@@ -1,0 +1,6 @@
+{
+  "repository": "https://gitlab.torproject.org/tpo/applications/tor-browser-build.git",
+  "tag": "mb-16.0a9-build1",
+  "tag_object": "729e1f7ccd88bbc75f33d29cbf39da26ca2e2721",
+  "commit": "7dd751cf1837d667908b339aebf82567ece55e20"
+}

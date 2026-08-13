@@ -1,0 +1,26 @@
+name: Validate upstream pin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out overlay repository
+        uses: actions/checkout@v4
+
+      - name: Resolve and validate upstream lock
+        run: ./scripts/resolve-upstream.sh
+
+      - name: Report stale upstream lock
+        run: |
+          if ! ./scripts/resolve-upstream.sh --check; then
+            echo '::warning::A newer Mullvad Browser Alpha build tag is available.'
+          fi
+
+      - name: Fetch exact locked upstream tree
+        run: ./scripts/fetch-upstream.sh --destination "$RUNNER_TEMP/tor-browser-build"
