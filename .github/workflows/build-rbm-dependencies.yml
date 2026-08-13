@@ -98,49 +98,22 @@ jobs:
           awk -F: -v user="$build_user" '$1 == user' /etc/subuid | sed 's/^/subuid: /'
           awk -F: -v user="$build_user" '$1 == user' /etc/subgid | sed 's/^/subgid: /'
 
-          # Mirror rbm/container's mapping: the caller becomes namespace ID 0,
-          # and the first subordinate ranges begin at namespace ID 1. RBM also
-          # calls setgroups(0, NULL) after newgidmap, so exercise that operation.
-          IFS=: read -r _ subuid_start subuid_count < <(
-            awk -F: -v user="$build_user" '$1 == user && $3 > 0 { print; exit }' /etc/subuid
-          )
-          IFS=: read -r _ subgid_start subgid_count < <(
-            awk -F: -v user="$build_user" '$1 == user && $3 > 0 { print; exit }' /etc/subgid
-          )
-          export build_uid build_gid subuid_start subuid_count subgid_start subgid_count
-
-          namespace_command=(
-            unshare --user
-            --map-users="0:$build_uid:1"
-            --map-users="1:$subuid_start:$subuid_count"
-            --map-groups="0:$build_gid:1"
-            --map-groups="1:$subgid_start:$subgid_count"
-            --setgroups=allow
-            sh -eu -c '
-              echo "Inner identity: uid=$(id -u) gid=$(id -g)"
-              echo "uid_map:"; cat /proc/self/uid_map
-              echo "gid_map:"; cat /proc/self/gid_map
-              echo "setgroups:"; cat /proc/self/setgroups
-              awk -v outer="$build_uid" "\$1 == 0 && \$2 == outer && \$3 == 1 { found = 1 } END { exit !found }" /proc/self/uid_map
-              awk -v start="$subuid_start" -v count="$subuid_count" "\$1 == 1 && \$2 == start && \$3 == count { found = 1 } END { exit !found }" /proc/self/uid_map
-              awk -v outer="$build_gid" "\$1 == 0 && \$2 == outer && \$3 == 1 { found = 1 } END { exit !found }" /proc/self/gid_map
-              awk -v start="$subgid_start" -v count="$subgid_count" "\$1 == 1 && \$2 == start && \$3 == count { found = 1 } END { exit !found }" /proc/self/gid_map
-              setpriv --clear-groups true
-            '
-          )
-          echo "Running RBM-compatible user-namespace preflight:"
-          printf ' %q' "${namespace_command[@]}"; echo
-          if "${namespace_command[@]}"; then
-            echo "RBM user-namespace preflight succeeded."
-          else
-            status=$?
-            echo "::error::RBM-compatible user-namespace preflight failed (status $status); see unshare/newuidmap/newgidmap diagnostics above." >&2
-            exit "$status"
-          fi
       - name: Fetch pinned official build tree
         run: |
           ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
           git -C "$UPSTREAM" submodule update --init rbm
+      - name: Validate pinned RBM container namespaces
+        run: |
+          set -euo pipefail
+          build_user="$(id -un)"
+          echo "RBM container preflight user: $build_user (uid=$(id -u) gid=$(id -g))"
+          sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          awk -F: -v user="$build_user" '$1 == user' /etc/subuid | sed 's/^/subuid: /'
+          awk -F: -v user="$build_user" '$1 == user' /etc/subgid | sed 's/^/subgid: /'
+          echo "Running the pinned RBM container implementation: $UPSTREAM/rbm/container run -- /bin/true"
+          "$UPSTREAM/rbm/container" run -- /bin/true
+          echo "Pinned RBM container preflight succeeded."
       - name: Restore verified RBM outputs
         run: ./scripts/rbm-release-artifacts.py restore --upstream "$UPSTREAM"
         env:

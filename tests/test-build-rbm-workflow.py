@@ -9,26 +9,23 @@ WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/build-rbm-de
 
 
 class WorkflowTests(unittest.TestCase):
-    def test_namespace_preflight_precedes_build(self):
+    def test_pinned_rbm_container_preflight_is_between_fetch_and_build(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        preflight = workflow.index("      - name: Prepare and validate RBM user namespaces\n")
+        preparation = workflow.index("      - name: Prepare and validate RBM user namespaces\n")
+        fetch = workflow.index("      - name: Fetch pinned official build tree\n")
+        preflight = workflow.index("      - name: Validate pinned RBM container namespaces\n")
         build = workflow.index("      - name: Build stage through RBM\n")
 
+        self.assertLess(preparation, fetch)
+        self.assertLess(fetch, preflight)
         self.assertLess(preflight, build)
         self.assertIn("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0", workflow)
         self.assertIn('build_user="$(id -un)"', workflow)
         self.assertIn("for map_file in /etc/subuid /etc/subgid", workflow)
-        self.assertIn('unshare --user', workflow)
-        self.assertIn('--map-users="0:$build_uid:1"', workflow)
-        self.assertIn('--map-users="1:$subuid_start:$subuid_count"', workflow)
-        self.assertIn('--map-groups="0:$build_gid:1"', workflow)
-        self.assertIn('--map-groups="1:$subgid_start:$subgid_count"', workflow)
-        self.assertIn('cat /proc/self/uid_map', workflow)
-        self.assertIn('cat /proc/self/gid_map', workflow)
-        self.assertIn('cat /proc/self/setgroups', workflow)
-        self.assertIn('setpriv --clear-groups true', workflow)
-        self.assertNotIn('--map-auto', workflow)
-        self.assertNotIn('test "$(id -u)" -eq 0', workflow)
+        self.assertIn('"$UPSTREAM/rbm/container" run -- /bin/true', workflow)
+        self.assertNotIn("unshare --user", workflow)
+        self.assertNotIn("--map-users", workflow)
+        self.assertNotIn("--map-groups", workflow)
 
     def test_automated_build_disables_interactive_rbm_debugging(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
