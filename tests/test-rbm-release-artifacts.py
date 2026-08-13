@@ -13,30 +13,68 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts/rbm-release-artifacts.py"
 FAKE_GH = r'''#!/usr/bin/env python3
-import json, os, shutil, sys
+import json, os, shutil, sys, time
 from pathlib import Path
 args = sys.argv[1:]
 store = Path(os.environ["FAKE_GH_STORE"])
 store.mkdir(parents=True, exist_ok=True)
+
+def metadata(release_dir):
+    path = release_dir / ".assets.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+def save(release_dir, data):
+    (release_dir / ".assets.json").write_text(json.dumps(data))
+
+if args[0] == "api":
+    asset_id = int(args[-1].rsplit("/", 1)[1])
+    for release_dir in store.iterdir():
+        if not release_dir.is_dir(): continue
+        data = metadata(release_dir)
+        for name, asset in list(data.items()):
+            if asset["id"] == asset_id:
+                (release_dir / name).unlink(missing_ok=True)
+                del data[name]
+                save(release_dir, data)
+                sys.exit(0)
+    sys.exit(1)
+
 command, release = args[1], args[2]
 release_dir = store / release
 if command == "view":
     if not release_dir.exists(): sys.exit(1)
     if "--json" in args:
-        print(json.dumps({"assets": [{"name": p.name} for p in release_dir.iterdir()]}))
+        data = metadata(release_dir)
+        print(json.dumps({"assets": [dict(value, name=name) for name, value in data.items()]}))
 elif command == "create":
     release_dir.mkdir()
+    save(release_dir, {})
     (store / "create-args").write_text(" ".join(args))
 elif command == "upload":
     source = Path(args[-1])
     destination = release_dir / source.name
-    if destination.exists(): sys.exit(2)
+    data = metadata(release_dir)
+    if source.name in data: sys.exit(2)
+    attempt_file = store / ("attempts-" + source.name)
+    attempts = int(attempt_file.read_text()) + 1 if attempt_file.exists() else 1
+    attempt_file.write_text(str(attempts))
+    failures = int(os.environ.get("FAKE_UPLOAD_FAILURES", "0"))
+    if attempts <= failures:
+        destination.write_bytes(b"")
+        data[source.name] = {"id": 1000 + len(data), "state": "starter", "size": 0}
+        save(release_dir, data)
+        if os.environ.get("FAKE_UPLOAD_TIMEOUT") == "1": time.sleep(10)
+        sys.exit(4)
     shutil.copyfile(source, destination)
+    data[source.name] = {"id": 1000 + len(data), "state": "uploaded", "size": source.stat().st_size}
+    save(release_dir, data)
 elif command == "download":
     pattern = args[args.index("--pattern") + 1]
     destination = Path(args[args.index("--dir") + 1])
     destination.mkdir(parents=True, exist_ok=True)
-    matches = list(release_dir.glob(pattern))
+    data = metadata(release_dir)
+    matches = [release_dir / name for name, asset in data.items()
+               if name == pattern and asset["state"] == "uploaded"]
     if not matches: sys.exit(1)
     for source in matches:
         target = destination / source.name
@@ -89,10 +127,13 @@ class PublicationTests(unittest.TestCase):
              "--registry-dir", str(self.registry_dir)],
             env=self.env, text=True, capture_output=True)
 
-    def seed_asset(self, content):
+    def seed_asset(self, content, state="uploaded"):
         release = self.store / self.release
         release.mkdir(parents=True)
         (release / self.asset_name).write_bytes(content)
+        (release / ".assets.json").write_text(json.dumps({
+            self.asset_name: {"id": 42, "state": state, "size": len(content)}
+        }))
 
     def test_existing_identical_asset_is_reused(self):
         self.seed_asset(self.artifact.read_bytes())
@@ -107,6 +148,24 @@ class PublicationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("identity mismatch", result.stderr)
         self.assertFalse((self.store / self.release / "registry-clang.json").exists())
+
+    def test_incomplete_starter_asset_is_removed_and_retried(self):
+        self.seed_asset(b"partial", state="starter")
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Removing interrupted Release asset", result.stdout)
+        self.assertEqual((self.store / self.release / self.asset_name).read_bytes(),
+                         self.artifact.read_bytes())
+
+    def test_upload_timeout_is_retried_with_a_bound(self):
+        self.env.update({"FAKE_UPLOAD_FAILURES": "9", "FAKE_UPLOAD_TIMEOUT": "1",
+                         "RBM_UPLOAD_TIMEOUT_SECONDS": "1", "RBM_UPLOAD_ATTEMPTS": "2"})
+        result = self.publish()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("timed out after 1s", result.stderr)
+        self.assertIn("upload failed after 2 attempts", result.stderr)
+        attempts = self.store / f"attempts-{self.asset_name}"
+        self.assertEqual(attempts.read_text(), "2")
 
     def test_partial_stage_resumes_and_publishes_registry(self):
         self.seed_asset(self.artifact.read_bytes())

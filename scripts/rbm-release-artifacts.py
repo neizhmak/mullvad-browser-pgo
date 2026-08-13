@@ -11,6 +11,8 @@ import subprocess
 import sys
 
 MAX_RELEASE_ASSET_SIZE = 2 * 1024 * 1024 * 1024
+UPLOAD_TIMEOUT_SECONDS = int(os.environ.get("RBM_UPLOAD_TIMEOUT_SECONDS", 15 * 60))
+UPLOAD_ATTEMPTS = int(os.environ.get("RBM_UPLOAD_ATTEMPTS", 3))
 
 
 def run(*args):
@@ -51,7 +53,54 @@ def release_exists(repository, release):
 def release_assets(repository, release):
     data = json.loads(output("gh", "release", "view", release, "--repo", repository,
                              "--json", "assets"))
-    return {asset["name"] for asset in data["assets"]}
+    return {asset["name"]: {key: asset.get(key) for key in ("name", "id", "state", "size")}
+            for asset in data["assets"]}
+
+
+def delete_incomplete_asset(args, asset):
+    if asset["state"] == "uploaded":
+        raise SystemExit(f"refusing to delete uploaded Release asset: {asset['name']}")
+    print(f"Removing interrupted Release asset {asset['name']} "
+          f"(id={asset['id']}, state={asset['state']}, size={asset['size']})")
+    run("gh", "api", "--method", "DELETE",
+        f"repos/{args.repository}/releases/assets/{asset['id']}")
+
+
+def verify_uploaded_asset(args, path, asset):
+    published = download_asset(args, asset["name"], Path(args.registry_dir) / "published")
+    if published.stat().st_size != path.stat().st_size or digest(published) != digest(path):
+        raise SystemExit(f"published artifact identity mismatch: {asset['name']}")
+    print(f"Reusing identical published asset: {asset['name']}")
+
+
+def upload_asset(args, path):
+    name = path.name
+    for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+        assets = release_assets(args.repository, args.release)
+        existing = assets.get(name)
+        if existing:
+            if existing["state"] == "uploaded":
+                verify_uploaded_asset(args, path, existing)
+                return existing
+            delete_incomplete_asset(args, existing)
+        print(f"Uploading {name} (attempt {attempt}/{UPLOAD_ATTEMPTS}, "
+              f"timeout {UPLOAD_TIMEOUT_SECONDS}s)")
+        try:
+            subprocess.run(
+                ["gh", "release", "upload", args.release, "--repo", args.repository,
+                 str(path)], check=True, timeout=UPLOAD_TIMEOUT_SECONDS,
+            )
+            uploaded = release_assets(args.repository, args.release).get(name)
+            if uploaded and uploaded["state"] == "uploaded":
+                return uploaded
+            reason = "returned without producing an uploaded asset"
+        except subprocess.TimeoutExpired:
+            reason = f"timed out after {UPLOAD_TIMEOUT_SECONDS}s"
+        except subprocess.CalledProcessError as error:
+            reason = f"failed with exit status {error.returncode}"
+        print(f"Upload of {name} {reason} (attempt {attempt}/{UPLOAD_ATTEMPTS})",
+              file=sys.stderr)
+    raise SystemExit(f"upload failed after {UPLOAD_ATTEMPTS} attempts: {name}")
 
 
 def download_asset(args, name, directory):
@@ -135,20 +184,13 @@ def publish(args, root):
             "--title", f"RBM dependencies for {provenance['tag']}",
             "--notes", "Unmodified outputs produced by the pinned official RBM recipes.",
             "--prerelease", "--latest=false", "--target", os.environ["GITHUB_SHA"])
-    assets = release_assets(args.repository, args.release)
     # The registry is uploaded last: it is the commit record for this stage.
     for path, artifact in zip(paths, artifacts):
         upload = registry.parent / artifact["asset"]
         shutil.copyfile(path, upload)
-        if artifact["asset"] in assets:
-            published = download_asset(args, artifact["asset"], registry.parent / "published")
-            if published.stat().st_size != artifact["size"] or digest(published) != artifact["sha256"]:
-                raise SystemExit(f"published artifact identity mismatch: {artifact['asset']}")
-            print(f"Reusing identical published asset: {artifact['asset']}")
-        else:
-            run("gh", "release", "upload", args.release, "--repo", args.repository,
-                str(upload))
-    run("gh", "release", "upload", args.release, "--repo", args.repository, str(registry))
+        upload_asset(args, upload)
+    # The stage registry remains the commit record and must always be uploaded last.
+    upload_asset(args, registry)
 
 
 def main():
