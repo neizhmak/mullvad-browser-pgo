@@ -13,6 +13,14 @@ jobs:
       - name: Check out overlay repository
         uses: actions/checkout@v4
 
+      - name: Validate GitHub Actions workflows
+        # actionlint validates expression-context availability as well as YAML.
+        # Ignore its lack of support for GitHub's YAML step aliases.
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
+            -ignore '"steps" section is missing' \
+            -ignore '"steps" section must be sequence node'
+
       - name: Resolve and validate upstream lock
         run: ./scripts/resolve-upstream.sh
 
