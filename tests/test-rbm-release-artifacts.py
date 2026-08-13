@@ -244,6 +244,7 @@ class PublicationTests(unittest.TestCase):
 
     def test_successful_required_restore_removes_temporary_downloads(self):
         self.assertEqual(self.publish().returncode, 0)
+        original_clang_bytes = self.artifact.read_bytes()
         release = self.store / self.release
         registry = json.loads((release / "registry-clang.json").read_text())
         for stage in ("mingw-w64-clang", "rust"):
@@ -272,6 +273,7 @@ class PublicationTests(unittest.TestCase):
         result = self.restore_required("clang", "mingw-w64-clang", "rust")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.artifact.is_file())
+        self.assertEqual(self.artifact.read_bytes(), original_clang_bytes)
         self.assertFalse((self.registry_dir / "required").exists())
         self.assertIn("Removed verified temporary downloads", result.stdout)
 

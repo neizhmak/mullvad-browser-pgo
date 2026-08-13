@@ -235,7 +235,7 @@ def restore_required(args, root):
             print(f"Already restored verified RBM output: {output_path}")
             continue
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(downloaded, output_path)
+        shutil.move(downloaded, output_path)
         print(f"Restored verified RBM output: {output_path}")
     print("All required RBM stages restored: " + ", ".join(args.stage))
     shutil.rmtree(download_dir)
