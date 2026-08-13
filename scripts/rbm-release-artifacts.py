@@ -15,6 +15,10 @@ def run(*args):
     subprocess.run(args, check=True)
 
 
+def output(*args):
+    return subprocess.run(args, check=True, text=True, stdout=subprocess.PIPE).stdout
+
+
 def digest(path):
     value = hashlib.sha256()
     with path.open("rb") as stream:
@@ -42,14 +46,34 @@ def release_exists(repository, release):
     ).returncode == 0
 
 
+def release_assets(repository, release):
+    data = json.loads(output("gh", "release", "view", release, "--repo", repository,
+                             "--json", "assets"))
+    return {asset["name"] for asset in data["assets"]}
+
+
+def download_asset(args, name, directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    if path.exists():
+        path.unlink()
+    run("gh", "release", "download", args.release, "--repo", args.repository,
+        "--dir", str(directory), "--pattern", name)
+    return path
+
+
 def restore(args, root):
     destination = Path(args.upstream)
     registries = Path(args.registry_dir)
     registries.mkdir(parents=True, exist_ok=True)
     if not release_exists(args.repository, args.release):
         return
-    run("gh", "release", "download", args.release, "--repo", args.repository,
-        "--dir", str(registries), "--pattern", "registry-*.json", "--clobber")
+    for old_registry in registries.glob("registry-*.json"):
+        old_registry.unlink()
+    registry_names = sorted(name for name in release_assets(args.repository, args.release)
+                            if name.startswith("registry-") and name.endswith(".json"))
+    for name in registry_names:
+        download_asset(args, name, registries)
     expected_lock = lock(root)
     for registry in sorted(registries.glob("registry-*.json")):
         data = json.loads(registry.read_text(encoding="utf-8"))
@@ -57,9 +81,7 @@ def restore(args, root):
             raise SystemExit(f"provenance mismatch in {registry.name}")
         for artifact in data.get("artifacts", []):
             output = safe_output(destination, artifact["path"])
-            asset = registries / artifact["asset"]
-            run("gh", "release", "download", args.release, "--repo", args.repository,
-                "--dir", str(registries), "--pattern", artifact["asset"], "--clobber")
+            asset = download_asset(args, artifact["asset"], registries)
             if asset.stat().st_size != artifact["size"] or digest(asset) != artifact["sha256"]:
                 raise SystemExit(f"published artifact identity mismatch: {artifact['asset']}")
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -103,13 +125,21 @@ def publish(args, root):
     if not release_exists(args.repository, args.release):
         run("gh", "release", "create", args.release, "--repo", args.repository,
             "--title", f"RBM dependencies for {provenance['tag']}",
-            "--notes", "Unmodified outputs produced by the pinned official RBM recipes.")
+            "--notes", "Unmodified outputs produced by the pinned official RBM recipes.",
+            "--prerelease", "--latest=false")
+    assets = release_assets(args.repository, args.release)
     # The registry is uploaded last: it is the commit record for this stage.
     for path, artifact in zip(paths, artifacts):
         upload = registry.parent / artifact["asset"]
         shutil.copyfile(path, upload)
-        run("gh", "release", "upload", args.release, "--repo", args.repository,
-            str(upload))
+        if artifact["asset"] in assets:
+            published = download_asset(args, artifact["asset"], registry.parent / "published")
+            if published.stat().st_size != artifact["size"] or digest(published) != artifact["sha256"]:
+                raise SystemExit(f"published artifact identity mismatch: {artifact['asset']}")
+            print(f"Reusing identical published asset: {artifact['asset']}")
+        else:
+            run("gh", "release", "upload", args.release, "--repo", args.repository,
+                str(upload))
     run("gh", "release", "upload", args.release, "--repo", args.repository, str(registry))
 
 
