@@ -1,0 +1,154 @@
+name: Build baseline Mullvad Browser
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RBM_NO_DEBUG: "1"
+
+concurrency:
+  group: baseline-mullvad-browser
+  cancel-in-progress: false
+
+jobs:
+  windows-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Initialize build environment
+        run: echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
+
+      - name: Check out overlay repository
+        uses: actions/checkout@v4
+
+      - name: Derive dependency Release from upstream lock
+        run: |
+          tag="$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["tag"])')"
+          echo "Pinned upstream tag: $tag"
+          echo "RBM_RELEASE=rbm-dependencies-$tag" >> "$GITHUB_ENV"
+
+      - name: Install RBM host requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdata-dump-perl libdata-uuid-perl libdatetime-perl \
+            libdigest-sha-perl libfile-copy-recursive-perl libfile-slurp-perl \
+            libio-all-perl libcapture-tiny-perl libio-handle-util-perl libjson-perl \
+            libparallel-forkmanager-perl libpath-tiny-perl libsort-versions-perl \
+            libstring-shellquote-perl libtemplate-perl libxml-libxml-perl \
+            libxml-writer-perl libyaml-libyaml-perl git uidmap zstd jq zip
+
+      - name: Prepare and validate RBM user namespaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_user="$(id -un)"
+          echo "RBM build user: $build_user (uid=$(id -u) gid=$(id -g))"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          missing_files=()
+          for map_file in /etc/subuid /etc/subgid; do
+            if ! awk -F: -v user="$build_user" '$1 == user && $3 > 0 { found = 1 } END { exit !found }' "$map_file"; then
+              missing_files+=("$map_file")
+            fi
+          done
+          if (( ${#missing_files[@]} )); then
+            range_start="$(python3 - <<'PY'
+          from pathlib import Path
+          size = 65536
+          ranges = []
+          for filename in ('/etc/subuid', '/etc/subgid'):
+              for line in Path(filename).read_text().splitlines():
+                  fields = line.split(':')
+                  if len(fields) != 3:
+                      continue
+                  try:
+                      start, length = map(int, fields[1:])
+                  except ValueError:
+                      continue
+                  if length > 0:
+                      ranges.append((start, start + length))
+          candidate = 100000
+          while True:
+              end = candidate + size
+              conflicts = [stop for start, stop in ranges if candidate < stop and start < end]
+              if not conflicts:
+                  print(candidate)
+                  break
+              candidate = max(conflicts)
+          PY
+            )"
+            for map_file in "${missing_files[@]}"; do
+              printf '%s:%s:65536\n' "$build_user" "$range_start" | sudo tee -a "$map_file" >/dev/null
+            done
+          fi
+          sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          awk -F: -v user="$build_user" '$1 == user' /etc/subuid | sed 's/^/subuid: /'
+          awk -F: -v user="$build_user" '$1 == user' /etc/subgid | sed 's/^/subgid: /'
+
+      - name: Fetch pinned official build tree
+        run: |
+          ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
+          git -C "$UPSTREAM" submodule update --init rbm
+
+      - name: Validate pinned RBM container namespaces
+        run: |
+          set -euo pipefail
+          echo "Running pinned RBM container: $UPSTREAM/rbm/container run -- /bin/true"
+          "$UPSTREAM/rbm/container" run -- /bin/true
+
+      - name: Require and restore persisted compiler stages
+        run: |
+          ./scripts/rbm-release-artifacts.py restore-required --upstream "$UPSTREAM" \
+            --stage clang --stage mingw-w64-clang --stage rust
+          echo "Restored RBM outputs:"
+          find "$UPSTREAM/out" -type f -printf '%P\n' | sort
+          df -h
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Show official browser inputs
+        run: |
+          cd "$UPSTREAM"
+          ./rbm/rbm showconf browser input_files --target alpha --target mullvadbrowser-windows-x86_64
+
+      - name: Build official baseline target
+        timeout-minutes: 330
+        run: |
+          set -o pipefail
+          cd "$UPSTREAM"
+          make mullvadbrowser-alpha-windows-x86_64 2>&1 | tee "$RUNNER_TEMP/baseline-build.log"
+
+      - name: Collect resulting Windows packages
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/baseline-packages"
+          find "$UPSTREAM/out" -type f \( -name '*.exe' -o -name '*.mar' \) -print0 \
+            | while IFS= read -r -d '' package; do
+                relative="${package#"$UPSTREAM/out/"}"
+                destination="$RUNNER_TEMP/baseline-packages/$relative"
+                mkdir -p "$(dirname "$destination")"
+                cp "$package" "$destination"
+              done
+          find "$RUNNER_TEMP/baseline-packages" -type f -print -quit | grep -q . \
+            || { echo 'No Windows .exe or .mar packages were produced.' >&2; exit 1; }
+          find "$RUNNER_TEMP/baseline-packages" -type f -printf '%P\n' | sort
+
+      - name: Upload baseline packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: mullvad-browser-alpha-windows-x86_64-baseline
+          path: ${{ runner.temp }}/baseline-packages/
+          if-no-files-found: error
+
+      - name: Upload RBM and browser build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-build-logs
+          path: |
+            ${{ runner.temp }}/baseline-build.log
+            ${{ runner.temp }}/tor-browser-build/logs/
+          if-no-files-found: warn

@@ -176,6 +176,72 @@ def restore(args, root):
                 raise SystemExit(f"filename mismatch in {registry.name}")
 
 
+def restore_required(args, root):
+    """Atomically validate and restore a caller-supplied set of RBM stages."""
+    destination = Path(args.upstream)
+    registries = Path(args.registry_dir)
+    download_dir = registries / "required"
+    if not release_exists(args.repository, args.release):
+        raise SystemExit(f"required dependency Release does not exist: {args.release}")
+
+    assets = release_assets(args.repository, args.release)
+    expected_lock = lock(root)
+    planned = []
+    output_paths = {}
+    for stage in args.stage:
+        registry_name = f"registry-{stage}.json"
+        registry_asset = assets.get(registry_name)
+        if not registry_asset or registry_asset["state"] != "uploaded":
+            raise SystemExit(f"required stage is incomplete: {registry_name}")
+        registry = download_asset(args, registry_name, download_dir)
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        if data.get("schema") != 1 or data.get("stage") != stage:
+            raise SystemExit(f"invalid required stage registry: {registry_name}")
+        if data.get("upstream") != expected_lock:
+            raise SystemExit(f"provenance mismatch in {registry_name}")
+        artifacts = data.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise SystemExit(f"required stage has no artifacts: {registry_name}")
+        for artifact in artifacts:
+            try:
+                output_path = safe_output(destination, artifact["path"])
+                filename = artifact["filename"]
+                asset_name = artifact["asset"]
+                size = artifact["size"]
+                sha256 = artifact["sha256"]
+            except (KeyError, TypeError) as error:
+                raise SystemExit(f"invalid artifact record in {registry_name}: {error}")
+            if output_path.name != filename or Path(asset_name).name != asset_name:
+                raise SystemExit(f"filename mismatch in {registry_name}")
+            identity = (asset_name, size, sha256)
+            if output_path in output_paths:
+                raise SystemExit(f"conflicting required output path: {artifact['path']}")
+            output_paths[output_path] = identity
+            release_asset = assets.get(asset_name)
+            if (not release_asset or release_asset["state"] != "uploaded"
+                    or release_asset["size"] != size):
+                raise SystemExit(f"required artifact is missing or incomplete: {asset_name}")
+            downloaded = download_asset(args, asset_name, download_dir)
+            if downloaded.stat().st_size != size or digest(downloaded) != sha256:
+                raise SystemExit(f"published artifact identity mismatch: {asset_name}")
+            if (output_path.exists()
+                    and (output_path.stat().st_size != size or digest(output_path) != sha256)):
+                raise SystemExit(f"conflicting existing RBM output: {output_path}")
+            planned.append((downloaded, output_path, sha256))
+
+    # Do not alter out/ until every required registry and artifact has passed.
+    for downloaded, output_path, sha256 in planned:
+        if output_path.exists():
+            print(f"Already restored verified RBM output: {output_path}")
+            continue
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(downloaded, output_path)
+        print(f"Restored verified RBM output: {output_path}")
+    print("All required RBM stages restored: " + ", ".join(args.stage))
+    shutil.rmtree(download_dir)
+    print(f"Removed verified temporary downloads: {download_dir}")
+
+
 def snapshot(args):
     upstream = Path(args.upstream)
     paths = sorted(str(path.relative_to(upstream)) for path in (upstream / "out").glob("**/*") if path.is_file())
@@ -230,27 +296,34 @@ def publish(args, root):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("stage-complete", "restore", "snapshot", "publish"))
+    parser.add_argument("command", choices=("stage-complete", "restore", "restore-required",
+                                            "snapshot", "publish"))
     parser.add_argument("--upstream", required=True)
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY"))
     parser.add_argument("--release", default=os.environ.get("RBM_RELEASE"))
     parser.add_argument("--registry-dir", default=os.environ.get("RUNNER_TEMP", "/tmp") + "/rbm-registry")
     parser.add_argument("--file")
     parser.add_argument("--before")
-    parser.add_argument("--stage")
+    parser.add_argument("--stage", action="append")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    if args.command in ("stage-complete", "restore", "publish") and (not args.repository or not args.release):
+    if args.command in ("stage-complete", "restore", "restore-required", "publish") and (not args.repository or not args.release):
         parser.error("repository and release are required")
     if args.command == "stage-complete":
         if not args.stage: parser.error("stage-complete requires --stage")
+        args.stage = args.stage[0]
         raise SystemExit(0 if stage_complete(args, root) else 1)
     if args.command == "restore": restore(args, root)
+    elif args.command == "restore-required":
+        if not args.stage: parser.error("restore-required requires --stage")
+        if len(set(args.stage)) != len(args.stage): parser.error("required stages must be unique")
+        restore_required(args, root)
     elif args.command == "snapshot":
         if not args.file: parser.error("snapshot requires --file")
         snapshot(args)
     else:
         if not args.before or not args.stage: parser.error("publish requires --before and --stage")
+        args.stage = args.stage[0]
         publish(args, root)
 
 
