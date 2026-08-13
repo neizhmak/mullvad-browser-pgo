@@ -1,0 +1,78 @@
+name: Build official RBM dependencies
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rbm-dependencies
+  cancel-in-progress: false
+
+jobs:
+  clang:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps: &rbm_steps
+      - uses: actions/checkout@v4
+      - name: Initialize runner paths
+        run: echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
+      - name: Name dependency release from upstream lock
+        run: |
+          tag="$(python3 -c 'import json; print(json.load(open("upstream.lock.json"))["tag"])')"
+          echo "RBM_RELEASE=rbm-dependencies-$tag" >> "$GITHUB_ENV"
+      - name: Install RBM host requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdata-dump-perl libdata-uuid-perl libdatetime-perl \
+            libdigest-sha-perl libfile-copy-recursive-perl libfile-slurp-perl \
+            libio-all-perl libcapture-tiny-perl libio-handle-util-perl libjson-perl \
+            libparallel-forkmanager-perl libpath-tiny-perl libsort-versions-perl \
+            libstring-shellquote-perl libtemplate-perl libxml-libxml-perl \
+            libxml-writer-perl libyaml-libyaml-perl git uidmap zstd jq zip
+      - name: Fetch pinned official build tree
+        run: |
+          ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
+          git -C "$UPSTREAM" submodule update --init rbm
+      - name: Restore verified RBM outputs
+        run: ./scripts/rbm-release-artifacts.py restore --upstream "$UPSTREAM"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Record existing outputs
+        run: ./scripts/rbm-release-artifacts.py snapshot --upstream "$UPSTREAM" --file "$RUNNER_TEMP/before"
+      - name: Build stage through RBM
+        timeout-minutes: 330
+        run: |
+          cd "$UPSTREAM"
+          ./rbm/rbm showconf "$RBM_PROJECT" input_files --target alpha --target mullvadbrowser-windows-x86_64
+          ./rbm/rbm build "$RBM_PROJECT" --target alpha --target mullvadbrowser-windows-x86_64
+      - name: Publish new immutable RBM outputs
+        run: ./scripts/rbm-release-artifacts.py publish --upstream "$UPSTREAM" --before "$RUNNER_TEMP/before" --stage "$RBM_PROJECT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Upload RBM build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rbm-logs-${{ env.RBM_PROJECT }}
+          path: ${{ runner.temp }}/tor-browser-build/logs/
+          if-no-files-found: warn
+    env:
+      RBM_PROJECT: clang
+
+  mingw-w64-clang:
+    needs: clang
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps: *rbm_steps
+    env:
+      RBM_PROJECT: mingw-w64-clang
+
+  rust:
+    needs: mingw-w64-clang
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps: *rbm_steps
+    env:
+      RBM_PROJECT: rust
