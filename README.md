@@ -43,7 +43,10 @@ Resolution accepts only tags of the exact form
 and tags are ordered by `(MAJOR, MINOR, ALPHA, BUILD)`, so `a10` follows `a9`
 and `build2` follows `build1`. Suspicious Alpha-like names, duplicate refs,
 missing peeled refs, and non-annotated candidate tags cause an error rather
-than being guessed at.
+than being guessed at. If the already locked tag name is still upstream but
+either of its object IDs changed, resolution treats that as an integrity
+anomaly in every mode; even `--update-lock` refuses to overwrite it. Lock
+updates are limited to tags that are numerically newer than the locked tag.
 
 This first stage only pins, resolves, validates, and fetches upstream. It does
 not compile a toolchain or browser, apply PGO, publish releases, or poll on a

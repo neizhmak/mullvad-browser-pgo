@@ -97,12 +97,32 @@ for key in ("tag_object", "commit"):
     if not oid_pattern.fullmatch(current[key]):
         raise SystemExit(f"error: malformed locked {key}: {current[key]!r}")
 
+locked_upstream = refs.get(current["tag"])
+if locked_upstream is not None:
+    identity_changes = []
+    for key in ("tag_object", "commit"):
+        if current[key] != locked_upstream[key]:
+            identity_changes.append(
+                f"  {key}: expected {current[key]}, observed {locked_upstream[key]}"
+            )
+    if identity_changes:
+        raise SystemExit(
+            f"error: integrity anomaly: locked tag {current['tag']} changed identity\n"
+            + "\n".join(identity_changes)
+        )
+
 print(f"Locked Alpha tag: {current['tag']}")
 print(f"Newest Alpha tag: {tag}")
 same = current == new_lock
 print("Lock status: current" if same else "Lock status: stale or mismatched")
 
 if mode == "update" and not same:
+    locked_match = pattern.fullmatch(current["tag"])
+    locked_version = tuple(map(int, locked_match.groups()))
+    if selected["version"] <= locked_version:
+        raise SystemExit(
+            "error: refusing to update: selected Alpha tag is not newer than the lock"
+        )
     directory = os.path.dirname(lock_path)
     fd, temporary = tempfile.mkstemp(prefix=".upstream.lock.", dir=directory, text=True)
     try:

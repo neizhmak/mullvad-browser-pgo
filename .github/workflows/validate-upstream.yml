@@ -16,6 +16,9 @@ jobs:
       - name: Resolve and validate upstream lock
         run: ./scripts/resolve-upstream.sh
 
+      - name: Test upstream integrity handling
+        run: ./tests/test-resolve-upstream.sh
+
       - name: Report stale upstream lock
         run: |
           if ! ./scripts/resolve-upstream.sh --check; then
