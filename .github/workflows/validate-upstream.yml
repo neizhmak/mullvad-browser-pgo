@@ -20,7 +20,7 @@ jobs:
         run: ./tests/test-resolve-upstream.sh
 
       - name: Validate GitHub Actions workflows and expression contexts
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
       - name: Report stale upstream lock
         run: |
