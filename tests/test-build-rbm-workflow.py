@@ -27,6 +27,26 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("--map-users", workflow)
         self.assertNotIn("--map-groups", workflow)
 
+    def test_complete_stage_skips_restore_build_and_publish(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        condition = "        if: steps.stage.outputs.complete != 'true'\n"
+
+        self.assertIn("stage-complete --upstream", workflow)
+        self.assertEqual(workflow.count(condition), 4)
+        self.assertIn('echo "complete=true" >> "$GITHUB_OUTPUT"', workflow)
+        self.assertIn('echo "complete=false" >> "$GITHUB_OUTPUT"', workflow)
+
+    def test_stage_chain_allows_each_incomplete_job_to_restore_prerequisites(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("  mingw-w64-clang:\n    needs: clang", workflow)
+        self.assertIn("  rust:\n    needs: mingw-w64-clang", workflow)
+        check = workflow.index("      - name: Check whether current RBM stage is complete\n")
+        restore = workflow.index("      - name: Restore verified RBM outputs\n")
+        build = workflow.index("      - name: Build stage through RBM\n")
+        self.assertLess(check, restore)
+        self.assertLess(restore, build)
+
     def test_automated_build_disables_interactive_rbm_debugging(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
 

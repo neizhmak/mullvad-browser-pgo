@@ -114,19 +114,33 @@ jobs:
           echo "Running the pinned RBM container implementation: $UPSTREAM/rbm/container run -- /bin/true"
           "$UPSTREAM/rbm/container" run -- /bin/true
           echo "Pinned RBM container preflight succeeded."
+      - name: Check whether current RBM stage is complete
+        id: stage
+        run: |
+          if ./scripts/rbm-release-artifacts.py stage-complete --upstream "$UPSTREAM" --stage "$RBM_PROJECT"; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Restore verified RBM outputs
+        if: steps.stage.outputs.complete != 'true'
         run: ./scripts/rbm-release-artifacts.py restore --upstream "$UPSTREAM"
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Record existing outputs
+        if: steps.stage.outputs.complete != 'true'
         run: ./scripts/rbm-release-artifacts.py snapshot --upstream "$UPSTREAM" --file "$RUNNER_TEMP/before"
       - name: Build stage through RBM
+        if: steps.stage.outputs.complete != 'true'
         timeout-minutes: 330
         run: |
           cd "$UPSTREAM"
           ./rbm/rbm showconf "$RBM_PROJECT" input_files --target alpha --target mullvadbrowser-windows-x86_64
           ./rbm/rbm build "$RBM_PROJECT" --target alpha --target mullvadbrowser-windows-x86_64
       - name: Publish new immutable RBM outputs
+        if: steps.stage.outputs.complete != 'true'
         run: ./scripts/rbm-release-artifacts.py publish --upstream "$UPSTREAM" --before "$RUNNER_TEMP/before" --stage "$RBM_PROJECT"
         env:
           GH_TOKEN: ${{ github.token }}

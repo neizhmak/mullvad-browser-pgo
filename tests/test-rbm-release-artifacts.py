@@ -120,6 +120,13 @@ class PublicationTests(unittest.TestCase):
              "--registry-dir", str(self.registry_dir), "--before", str(self.before),
              "--stage", "clang"], env=self.env, text=True, capture_output=True)
 
+    def stage_complete(self, stage="clang"):
+        return subprocess.run(
+            [str(HELPER), "stage-complete", "--upstream", str(self.upstream),
+             "--repository", "owner/repo", "--release", self.release,
+             "--registry-dir", str(self.registry_dir), "--stage", stage],
+            env=self.env, text=True, capture_output=True)
+
     def restore(self):
         return subprocess.run(
             [str(HELPER), "restore", "--upstream", str(self.upstream),
@@ -134,6 +141,30 @@ class PublicationTests(unittest.TestCase):
         (release / ".assets.json").write_text(json.dumps({
             self.asset_name: {"id": 42, "state": state, "size": len(content)}
         }))
+
+    def test_complete_registry_marks_stage_complete(self):
+        publish = self.publish()
+        self.assertEqual(publish.returncode, 0, publish.stderr)
+        result = self.stage_complete()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Stage clang is already complete; skipping RBM build.", result.stdout)
+
+    def test_missing_registry_does_not_mark_stage_complete(self):
+        self.seed_asset(self.artifact.read_bytes())
+        result = self.stage_complete()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("registry-clang.json is missing or incomplete", result.stdout)
+
+    def test_registry_with_incomplete_artifact_does_not_mark_stage_complete(self):
+        publish = self.publish()
+        self.assertEqual(publish.returncode, 0, publish.stderr)
+        metadata = self.store / self.release / ".assets.json"
+        assets = json.loads(metadata.read_text())
+        assets[self.asset_name]["state"] = "starter"
+        metadata.write_text(json.dumps(assets))
+        result = self.stage_complete()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is missing or incomplete", result.stdout)
 
     def test_existing_identical_asset_is_reused(self):
         self.seed_asset(self.artifact.read_bytes())
