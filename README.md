@@ -91,3 +91,26 @@ registry recording project, original filename/path, digest, size, and upstream
 lock. The registry is uploaded last as the stage's commit record. Existing,
 verified registries make reruns no-ops; provenance, checksum, or unexpected
 identity conflicts fail instead of being overwritten.
+
+## Baseline Windows build
+
+The manually dispatched **Build baseline Mullvad Browser** workflow is the
+Stage 3 control build. It fetches the exact locked official tree, initializes
+its pinned RBM, and requires the `clang`, `mingw-w64-clang`, and `rust`
+registries from the lock-derived dependency Release. Every persisted artifact
+is size- and SHA-256-verified before any output is restored to its recorded
+upstream `out/` path. A missing, empty, conflicting, or unverifiable required
+stage stops the job before the browser build; those heavyweight stages are
+never silently rebuilt.
+
+After restoration the workflow invokes the official, unmodified target:
+
+```sh
+make mullvadbrowser-alpha-windows-x86_64
+```
+
+RBM remains responsible for resolving every other dependency. The workflow
+uploads resulting Windows `.exe` and `.mar` packages as private workflow-run
+artifacts for inspection, and always uploads available RBM/browser logs. It
+does not publish a product Release and applies no Firefox, recipe, or PGO
+changes.

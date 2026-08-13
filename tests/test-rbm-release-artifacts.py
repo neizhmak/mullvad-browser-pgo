@@ -134,6 +134,14 @@ class PublicationTests(unittest.TestCase):
              "--registry-dir", str(self.registry_dir)],
             env=self.env, text=True, capture_output=True)
 
+    def restore_required(self, *stages):
+        command = [str(HELPER), "restore-required", "--upstream", str(self.upstream),
+                   "--repository", "owner/repo", "--release", self.release,
+                   "--registry-dir", str(self.registry_dir)]
+        for stage in stages:
+            command.extend(("--stage", stage))
+        return subprocess.run(command, env=self.env, text=True, capture_output=True)
+
     def seed_asset(self, content, state="uploaded"):
         release = self.store / self.release
         release.mkdir(parents=True)
@@ -224,6 +232,35 @@ class PublicationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must be below 2 GiB", result.stderr)
         self.assertFalse((self.store / self.release).exists())
+
+    def test_required_restore_fails_if_any_stage_is_absent(self):
+        self.assertEqual(self.publish().returncode, 0)
+        self.artifact.unlink()
+        result = self.restore_required("clang", "mingw-w64-clang", "rust")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required stage is incomplete: registry-mingw-w64-clang.json",
+                      result.stderr)
+        self.assertFalse(self.artifact.exists())
+
+    def test_required_restore_verifies_every_stage_before_copying(self):
+        self.assertEqual(self.publish().returncode, 0)
+        release = self.store / self.release
+        registry = json.loads((release / "registry-clang.json").read_text())
+        for stage in ("mingw-w64-clang", "rust"):
+            stage_registry = dict(registry, stage=stage)
+            stage_registry["artifacts"] = []
+            name = f"registry-{stage}.json"
+            payload = (json.dumps(stage_registry) + "\n").encode()
+            (release / name).write_bytes(payload)
+            metadata = json.loads((release / ".assets.json").read_text())
+            metadata[name] = {"id": 2000 + len(metadata), "state": "uploaded",
+                              "size": len(payload)}
+            (release / ".assets.json").write_text(json.dumps(metadata))
+        self.artifact.unlink()
+        result = self.restore_required("clang", "mingw-w64-clang", "rust")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required stage has no artifacts", result.stderr)
+        self.assertFalse(self.artifact.exists())
 
 
 if __name__ == "__main__":
