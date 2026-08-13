@@ -11,6 +11,8 @@ import subprocess
 import sys
 
 MAX_RELEASE_ASSET_SIZE = 2 * 1024 * 1024 * 1024
+UPLOAD_TIMEOUT_SECONDS = int(os.environ.get("RBM_UPLOAD_TIMEOUT_SECONDS", 15 * 60))
+UPLOAD_ATTEMPTS = int(os.environ.get("RBM_UPLOAD_ATTEMPTS", 3))
 
 
 def run(*args):
@@ -51,7 +53,54 @@ def release_exists(repository, release):
 def release_assets(repository, release):
     data = json.loads(output("gh", "release", "view", release, "--repo", repository,
                              "--json", "assets"))
-    return {asset["name"] for asset in data["assets"]}
+    return {asset["name"]: {key: asset.get(key) for key in ("name", "id", "state", "size", "digest")}
+            for asset in data["assets"]}
+
+
+def delete_incomplete_asset(args, asset):
+    if asset["state"] == "uploaded":
+        raise SystemExit(f"refusing to delete uploaded Release asset: {asset['name']}")
+    print(f"Removing interrupted Release asset {asset['name']} "
+          f"(id={asset['id']}, state={asset['state']}, size={asset['size']})")
+    run("gh", "api", "--method", "DELETE",
+        f"repos/{args.repository}/releases/assets/{asset['id']}")
+
+
+def verify_uploaded_asset(args, path, asset):
+    published = download_asset(args, asset["name"], Path(args.registry_dir) / "published")
+    if published.stat().st_size != path.stat().st_size or digest(published) != digest(path):
+        raise SystemExit(f"published artifact identity mismatch: {asset['name']}")
+    print(f"Reusing identical published asset: {asset['name']}")
+
+
+def upload_asset(args, path):
+    name = path.name
+    for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+        assets = release_assets(args.repository, args.release)
+        existing = assets.get(name)
+        if existing:
+            if existing["state"] == "uploaded":
+                verify_uploaded_asset(args, path, existing)
+                return existing
+            delete_incomplete_asset(args, existing)
+        print(f"Uploading {name} (attempt {attempt}/{UPLOAD_ATTEMPTS}, "
+              f"timeout {UPLOAD_TIMEOUT_SECONDS}s)")
+        try:
+            subprocess.run(
+                ["gh", "release", "upload", args.release, "--repo", args.repository,
+                 str(path)], check=True, timeout=UPLOAD_TIMEOUT_SECONDS,
+            )
+            uploaded = release_assets(args.repository, args.release).get(name)
+            if uploaded and uploaded["state"] == "uploaded":
+                return uploaded
+            reason = "returned without producing an uploaded asset"
+        except subprocess.TimeoutExpired:
+            reason = f"timed out after {UPLOAD_TIMEOUT_SECONDS}s"
+        except subprocess.CalledProcessError as error:
+            reason = f"failed with exit status {error.returncode}"
+        print(f"Upload of {name} {reason} (attempt {attempt}/{UPLOAD_ATTEMPTS})",
+              file=sys.stderr)
+    raise SystemExit(f"upload failed after {UPLOAD_ATTEMPTS} attempts: {name}")
 
 
 def download_asset(args, name, directory):
@@ -64,6 +113,40 @@ def download_asset(args, name, directory):
     return path
 
 
+
+def stage_complete(args, root):
+    if not release_exists(args.repository, args.release):
+        print(f"Stage {args.stage} is not complete: dependency Release does not exist.")
+        return False
+    assets = release_assets(args.repository, args.release)
+    registry_name = f"registry-{args.stage}.json"
+    registry_asset = assets.get(registry_name)
+    if not registry_asset or registry_asset["state"] != "uploaded":
+        print(f"Stage {args.stage} is not complete: {registry_name} is missing or incomplete.")
+        return False
+    registry = download_asset(args, registry_name, Path(args.registry_dir) / "completion")
+    data = json.loads(registry.read_text(encoding="utf-8"))
+    if data.get("upstream") != lock(root) or data.get("stage") != args.stage:
+        print(f"Stage {args.stage} is not complete: {registry_name} does not match the locked upstream.")
+        return False
+    for artifact in data.get("artifacts", []):
+        if Path(artifact["path"]).name != artifact["filename"]:
+            print(f"Stage {args.stage} is not complete: filename mismatch in {registry_name}.")
+            return False
+        asset = assets.get(artifact["asset"])
+        if not asset or asset["state"] != "uploaded":
+            print(f"Stage {args.stage} is not complete: {artifact['asset']} is missing or incomplete.")
+            return False
+        if asset["name"] != artifact["asset"] or asset["size"] != artifact["size"]:
+            print(f"Stage {args.stage} is not complete: metadata mismatch for {artifact['asset']}.")
+            return False
+        github_digest = asset.get("digest")
+        if github_digest and github_digest != f"sha256:{artifact['sha256']}":
+            print(f"Stage {args.stage} is not complete: digest mismatch for {artifact['asset']}.")
+            return False
+    print(f"Stage {args.stage} is already complete; skipping RBM build.")
+    return True
+
 def restore(args, root):
     destination = Path(args.upstream)
     registries = Path(args.registry_dir)
@@ -72,8 +155,9 @@ def restore(args, root):
         return
     for old_registry in registries.glob("registry-*.json"):
         old_registry.unlink()
-    registry_names = sorted(name for name in release_assets(args.repository, args.release)
-                            if name.startswith("registry-") and name.endswith(".json"))
+    registry_names = sorted(name for name, asset in release_assets(args.repository, args.release).items()
+                            if name.startswith("registry-") and name.endswith(".json")
+                            and asset["state"] == "uploaded")
     for name in registry_names:
         download_asset(args, name, registries)
     expected_lock = lock(root)
@@ -135,25 +219,18 @@ def publish(args, root):
             "--title", f"RBM dependencies for {provenance['tag']}",
             "--notes", "Unmodified outputs produced by the pinned official RBM recipes.",
             "--prerelease", "--latest=false", "--target", os.environ["GITHUB_SHA"])
-    assets = release_assets(args.repository, args.release)
     # The registry is uploaded last: it is the commit record for this stage.
     for path, artifact in zip(paths, artifacts):
         upload = registry.parent / artifact["asset"]
         shutil.copyfile(path, upload)
-        if artifact["asset"] in assets:
-            published = download_asset(args, artifact["asset"], registry.parent / "published")
-            if published.stat().st_size != artifact["size"] or digest(published) != artifact["sha256"]:
-                raise SystemExit(f"published artifact identity mismatch: {artifact['asset']}")
-            print(f"Reusing identical published asset: {artifact['asset']}")
-        else:
-            run("gh", "release", "upload", args.release, "--repo", args.repository,
-                str(upload))
-    run("gh", "release", "upload", args.release, "--repo", args.repository, str(registry))
+        upload_asset(args, upload)
+    # The stage registry remains the commit record and must always be uploaded last.
+    upload_asset(args, registry)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("restore", "snapshot", "publish"))
+    parser.add_argument("command", choices=("stage-complete", "restore", "snapshot", "publish"))
     parser.add_argument("--upstream", required=True)
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY"))
     parser.add_argument("--release", default=os.environ.get("RBM_RELEASE"))
@@ -163,8 +240,11 @@ def main():
     parser.add_argument("--stage")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    if args.command in ("restore", "publish") and (not args.repository or not args.release):
+    if args.command in ("stage-complete", "restore", "publish") and (not args.repository or not args.release):
         parser.error("repository and release are required")
+    if args.command == "stage-complete":
+        if not args.stage: parser.error("stage-complete requires --stage")
+        raise SystemExit(0 if stage_complete(args, root) else 1)
     if args.command == "restore": restore(args, root)
     elif args.command == "snapshot":
         if not args.file: parser.error("snapshot requires --file")

@@ -6,6 +6,9 @@ on:
 permissions:
   contents: write
 
+env:
+  RBM_NO_DEBUG: "1"
+
 concurrency:
   group: rbm-dependencies
   cancel-in-progress: false
@@ -31,23 +34,113 @@ jobs:
             libparallel-forkmanager-perl libpath-tiny-perl libsort-versions-perl \
             libstring-shellquote-perl libtemplate-perl libxml-libxml-perl \
             libxml-writer-perl libyaml-libyaml-perl git uidmap zstd jq zip
+      - name: Prepare and validate RBM user namespaces
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          build_user="$(id -un)"
+          build_uid="$(id -u)"
+          build_gid="$(id -g)"
+          echo "RBM build user: $build_user (uid=$build_uid gid=$build_gid)"
+
+          echo "Enabling unprivileged user namespaces required on Ubuntu 24.04+"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+          missing_files=()
+          for map_file in /etc/subuid /etc/subgid; do
+            if ! awk -F: -v user="$build_user" '$1 == user && $3 > 0 { found = 1 } END { exit !found }' "$map_file"; then
+              missing_files+=("$map_file")
+            fi
+          done
+
+          if (( ${#missing_files[@]} )); then
+            # Pick one 65536-ID range which does not overlap any range already
+            # assigned in either mapping file, then use it only for missing maps.
+            range_start="$(python3 - <<'PY'
+          from pathlib import Path
+
+          size = 65536
+          ranges = []
+          for filename in ('/etc/subuid', '/etc/subgid'):
+              for line in Path(filename).read_text().splitlines():
+                  fields = line.split(':')
+                  if len(fields) != 3:
+                      continue
+                  try:
+                      start, length = map(int, fields[1:])
+                  except ValueError:
+                      continue
+                  if length > 0:
+                      ranges.append((start, start + length))
+
+          candidate = 100000
+          while True:
+              end = candidate + size
+              conflicts = [stop for start, stop in ranges
+                           if candidate < stop and start < end]
+              if not conflicts:
+                  print(candidate)
+                  break
+              candidate = max(conflicts)
+          PY
+            )"
+            for map_file in "${missing_files[@]}"; do
+              echo "Adding $build_user:$range_start:65536 to $map_file"
+              printf '%s:%s:65536\n' "$build_user" "$range_start" | sudo tee -a "$map_file" >/dev/null
+            done
+          fi
+
+          echo "User-namespace settings:"
+          sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          echo "Subordinate mappings for $build_user:"
+          awk -F: -v user="$build_user" '$1 == user' /etc/subuid | sed 's/^/subuid: /'
+          awk -F: -v user="$build_user" '$1 == user' /etc/subgid | sed 's/^/subgid: /'
+
       - name: Fetch pinned official build tree
         run: |
           ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
           git -C "$UPSTREAM" submodule update --init rbm
+      - name: Validate pinned RBM container namespaces
+        run: |
+          set -euo pipefail
+          build_user="$(id -un)"
+          echo "RBM container preflight user: $build_user (uid=$(id -u) gid=$(id -g))"
+          sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          awk -F: -v user="$build_user" '$1 == user' /etc/subuid | sed 's/^/subuid: /'
+          awk -F: -v user="$build_user" '$1 == user' /etc/subgid | sed 's/^/subgid: /'
+          echo "Running the pinned RBM container implementation: $UPSTREAM/rbm/container run -- /bin/true"
+          "$UPSTREAM/rbm/container" run -- /bin/true
+          echo "Pinned RBM container preflight succeeded."
+      - name: Check whether current RBM stage is complete
+        id: stage
+        run: |
+          if ./scripts/rbm-release-artifacts.py stage-complete --upstream "$UPSTREAM" --stage "$RBM_PROJECT"; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Restore verified RBM outputs
+        if: steps.stage.outputs.complete != 'true'
         run: ./scripts/rbm-release-artifacts.py restore --upstream "$UPSTREAM"
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Record existing outputs
+        if: steps.stage.outputs.complete != 'true'
         run: ./scripts/rbm-release-artifacts.py snapshot --upstream "$UPSTREAM" --file "$RUNNER_TEMP/before"
       - name: Build stage through RBM
+        if: steps.stage.outputs.complete != 'true'
         timeout-minutes: 330
         run: |
           cd "$UPSTREAM"
           ./rbm/rbm showconf "$RBM_PROJECT" input_files --target alpha --target mullvadbrowser-windows-x86_64
           ./rbm/rbm build "$RBM_PROJECT" --target alpha --target mullvadbrowser-windows-x86_64
       - name: Publish new immutable RBM outputs
+        if: steps.stage.outputs.complete != 'true'
         run: ./scripts/rbm-release-artifacts.py publish --upstream "$UPSTREAM" --before "$RUNNER_TEMP/before" --stage "$RBM_PROJECT"
         env:
           GH_TOKEN: ${{ github.token }}
