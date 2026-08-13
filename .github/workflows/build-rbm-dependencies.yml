@@ -10,15 +10,13 @@ concurrency:
   group: rbm-dependencies
   cancel-in-progress: false
 
-env:
-  UPSTREAM: ${{ runner.temp }}/tor-browser-build
-  GH_TOKEN: ${{ github.token }}
-
 jobs:
   clang:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps: &rbm_steps
+      - name: Initialize shared build environment
+        run: echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - name: Name dependency release from upstream lock
         run: |
@@ -39,6 +37,8 @@ jobs:
           git -C "$UPSTREAM" submodule update --init rbm
       - name: Restore verified RBM outputs
         run: ./scripts/rbm-release-artifacts.py restore --upstream "$UPSTREAM"
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Record existing outputs
         run: ./scripts/rbm-release-artifacts.py snapshot --upstream "$UPSTREAM" --file "$RUNNER_TEMP/before"
       - name: Build stage through RBM
@@ -49,12 +49,14 @@ jobs:
           ./rbm/rbm build "$RBM_PROJECT" --target alpha --target mullvadbrowser-windows-x86_64
       - name: Publish new immutable RBM outputs
         run: ./scripts/rbm-release-artifacts.py publish --upstream "$UPSTREAM" --before "$RUNNER_TEMP/before" --stage "$RBM_PROJECT"
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Upload RBM build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rbm-logs-${{ env.RBM_PROJECT }}
-          path: ${{ env.UPSTREAM }}/logs/
+          path: ${{ runner.temp }}/tor-browser-build/logs/
           if-no-files-found: warn
     env:
       RBM_PROJECT: clang
