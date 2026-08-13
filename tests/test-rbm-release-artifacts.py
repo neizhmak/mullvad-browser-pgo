@@ -63,7 +63,8 @@ class PublicationTests(unittest.TestCase):
         (bindir / "gh").chmod(0o755)
         self.store = self.base / "releases"
         self.env = os.environ | {"PATH": f"{bindir}:{os.environ['PATH']}",
-                                 "FAKE_GH_STORE": str(self.store)}
+                                 "FAKE_GH_STORE": str(self.store),
+                                 "GITHUB_SHA": "0123456789abcdef0123456789abcdef01234567"}
         self.release = "rbm-dependencies-mb-test"
 
     def tearDown(self):
@@ -124,6 +125,15 @@ class PublicationTests(unittest.TestCase):
         create_args = (self.store / "create-args").read_text()
         self.assertIn("--prerelease", create_args)
         self.assertIn("--latest=false", create_args)
+        self.assertIn("--target 0123456789abcdef0123456789abcdef01234567", create_args)
+
+    def test_two_gibibyte_asset_is_rejected_before_upload(self):
+        with self.artifact.open("wb") as stream:
+            stream.truncate(2 * 1024 * 1024 * 1024)
+        result = self.publish()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be below 2 GiB", result.stderr)
+        self.assertFalse((self.store / self.release).exists())
 
 
 if __name__ == "__main__":

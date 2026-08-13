@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 
+MAX_RELEASE_ASSET_SIZE = 2 * 1024 * 1024 * 1024
+
 
 def run(*args):
     subprocess.run(args, check=True)
@@ -104,11 +106,17 @@ def publish(args, root):
     provenance = lock(root)
     artifacts = []
     for path in paths:
+        size = path.stat().st_size
+        if size >= MAX_RELEASE_ASSET_SIZE:
+            raise SystemExit(
+                f"RBM artifact is too large for a GitHub Release asset "
+                f"({size} bytes; must be below 2 GiB): {path}"
+            )
         relative = str(path.relative_to(upstream))
         project = Path(relative).parts[1]
         asset = f"rbm-{provenance['commit'][:12]}--{project}--{path.name}"
         artifacts.append({"project": project, "filename": path.name, "path": relative,
-                          "asset": asset, "sha256": digest(path), "size": path.stat().st_size})
+                          "asset": asset, "sha256": digest(path), "size": size})
     registry = Path(args.registry_dir) / f"registry-{args.stage}.json"
     registry.parent.mkdir(parents=True, exist_ok=True)
     if registry.exists():
@@ -126,7 +134,7 @@ def publish(args, root):
         run("gh", "release", "create", args.release, "--repo", args.repository,
             "--title", f"RBM dependencies for {provenance['tag']}",
             "--notes", "Unmodified outputs produced by the pinned official RBM recipes.",
-            "--prerelease", "--latest=false")
+            "--prerelease", "--latest=false", "--target", os.environ["GITHUB_SHA"])
     assets = release_assets(args.repository, args.release)
     # The registry is uploaded last: it is the commit record for this stage.
     for path, artifact in zip(paths, artifacts):

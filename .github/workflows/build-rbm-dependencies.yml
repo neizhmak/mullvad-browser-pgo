@@ -7,7 +7,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: rbm-dependencies-${{ github.ref }}
+  group: rbm-dependencies
   cancel-in-progress: false
 
 env:
@@ -42,10 +42,18 @@ jobs:
       - name: Record existing outputs
         run: ./scripts/rbm-release-artifacts.py snapshot --upstream "$UPSTREAM" --file "$RUNNER_TEMP/before"
       - name: Build stage through RBM
+        timeout-minutes: 330
         run: |
           cd "$UPSTREAM"
           ./rbm/rbm showconf "$RBM_PROJECT" input_files --target alpha --target mullvadbrowser-windows-x86_64
           ./rbm/rbm build "$RBM_PROJECT" --target alpha --target mullvadbrowser-windows-x86_64
+      - name: Upload RBM build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rbm-logs-${{ env.RBM_PROJECT }}
+          path: ${{ env.UPSTREAM }}/logs/
+          if-no-files-found: warn
       - name: Publish new immutable RBM outputs
         run: ./scripts/rbm-release-artifacts.py publish --upstream "$UPSTREAM" --before "$RUNNER_TEMP/before" --stage "$RBM_PROJECT"
     env:
