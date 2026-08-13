@@ -16,7 +16,7 @@ concurrency:
 jobs:
   windows-x86_64:
     runs-on: ubuntu-24.04
-    timeout-minutes: 720
+    timeout-minutes: 360
     steps:
       - name: Initialize build environment
         run: echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
@@ -105,18 +105,20 @@ jobs:
             --stage clang --stage mingw-w64-clang --stage rust
           echo "Restored RBM outputs:"
           find "$UPSTREAM/out" -type f -printf '%P\n' | sort
+          df -h
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Show official browser inputs
-        working-directory: ${{ env.UPSTREAM }}
-        run: ./rbm/rbm showconf browser input_files --target alpha --target mullvadbrowser-windows-x86_64
+        run: |
+          cd "$UPSTREAM"
+          ./rbm/rbm showconf browser input_files --target alpha --target mullvadbrowser-windows-x86_64
 
       - name: Build official baseline target
-        timeout-minutes: 660
-        working-directory: ${{ env.UPSTREAM }}
+        timeout-minutes: 330
         run: |
           set -o pipefail
+          cd "$UPSTREAM"
           make mullvadbrowser-alpha-windows-x86_64 2>&1 | tee "$RUNNER_TEMP/baseline-build.log"
 
       - name: Collect resulting Windows packages

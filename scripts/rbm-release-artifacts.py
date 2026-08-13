@@ -238,6 +238,8 @@ def restore_required(args, root):
         shutil.copyfile(downloaded, output_path)
         print(f"Restored verified RBM output: {output_path}")
     print("All required RBM stages restored: " + ", ".join(args.stage))
+    shutil.rmtree(download_dir)
+    print(f"Removed verified temporary downloads: {download_dir}")
 
 
 def snapshot(args):

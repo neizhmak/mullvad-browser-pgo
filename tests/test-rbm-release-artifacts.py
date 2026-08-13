@@ -242,6 +242,39 @@ class PublicationTests(unittest.TestCase):
                       result.stderr)
         self.assertFalse(self.artifact.exists())
 
+    def test_successful_required_restore_removes_temporary_downloads(self):
+        self.assertEqual(self.publish().returncode, 0)
+        release = self.store / self.release
+        registry = json.loads((release / "registry-clang.json").read_text())
+        for stage in ("mingw-w64-clang", "rust"):
+            stage_registry = dict(registry, stage=stage)
+            content = f"official {stage} bytes".encode()
+            asset_name = f"rbm-test--{stage}--{stage}.tar.zst"
+            stage_registry["artifacts"] = [{
+                "project": stage,
+                "filename": f"{stage}.tar.zst",
+                "path": f"out/{stage}/{stage}.tar.zst",
+                "asset": asset_name,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size": len(content),
+            }]
+            name = f"registry-{stage}.json"
+            payload = (json.dumps(stage_registry) + "\n").encode()
+            (release / name).write_bytes(payload)
+            (release / asset_name).write_bytes(content)
+            metadata = json.loads((release / ".assets.json").read_text())
+            metadata[name] = {"id": 2000 + len(metadata), "state": "uploaded",
+                              "size": len(payload)}
+            metadata[asset_name] = {"id": 3000 + len(metadata), "state": "uploaded",
+                                    "size": len(content)}
+            (release / ".assets.json").write_text(json.dumps(metadata))
+        self.artifact.unlink()
+        result = self.restore_required("clang", "mingw-w64-clang", "rust")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.artifact.is_file())
+        self.assertFalse((self.registry_dir / "required").exists())
+        self.assertIn("Removed verified temporary downloads", result.stdout)
+
     def test_required_restore_verifies_every_stage_before_copying(self):
         self.assertEqual(self.publish().returncode, 0)
         release = self.store / self.release

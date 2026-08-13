@@ -2,6 +2,7 @@
 """Structural checks for the baseline/control build orchestration."""
 
 from pathlib import Path
+import re
 import unittest
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/baseline.yml"
@@ -33,6 +34,23 @@ class BaselineWorkflowTests(unittest.TestCase):
         logs = workflow.index("      - name: Upload RBM and browser build logs\n")
         self.assertIn("        if: always()\n", workflow[logs:])
         self.assertNotIn("gh release create", workflow)
+
+    def test_timeouts_fit_github_hosted_runner_limits(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        timeouts = [int(value) for value in
+                    re.findall(r"^\s+timeout-minutes:\s*(\d+)\s*$", workflow,
+                               flags=re.MULTILINE)]
+        self.assertTrue(timeouts)
+        self.assertTrue(all(timeout <= 360 for timeout in timeouts), timeouts)
+        self.assertIn("    timeout-minutes: 360\n", workflow)
+        self.assertIn("        timeout-minutes: 330\n", workflow)
+
+    def test_dynamic_upstream_is_not_used_as_expression_context(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn('echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"',
+                      workflow)
+        self.assertNotIn("${{ env.UPSTREAM }}", workflow)
+        self.assertGreaterEqual(workflow.count('cd "$UPSTREAM"'), 2)
 
 if __name__ == "__main__":
     unittest.main()
