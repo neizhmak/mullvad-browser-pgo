@@ -48,6 +48,46 @@ either of its object IDs changed, resolution treats that as an integrity
 anomaly in every mode; even `--update-lock` refuses to overwrite it. Lock
 updates are limited to tags that are numerically newer than the locked tag.
 
-This first stage only pins, resolves, validates, and fetches upstream. It does
-not compile a toolchain or browser, apply PGO, publish releases, or poll on a
-schedule.
+## Reusable official RBM dependencies
+
+The manually dispatched **Build official RBM dependencies** workflow persists
+the expensive compiler chain for the pinned Mullvad Browser Alpha Windows
+x86_64 build. Inspection of RBM's evaluated `input_files` showed these useful
+checkpoint boundaries:
+
+1. `clang`, which recursively obtains/builds its container image, CMake,
+   Ninja, LLVM source, and the native build tools selected by RBM;
+2. `mingw-w64-clang`, which consumes that `clang` output and recursively adds
+   the MinGW sources, WASI compiler-rt, CMake, and LLVM source;
+3. `rust`, which consumes `mingw-w64-clang` as `var/compiler` for the Windows
+   target and recursively obtains/builds CMake, Ninja, the official bootstrap
+   Rust, and its other RBM inputs.
+
+Each stage uses the target list which the official release project passes to
+the Windows browser dependency chain:
+
+```sh
+./rbm/rbm build clang --target alpha --target mullvadbrowser-windows-x86_64
+./rbm/rbm build mingw-w64-clang --target alpha --target mullvadbrowser-windows-x86_64
+./rbm/rbm build rust --target alpha --target mullvadbrowser-windows-x86_64
+```
+
+There is deliberately no repository-owned dependency graph. Before each build,
+the workflow also prints RBM's evaluated `input_files`; RBM alone decides what
+is missing and recursively builds it. The split follows the two LLVM-scale
+compiler builds and Rust so that each completed expensive boundary survives a
+later timeout. The workflow stops after Rust and never invokes `firefox`,
+`browser`, `release`, or the official `make
+mullvadbrowser-alpha-windows-x86_64` browser target.
+
+Every job starts with a clean runner and exact checkout from
+`upstream.lock.json`. It downloads each prior release registry, checks the full
+locked upstream provenance plus every byte's SHA-256 and size, and copies each
+unchanged asset back to its recorded `out/<project>/<filename>` location. A
+normal subsequent `rbm build` therefore finds the artifact by its own expected
+filename/build ID through its normal `input_files` mechanism. Newly created
+files under `out/` are uploaded byte-for-byte, followed by a small stage
+registry recording project, original filename/path, digest, size, and upstream
+lock. The registry is uploaded last as the stage's commit record. Existing,
+verified registries make reruns no-ops; provenance, checksum, or unexpected
+identity conflicts fail instead of being overwritten.
