@@ -47,6 +47,8 @@ jobs:
           cd "$UPSTREAM"
           ./rbm/rbm showconf "$RBM_PROJECT" input_files --target alpha --target mullvadbrowser-windows-x86_64
           ./rbm/rbm build "$RBM_PROJECT" --target alpha --target mullvadbrowser-windows-x86_64
+      - name: Publish new immutable RBM outputs
+        run: ./scripts/rbm-release-artifacts.py publish --upstream "$UPSTREAM" --before "$RUNNER_TEMP/before" --stage "$RBM_PROJECT"
       - name: Upload RBM build logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -54,8 +56,6 @@ jobs:
           name: rbm-logs-${{ env.RBM_PROJECT }}
           path: ${{ env.UPSTREAM }}/logs/
           if-no-files-found: warn
-      - name: Publish new immutable RBM outputs
-        run: ./scripts/rbm-release-artifacts.py publish --upstream "$UPSTREAM" --before "$RUNNER_TEMP/before" --stage "$RBM_PROJECT"
     env:
       RBM_PROJECT: clang
 
