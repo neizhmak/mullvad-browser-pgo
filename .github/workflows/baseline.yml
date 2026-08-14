@@ -117,9 +117,7 @@ jobs:
       - name: Build official baseline target
         timeout-minutes: 330
         run: |
-          set -o pipefail
-          cd "$UPSTREAM"
-          make mullvadbrowser-alpha-windows-x86_64 2>&1 | tee "$RUNNER_TEMP/baseline-build.log"
+          "$GITHUB_WORKSPACE/scripts/run-baseline-build.sh"
 
       - name: Collect resulting Windows packages
         run: |
