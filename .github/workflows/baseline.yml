@@ -114,12 +114,14 @@ jobs:
           cd "$UPSTREAM"
           ./rbm/rbm showconf browser input_files --target alpha --target mullvadbrowser-windows-x86_64
 
+      - name: Prepare verified Binutils source input
+        run: |
+          "$GITHUB_WORKSPACE/scripts/prepare-binutils-input.sh"
+
       - name: Build official baseline target
         timeout-minutes: 330
         run: |
-          set -o pipefail
-          cd "$UPSTREAM"
-          make mullvadbrowser-alpha-windows-x86_64 2>&1 | tee "$RUNNER_TEMP/baseline-build.log"
+          "$GITHUB_WORKSPACE/scripts/run-baseline-build.sh"
 
       - name: Collect resulting Windows packages
         run: |
