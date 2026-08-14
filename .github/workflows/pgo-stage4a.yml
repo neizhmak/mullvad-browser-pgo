@@ -11,7 +11,7 @@ concurrency:
 jobs:
   pgo-generate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 720
     steps:
       - uses: actions/checkout@v4
       - name: Initialize pinned build
@@ -19,6 +19,7 @@ jobs:
           echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
           tag="$(jq -r .tag upstream.lock.json)"
           echo "RBM_RELEASE=rbm-dependencies-$tag" >> "$GITHUB_ENV"
+          echo "PGO_TOOLCHAIN_RELEASE=pgo-toolchains-$tag" >> "$GITHUB_ENV"
       - name: Install RBM requirements
         run: |
           sudo apt-get update
@@ -83,6 +84,50 @@ jobs:
           ./scripts/validate-pgo-overlay.sh
           ./scripts/resolve-pgo-provenance.sh
           (cd "$UPSTREAM" && ./rbm/rbm showconf firefox input_files --target alpha --target mullvadbrowser-windows-x86_64 --target pgo-generate)
+      - name: Resolve exact PGO Rust provenance
+        run: ./scripts/resolve-pgo-rust-identity.py --upstream "$UPSTREAM" --output "$RUNNER_TEMP/pgo-rust-identity.json"
+      - name: Check for committed profiler-enabled Rust
+        id: pgo_rust
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          if ./scripts/rbm-release-artifacts.py stage-complete --upstream "$UPSTREAM" --release "$PGO_TOOLCHAIN_RELEASE" --stage rust-pgo --identity-file "$RUNNER_TEMP/pgo-rust-identity.json"; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Restore committed profiler-enabled Rust
+        if: steps.pgo_rust.outputs.complete == 'true'
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: ./scripts/rbm-release-artifacts.py restore-required --upstream "$UPSTREAM" --release "$PGO_TOOLCHAIN_RELEASE" --stage rust-pgo --identity-file "$RUNNER_TEMP/pgo-rust-identity.json"
+      - name: Snapshot official outputs before PGO Rust build
+        if: steps.pgo_rust.outputs.complete != 'true'
+        run: ./scripts/rbm-release-artifacts.py snapshot --upstream "$UPSTREAM" --file "$RUNNER_TEMP/pgo-rust-before"
+      - name: Build distinct profiler-enabled Rust through pinned RBM
+        if: steps.pgo_rust.outputs.complete != 'true'
+        timeout-minutes: 330
+        run: |
+          cd "$UPSTREAM"
+          ./rbm/rbm showconf rust build --target alpha --target mullvadbrowser-windows-x86_64 --target pgo-generate | grep -F -- '--set build.profiler=true'
+          ./rbm/rbm build rust --target alpha --target mullvadbrowser-windows-x86_64 --target pgo-generate
+      - name: Create PGO toolchain technical prerelease if absent
+        if: steps.pgo_rust.outputs.complete != 'true'
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          if gh release view "$PGO_TOOLCHAIN_RELEASE" >/dev/null 2>&1; then
+            test "$(gh release view "$PGO_TOOLCHAIN_RELEASE" --json isPrerelease --jq .isPrerelease)" = true || { echo 'existing PGO toolchain tag is not a prerelease' >&2; exit 1; }
+          else
+            gh release create "$PGO_TOOLCHAIN_RELEASE" --prerelease --latest=false --target "$GITHUB_SHA" --title "Technical PGO toolchains $(jq -r .tag upstream.lock.json)" --notes 'Profiler-enabled Rust for cross-language PGO; separate from exact official RBM outputs.'
+          fi
+      - name: Publish immutable PGO Rust payload and registry last
+        if: steps.pgo_rust.outputs.complete != 'true'
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: ./scripts/rbm-release-artifacts.py publish --upstream "$UPSTREAM" --release "$PGO_TOOLCHAIN_RELEASE" --before "$RUNNER_TEMP/pgo-rust-before" --stage rust-pgo --project rust --identity-file "$RUNNER_TEMP/pgo-rust-identity.json"
+      - name: Functionally preflight exact Firefox PGO Rust toolchain
+        run: ./scripts/preflight-pgo-rust.sh
       - name: Prepare verified source fallback
         run: ./scripts/prepare-binutils-input.sh
       - name: Build only instrumented Firefox
@@ -90,7 +135,7 @@ jobs:
         run: ./scripts/run-pgo-generate.sh
       - name: Complete build provenance
         run: |
-          clang_archive="$(find "$UPSTREAM/out/mingw-w64-clang" -type f | head -1)"; rust_archive="$(find "$UPSTREAM/out/rust" -type f | head -1)"
+          clang_archive="$(find "$UPSTREAM/out/mingw-w64-clang" -type f | head -1)"; rust_name="$(cd "$UPSTREAM" && ./rbm/rbm showconf rust filename --target alpha --target mullvadbrowser-windows-x86_64 --target pgo-generate)"; rust_archive="$(find "$UPSTREAM/out/rust" -type f -name "$rust_name" -print -quit)"; test -n "$rust_archive"
           mkdir "$RUNNER_TEMP/tools"; tar -xaf "$clang_archive" -C "$RUNNER_TEMP/tools"; tar -xaf "$rust_archive" -C "$RUNNER_TEMP/tools"
           clang="$(find "$RUNNER_TEMP/tools" -type f -name clang -perm -111 | head -1)"; rustc="$(find "$RUNNER_TEMP/tools" -type f -name rustc -perm -111 | head -1)"
           package="$(find "$RUNNER_TEMP/instrumented" -type f -name '*.tar.*')"
