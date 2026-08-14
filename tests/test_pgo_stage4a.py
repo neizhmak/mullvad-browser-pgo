@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 ROOT=Path(__file__).resolve().parents[1]
 WORKFLOW=(ROOT/'.github/workflows/pgo-stage4a.yml').read_text()
@@ -7,6 +9,7 @@ PATCH=(ROOT/'patches/firefox-pgo-generate.patch').read_text()
 TRAIN=(ROOT/'scripts/train-pgo.ps1').read_text()
 RUN=(ROOT/'scripts/run-pgo-generate.sh').read_text()
 PUBLISH=(ROOT/'scripts/publish-pgo-profile.py').read_text()
+VALIDATOR=ROOT/'scripts/validate-pgo-rendering.py'
 BASELINE=(ROOT/'.github/workflows/baseline.yml').read_text()
 class Stage4ATests(unittest.TestCase):
  def test_baseline_remains_non_pgo_control(self):
@@ -16,13 +19,46 @@ class Stage4ATests(unittest.TestCase):
   self.assertIn('--enable-profile-generate=cross',PATCH)
   self.assertIn('pgo-generate:',PATCH); self.assertNotIn('--enable-profile-use',PATCH)
   self.assertIn('--target pgo-generate',RUN)
+  self.assertIn('./scripts/validate-pgo-overlay.sh',WORKFLOW)
+ def test_effective_rendering_places_option_inside_configure_only_for_pgo(self):
+  baseline = ("#!/bin/bash\necho Starting\n./mach configure \\\n"
+              "  --with-distribution-id=org.torproject \\\n"
+              "  --with-base-browser-version=16.0a9 \\\n"
+              "  --without-wasm-sandboxed-libraries\n")
+  pgo = baseline.replace("  --with-base", "  --enable-profile-generate=cross \\\n  --with-base")
+  with tempfile.TemporaryDirectory() as directory:
+   baseline_path=Path(directory)/'baseline'; pgo_path=Path(directory)/'pgo'
+   baseline_path.write_text(baseline); pgo_path.write_text(pgo)
+   result=subprocess.run([VALIDATOR,'--baseline',baseline_path,'--pgo',pgo_path],text=True,capture_output=True)
+  self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+  self.assertIn('contains --enable-profile-generate=cross',result.stdout)
+  with tempfile.TemporaryDirectory() as directory:
+   baseline_path=Path(directory)/'baseline'; pgo_path=Path(directory)/'pgo'
+   baseline_path.write_text(baseline)
+   pgo_path.write_text(baseline + "--enable-profile-generate=cross\n")
+   standalone=subprocess.run([VALIDATOR,'--baseline',baseline_path,'--pgo',pgo_path],text=True,capture_output=True)
+  self.assertNotEqual(standalone.returncode,0)
+ def test_windows_uses_pinned_mach_python_and_collects_profileserver_location(self):
+  self.assertIn("actions/setup-python@v5",WORKFLOW)
+  self.assertIn("python-version: '3.12'",WORKFLOW)
+  self.assertIn('python mach python --virtualenv build build/pgo/profileserver.py',TRAIN)
+  self.assertNotIn('$env:LLVM_PROFILE_FILE',TRAIN)
+  self.assertIn("Get-ChildItem $source -File -Filter '*.profraw'",TRAIN)
+  self.assertIn('Remove-Item -Force',TRAIN)
+  self.assertIn('Move-Item -LiteralPath',TRAIN)
+  self.assertIn('profileserver.py SHA-256 does not match generation provenance',TRAIN)
+ def test_namespace_setup_reuses_nonoverlapping_range_logic(self):
+  self.assertIn('conflicts = [stop for start, stop in ranges',WORKFLOW)
+  self.assertIn('missing_files=()',WORKFLOW)
+  self.assertNotIn('echo "$user:100000:65536"',WORKFLOW)
  def test_generate_and_use_are_mutually_excluded(self):
   self.assertIn("grep -F -- '--enable-profile-use'",RUN)
   self.assertIn('profile-use was accidentally enabled',RUN)
  def test_training_is_native_windows_exact_profileserver(self):
   self.assertIn('runs-on: windows-2025',WORKFLOW)
   self.assertIn('build\\pgo\\profileserver.py',TRAIN)
-  self.assertIn('git -C $env:RUNNER_TEMP\\firefox-source fetch --depth=1 origin $env:FIREFOX_REVISION',TRAIN)
+  self.assertIn('git -C $source fetch --depth=1 origin',TRAIN)
+  self.assertIn('$env:FIREFOX_REF',TRAIN)
   self.assertNotIn('wine', (WORKFLOW+TRAIN).lower())
   self.assertNotIn('speedometer', (WORKFLOW+TRAIN).lower())
  def test_training_rejects_empty_outputs(self):
