@@ -1,0 +1,16 @@
+diff --git a/projects/firefox/build b/projects/firefox/build
+index 9e9b6c8..0797766 100644
+--- a/projects/firefox/build
++++ b/projects/firefox/build
+@@ -123,0 +124 @@ echo "Starting ./mach configure $(date)"
++  [% IF c("var/pgo_generate") -%]--enable-profile-generate=cross[% END %] \
+diff --git a/projects/firefox/config b/projects/firefox/config
+index 6ba1024..f97b15a 100644
+--- a/projects/firefox/config
++++ b/projects/firefox/config
+@@ -96,0 +97,5 @@ targets:
++  # Overlay-selected target: absent from all normal release target chains.
++  pgo-generate:
++    var:
++      pgo_generate: 1
++

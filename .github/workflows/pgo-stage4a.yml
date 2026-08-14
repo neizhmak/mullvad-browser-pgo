@@ -1,0 +1,142 @@
+name: Stage 4A - Generate verified Windows PGO profile
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  RBM_NO_DEBUG: "1"
+concurrency:
+  group: pgo-stage4a-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  pgo-generate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize pinned build
+        run: |
+          echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
+          tag="$(jq -r .tag upstream.lock.json)"
+          echo "RBM_RELEASE=rbm-dependencies-$tag" >> "$GITHUB_ENV"
+      - name: Install RBM requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdata-dump-perl libdata-uuid-perl libdatetime-perl libdigest-sha-perl libfile-copy-recursive-perl libfile-slurp-perl libio-all-perl libcapture-tiny-perl libio-handle-util-perl libjson-perl libparallel-forkmanager-perl libpath-tiny-perl libsort-versions-perl libstring-shellquote-perl libtemplate-perl libxml-libxml-perl libxml-writer-perl libyaml-libyaml-perl git uidmap zstd jq
+      - name: Prepare RBM namespace
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          user="$(id -un)"; for f in /etc/subuid /etc/subgid; do awk -F: -v u="$user" '$1==u&&$3>0{ok=1}END{exit !ok}' "$f" || echo "$user:100000:65536" | sudo tee -a "$f"; done
+      - name: Fetch exact upstream and restore compilers
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
+          git -C "$UPSTREAM" submodule update --init rbm
+          "$UPSTREAM/rbm/container" run -- /bin/true
+          ./scripts/rbm-release-artifacts.py restore-required --upstream "$UPSTREAM" --stage clang --stage mingw-w64-clang --stage rust
+      - name: Apply explicit PGO-generation overlay and resolve source
+        run: |
+          ./scripts/prepare-pgo-generate.sh
+          ./scripts/resolve-pgo-provenance.sh
+          "$UPSTREAM/rbm/rbm" showconf firefox input_files --target alpha --target mullvadbrowser-windows-x86_64 --target pgo-generate
+      - name: Prepare verified source fallback
+        run: ./scripts/prepare-binutils-input.sh
+      - name: Build only instrumented Firefox
+        timeout-minutes: 330
+        run: ./scripts/run-pgo-generate.sh
+      - name: Complete build provenance
+        run: |
+          clang_archive="$(find "$UPSTREAM/out/mingw-w64-clang" -type f | head -1)"; rust_archive="$(find "$UPSTREAM/out/rust" -type f | head -1)"
+          mkdir "$RUNNER_TEMP/tools"; tar -xaf "$clang_archive" -C "$RUNNER_TEMP/tools"; tar -xaf "$rust_archive" -C "$RUNNER_TEMP/tools"
+          clang="$(find "$RUNNER_TEMP/tools" -type f -name clang -perm -111 | head -1)"; rustc="$(find "$RUNNER_TEMP/tools" -type f -name rustc -perm -111 | head -1)"
+          package="$(find "$RUNNER_TEMP/instrumented" -type f -name '*.tar.*')"
+          jq --arg package_sha "$(sha256sum "$package"|cut -d' ' -f1)" --arg clang "$($clang --version | head -1)" --arg rust "$($rustc --version)" '.instrumented_package_sha256=$package_sha | .clang_identity=$clang | .rust_identity=$rust' "$RUNNER_TEMP/provenance/build.json" > "$RUNNER_TEMP/provenance/build.tmp"
+          mv "$RUNNER_TEMP/provenance/build.tmp" "$RUNNER_TEMP/provenance/build.json"
+      - uses: actions/upload-artifact@v4
+        with: { name: pgo-instrumented-firefox, path: "${{ runner.temp }}/instrumented/", if-no-files-found: error }
+      - uses: actions/upload-artifact@v4
+        with: { name: pgo-build-provenance, path: "${{ runner.temp }}/provenance/", if-no-files-found: error }
+      - name: Upload generation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-generation-logs
+          path: |
+            ${{ runner.temp }}/pgo-generate-build.log
+            ${{ runner.temp }}/tor-browser-build/logs/
+          if-no-files-found: warn
+  pgo-train:
+    needs: pgo-generate
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: pgo-instrumented-firefox, path: "${{ runner.temp }}/instrumented" }
+      - uses: actions/download-artifact@v4
+        with: { name: pgo-build-provenance, path: "${{ runner.temp }}/provenance" }
+      - name: Load exact Firefox identity
+        shell: pwsh
+        run: |
+          $p = Get-Content "$env:RUNNER_TEMP\provenance\build.json" | ConvertFrom-Json
+          "FIREFOX_REPOSITORY=$($p.firefox.repository)" >> $env:GITHUB_ENV
+          "FIREFOX_REVISION=$($p.firefox.revision)" >> $env:GITHUB_ENV
+      - name: Run exact upstream profileserver natively
+        shell: pwsh
+        run: ./scripts/train-pgo.ps1
+      - name: Upload raw profiles and jarlog
+        uses: actions/upload-artifact@v4
+        with: { name: pgo-training-output, path: "${{ runner.temp }}/training-output/", if-no-files-found: error }
+      - name: Upload training diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: pgo-training-logs, path: "${{ runner.temp }}/training-output/profileserver.log", if-no-files-found: warn }
+  pgo-merge:
+    needs: pgo-train
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize dependency identity
+        run: |
+          echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
+          echo "RBM_RELEASE=rbm-dependencies-$(jq -r .tag upstream.lock.json)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with: { name: pgo-training-output, path: "${{ runner.temp }}/training" }
+      - uses: actions/download-artifact@v4
+        with: { name: pgo-build-provenance, path: "${{ runner.temp }}/provenance" }
+      - name: Restore exact build clang
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          mkdir -p "$UPSTREAM"
+          ./scripts/rbm-release-artifacts.py restore-required --upstream "$UPSTREAM" --stage mingw-w64-clang
+          archive="$(find "$UPSTREAM/out/mingw-w64-clang" -type f | head -1)"; mkdir "$RUNNER_TEMP/clang"; tar -xaf "$archive" -C "$RUNNER_TEMP/clang"
+          profdata="$(find "$RUNNER_TEMP/clang" -type f -name llvm-profdata -perm -111 | head -1)"; test -n "$profdata"
+          echo "LLVM_PROFDATA=$profdata" >> "$GITHUB_ENV"
+      - name: Merge and verify real profile counters
+        run: |
+          set -euo pipefail; mkdir "$RUNNER_TEMP/profile"
+          mapfile -d '' raw < <(find "$RUNNER_TEMP/training" -type f -name '*.profraw' -size +0c -print0)
+          ((${#raw[@]} > 0)) || { echo 'no non-empty raw profiles' >&2; exit 1; }
+          test -s "$RUNNER_TEMP/training/jarlog" || { echo 'missing/empty jarlog' >&2; exit 1; }
+          "$LLVM_PROFDATA" merge -o "$RUNNER_TEMP/profile/merged.profdata" "${raw[@]}"
+          test -s "$RUNNER_TEMP/profile/merged.profdata"
+          "$LLVM_PROFDATA" show --summary-only "$RUNNER_TEMP/profile/merged.profdata" | tee "$RUNNER_TEMP/profile/llvm-profdata-summary.log"
+          cp "$RUNNER_TEMP/training/jarlog" "$RUNNER_TEMP/profile/jarlog"
+          jq --arg llvm "$($LLVM_PROFDATA --version | head -1)" --arg merged "$(sha256sum "$RUNNER_TEMP/profile/merged.profdata"|cut -d' ' -f1)" --arg jarlog "$(sha256sum "$RUNNER_TEMP/profile/jarlog"|cut -d' ' -f1)" '.llvm_profdata_identity=$llvm | .merged_profdata_sha256=$merged | .jarlog_sha256=$jarlog' "$RUNNER_TEMP/provenance/build.json" > "$RUNNER_TEMP/profile/provenance.json"
+          jq -n --slurpfile provenance "$RUNNER_TEMP/profile/provenance.json" '{schema:1,committed:true,provenance:$provenance[0],assets:["merged.profdata","jarlog","provenance.json"]}' > "$RUNNER_TEMP/profile/profile-registry.json"
+      - name: Create technical prerelease if absent
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          tag="pgo-profile-$(jq -r .tag upstream.lock.json)"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            test "$(gh release view "$tag" --json isPrerelease --jq .isPrerelease)" = true || { echo 'existing profile tag is not a prerelease' >&2; exit 1; }
+          else
+            gh release create "$tag" --prerelease --title "Technical PGO profile $(jq -r .tag upstream.lock.json)" --notes 'Verified Stage 4A inputs; not a browser product release.'
+          fi
+      - name: Publish immutable profile (registry last)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: ./scripts/publish-pgo-profile.py --repository "$GITHUB_REPOSITORY" --release "pgo-profile-$(jq -r .tag upstream.lock.json)" --directory "$RUNNER_TEMP/profile"
+      - name: Upload merge diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: pgo-merge-logs, path: "${{ runner.temp }}/profile/", if-no-files-found: warn }
