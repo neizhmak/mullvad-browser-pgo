@@ -9,6 +9,9 @@ PATCH=(ROOT/'patches/firefox-pgo-generate.patch').read_text()
 TRAIN=(ROOT/'scripts/train-pgo.ps1').read_text()
 RUN=(ROOT/'scripts/run-pgo-generate.sh').read_text()
 PUBLISH=(ROOT/'scripts/publish-pgo-profile.py').read_text()
+PREFLIGHT=(ROOT/'scripts/preflight-pgo-rust.sh').read_text()
+RUST_IDENTITY=(ROOT/'scripts/resolve-pgo-rust-identity.py').read_text()
+RELEASES=(ROOT/'scripts/rbm-release-artifacts.py').read_text()
 VALIDATOR=ROOT/'scripts/validate-pgo-rendering.py'
 BASELINE=(ROOT/'.github/workflows/baseline.yml').read_text()
 class Stage4ATests(unittest.TestCase):
@@ -76,4 +79,38 @@ class Stage4ATests(unittest.TestCase):
   self.assertIn("if 'profile-registry.json' in current",PUBLISH)
   self.assertIn('conflicting verified profile already committed',PUBLISH)
   self.assertIn('committed:true',WORKFLOW)
+ def test_pgo_target_alone_selects_distinct_profiler_rust(self):
+  self.assertIn('pgo-generate:',PATCH)
+  self.assertIn('filename_targets: "[% c(\'var/platform\') %]-profiler"',PATCH)
+  self.assertIn('--set build.profiler=true',PATCH)
+  self.assertNotIn('build.profiler',BASELINE)
+  self.assertIn("normal == pgo",RUST_IDENTITY)
+ def test_official_rust_release_is_never_used_for_pgo_publication(self):
+  self.assertIn('PGO_TOOLCHAIN_RELEASE=pgo-toolchains-$tag',WORKFLOW)
+  self.assertIn('--release "$PGO_TOOLCHAIN_RELEASE" --stage rust-pgo',WORKFLOW)
+  self.assertNotIn('publish --upstream "$UPSTREAM" --release "$RBM_RELEASE" --stage rust-pgo',WORKFLOW)
+  self.assertIn('conflicting existing RBM output',RELEASES)
+ def test_pgo_rust_registry_has_separate_bound_provenance(self):
+  for field in ('upstream','rust','overlay','mingw_w64_clang','sha256','size'):
+   self.assertIn(field,RUST_IDENTITY)
+  self.assertIn('"identity": identity',RELEASES)
+  self.assertIn('registry_identity(data) != expected_identity',RELEASES)
+  self.assertLess(RELEASES.index('for path, artifact in zip(paths, artifacts):'),
+                  RELEASES.rindex('upload_asset(args, registry)'))
+ def test_committed_pgo_rust_is_restored_and_build_skipped(self):
+  self.assertIn("stage-complete",WORKFLOW); self.assertIn("complete=true",WORKFLOW)
+  self.assertIn("steps.pgo_rust.outputs.complete == 'true'",WORKFLOW)
+  self.assertIn("steps.pgo_rust.outputs.complete != 'true'",WORKFLOW)
+ def test_profile_generate_link_preflight_is_fatal_before_firefox(self):
+  self.assertIn('-C "profile-generate=$profile"',PREFLIGHT)
+  self.assertIn('--target "$target"',PREFLIGHT)
+  self.assertIn('rustc sysroot:',PREFLIGHT); self.assertIn('--print target-libdir',PREFLIGHT)
+  self.assertIn('pgo-rust-runtime-inventory.log',PREFLIGHT)
+  self.assertLess(WORKFLOW.index('Functionally preflight exact Firefox PGO Rust toolchain'),
+                  WORKFLOW.index('Build only instrumented Firefox'))
+ def test_no_rust_pgo_workaround(self):
+  combined=WORKFLOW+PATCH+RUN+PREFLIGHT
+  self.assertNotIn('MOZ_PGO_RUST=0',combined)
+  self.assertNotIn('--disable-profile-generate',combined)
+  self.assertIn('--enable-profile-generate=cross',combined)
 if __name__=='__main__': unittest.main()

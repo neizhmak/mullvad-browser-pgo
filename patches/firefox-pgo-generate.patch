@@ -24,3 +24,35 @@ index 6ba1024..f97b15a 100644
    firefoxbrowser:
      git_hash: '[% c("var/upstream_firefox_commit") %]'
      tag_gpg_id: 0
+diff --git a/projects/rust/build b/projects/rust/build
+index 1974911..965215c 100644
+--- a/projects/rust/build
++++ b/projects/rust/build
+@@ -121,6 +121,8 @@ cd build
+ # binaries do.
+-
++
+ ../configure \
++  [% IF c("var/profiler") -%]--set build.profiler=true \
++  [% END -%]
+   --prefix=$distdir \
+   --disable-docs --disable-compiler-docs \
+   --enable-local-rust \
+diff --git a/projects/rust/config b/projects/rust/config
+index 042145e..fd520ce 100644
+--- a/projects/rust/config
++++ b/projects/rust/config
+@@ -33,6 +33,12 @@ targets:
+       arch_deps:
+         - pkg-config
+-
++  # This identity is selected only by Firefox's cross-language PGO target.
++  # Keep the official windows Rust output and filename untouched.
++  pgo-generate:
++    var:
++      profiler: 1
++      filename_targets: "[% c('var/platform') %]-profiler"
++
+ input_files:
+   - project: container-image
+   - project: cmake

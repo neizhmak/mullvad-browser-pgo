@@ -36,6 +36,17 @@ def lock(root):
         return json.load(stream)
 
 
+def expected_identity(args, root):
+    if args.identity_file:
+        return json.loads(Path(args.identity_file).read_text(encoding="utf-8"))
+    return {"upstream": lock(root)}
+
+
+def registry_identity(data):
+    # Schema 1 official registries predate the explicit identity object.
+    return data.get("identity", {"upstream": data.get("upstream")})
+
+
 def safe_output(root, relative):
     path = Path(relative)
     if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "out":
@@ -126,7 +137,7 @@ def stage_complete(args, root):
         return False
     registry = download_asset(args, registry_name, Path(args.registry_dir) / "completion")
     data = json.loads(registry.read_text(encoding="utf-8"))
-    if data.get("upstream") != lock(root) or data.get("stage") != args.stage:
+    if registry_identity(data) != expected_identity(args, root) or data.get("stage") != args.stage:
         print(f"Stage {args.stage} is not complete: {registry_name} does not match the locked upstream.")
         return False
     for artifact in data.get("artifacts", []):
@@ -160,10 +171,10 @@ def restore(args, root):
                             and asset["state"] == "uploaded")
     for name in registry_names:
         download_asset(args, name, registries)
-    expected_lock = lock(root)
+    expected = expected_identity(args, root)
     for registry in sorted(registries.glob("registry-*.json")):
         data = json.loads(registry.read_text(encoding="utf-8"))
-        if data.get("upstream") != expected_lock:
+        if registry_identity(data) != expected:
             raise SystemExit(f"provenance mismatch in {registry.name}")
         for artifact in data.get("artifacts", []):
             output = safe_output(destination, artifact["path"])
@@ -185,7 +196,7 @@ def restore_required(args, root):
         raise SystemExit(f"required dependency Release does not exist: {args.release}")
 
     assets = release_assets(args.repository, args.release)
-    expected_lock = lock(root)
+    expected = expected_identity(args, root)
     planned = []
     output_paths = {}
     for stage in args.stage:
@@ -197,7 +208,7 @@ def restore_required(args, root):
         data = json.loads(registry.read_text(encoding="utf-8"))
         if data.get("schema") != 1 or data.get("stage") != stage:
             raise SystemExit(f"invalid required stage registry: {registry_name}")
-        if data.get("upstream") != expected_lock:
+        if registry_identity(data) != expected:
             raise SystemExit(f"provenance mismatch in {registry_name}")
         artifacts = data.get("artifacts")
         if not isinstance(artifacts, list) or not artifacts:
@@ -253,7 +264,13 @@ def publish(args, root):
     before = set(Path(args.before).read_text(encoding="utf-8").splitlines())
     paths = sorted(path for path in (upstream / "out").glob("**/*")
                    if path.is_file() and str(path.relative_to(upstream)) not in before)
+    if args.project:
+        paths = [path for path in paths
+                 if path.relative_to(upstream).parts[1] == args.project]
+        if not paths and not (Path(args.registry_dir) / f"registry-{args.stage}.json").exists():
+            raise SystemExit(f"no new {args.project} output to publish for {args.stage}")
     provenance = lock(root)
+    identity = expected_identity(args, root)
     artifacts = []
     for path in paths:
         size = path.stat().st_size
@@ -271,14 +288,15 @@ def publish(args, root):
     registry.parent.mkdir(parents=True, exist_ok=True)
     if registry.exists():
         existing = json.loads(registry.read_text(encoding="utf-8"))
-        if existing.get("upstream") != provenance or existing.get("stage") != args.stage:
+        if registry_identity(existing) != identity or existing.get("stage") != args.stage:
             raise SystemExit(f"existing stage registry identity mismatch: {registry.name}")
         if paths:
             raise SystemExit(f"registered stage unexpectedly produced new outputs: {args.stage}")
         print(f"Stage already published and fully restored: {args.stage}")
         return
     registry.write_text(json.dumps({"schema": 1, "stage": args.stage,
-                                    "upstream": provenance, "artifacts": artifacts},
+                                    "upstream": provenance, "identity": identity,
+                                    "artifacts": artifacts},
                                    indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if not release_exists(args.repository, args.release):
         run("gh", "release", "create", args.release, "--repo", args.repository,
@@ -304,6 +322,8 @@ def main():
     parser.add_argument("--registry-dir", default=os.environ.get("RUNNER_TEMP", "/tmp") + "/rbm-registry")
     parser.add_argument("--file")
     parser.add_argument("--before")
+    parser.add_argument("--identity-file", help="exact registry identity/provenance JSON")
+    parser.add_argument("--project", help="publish only new outputs from this RBM project")
     parser.add_argument("--stage", action="append")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
