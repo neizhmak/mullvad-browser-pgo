@@ -670,7 +670,7 @@ def validate_workloads(report, iterations=None):
 
 def browser_command(binary, profile, screenshot, page):
     return [str(binary), "--headless", "--offline", "--no-remote", "--new-instance", "--wait-for-browser",
-            "--profile", str(profile), "--window-size", "1280,960", "--screenshot", str(screenshot), page.as_uri()]
+            "--profile", str(profile), "--window-size", "1280,960", "--screenshot", str(screenshot), "--url", page.as_uri()]
 
 
 def run_browser(binary, directory, label, timeout, *, iterations=None, target_ms=1200, diagnostics=False):

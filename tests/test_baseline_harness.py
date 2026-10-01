@@ -98,10 +98,19 @@ def fixture_main(argv):
     if behavior == "missing-screenshot":
         return 0
     assert all(flag in args for flag in ("--headless", "--offline", "--no-remote", "--new-instance", "--wait-for-browser", "--profile"))
-    assert args[-1].startswith("file://")
+    # Mirror the pinned BrowserContentHandler contract: explicit --url input
+    # is separate from the native --screenshot output parameter. Do not accept
+    # a positional-only URL that HeadlessShell could consume as a flag value.
+    assert args.count("--url") == 1
+    page_uri = args[args.index("--url") + 1]
+    assert page_uri.startswith("file://")
+    assert args.count("--screenshot") == 1
+    screenshot = Path(args[args.index("--screenshot") + 1])
     profile = Path(args[args.index("--profile") + 1])
     assert list(profile.iterdir()) == []
-    page = Path(url2pathname(urlparse(args[-1]).path))
+    page = Path(url2pathname(urlparse(page_uri).path))
+    assert page.is_absolute() and screenshot.is_absolute()
+    assert screenshot != page and screenshot.parent == page.parent == profile.parent
     config = json.loads(re.search(r"const config = (.*?);\n", page.read_text()).group(1))
     assert config["target_ms"] >= 1000
     counts = config["iterations"] or dict.fromkeys(runtime.CHECKSUMS, 8)
@@ -118,7 +127,7 @@ def fixture_main(argv):
         report["error"] = "fixture JavaScript error"
     elif behavior == "unmeasurable":
         report["workloads"]["integer-array"]["elapsed_ms"] = 0
-    Path(args[args.index("--screenshot") + 1]).write_bytes(png_bytes(report))
+    screenshot.write_bytes(png_bytes(report))
     return 0
 
 
@@ -213,6 +222,17 @@ class BaselineHarnessTests(unittest.TestCase):
         self.assertTrue(all("diagnostics" not in call for call in self.browser_calls))
         self.assertEqual(registry_calls, 2)
         self.assertEqual(len(self.native_commands), 4)
+        browser_commands = [command for command in self.native_commands if "--screenshot" in command]
+        self.assertEqual(len(browser_commands), 2)
+        for command in browser_commands:
+            self.assertEqual(command.count("--url"), 1)
+            page_uri = command[command.index("--url") + 1]
+            self.assertTrue(page_uri.startswith("file://"))
+            self.assertTrue(page_uri.endswith("/workload.html"))
+            image = Path(command[command.index("--screenshot") + 1])
+            self.assertTrue(image.is_absolute())
+            self.assertEqual(image.name, "screenshot.png")
+            self.assertNotEqual(str(image), page_uri)
         self.assertEqual(len(report["samples"]), 1)
         self.assertEqual(report["browser_executable"]["filename"], "mullvadbrowser.exe")
         inventory = runtime.read_json(self.args.output_directory / "baseline-installed-files.json")

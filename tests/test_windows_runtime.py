@@ -166,8 +166,9 @@ class RuntimeTests(unittest.TestCase):
         code += "class Runtime: pass\nruntime=Runtime()\nruntime.CHECKSUMS=" + repr(runtime.CHECKSUMS) + "\nruntime.SUITE=" + repr(runtime.SUITE) + "\n"
         code += "def png_bytes(" + helpers
         code += "print('fake native browser stdout', flush=True)\nprint('fake native browser stderr', file=sys.stderr, flush=True)\n"
-        code += "args=sys.argv[1:]\nscreenshot=Path(args[args.index('--screenshot')+1])\n"
-        code += "from urllib.parse import urlparse\nfrom urllib.request import url2pathname\npage=Path(url2pathname(urlparse(args[-1]).path))\n"
+        code += "args=sys.argv[1:]\nassert args.count('--url')==1, 'one explicit workload URL is required'\nassert args.count('--screenshot')==1\nscreenshot=Path(args[args.index('--screenshot')+1])\n"
+        code += "url=args[args.index('--url')+1]\nassert url.startswith('file:///') and url!=str(screenshot)\n"
+        code += "from urllib.parse import urlparse\nfrom urllib.request import url2pathname\npage=Path(url2pathname(urlparse(url).path))\n"
         code += "config=json.loads(re.search(r'const config = (.*?);\\n',page.read_text()).group(1))\n"
         code += "report=result(config['nonce'],config['iterations'] or None,mode=config['mode'])\n"
         if behavior == "bad-nonce":
@@ -467,9 +468,60 @@ class RuntimeTests(unittest.TestCase):
         command = report["native_process"]["command"]
         self.assertIn("--offline", command); self.assertIn("--no-remote", command)
         self.assertTrue(command[-1].startswith("file://"))
+        self.assertEqual(command.count("--url"), 1)
+        self.assertEqual(command[-2], "--url")
+        self.assertNotEqual(command[command.index("--screenshot") + 1], command[-1])
         self.assertFalse(report["browser_diagnostics"])
         self.assertEqual(runtime.read_json(self.root / "smoke/launch.json"), {"schema": 1, "browser_diagnostics": False})
         self.assertFalse((self.root / "smoke/navigation.log").exists())
+
+    def test_explicit_url_survives_pinned_headless_unknown_flag_argument_skipping(self):
+        # Compact behavioral model of the exact pinned handlers. The default
+        # BrowserContentHandler consumes --url first. HeadlessShell consumes
+        # --window-size/--screenshot, then skips an argument after unknown flags.
+        # Its URL-or-output screenshot parameter is otherwise used as the URL
+        # when URLlist is empty. Keep the launcher's possible leftover flag to
+        # exercise the observed screenshot-output-as-URL failure mechanism.
+        def route(command):
+            arguments = list(command[1:])
+            urls = []
+            def take(flag):
+                if flag not in arguments:
+                    return None
+                index = arguments.index(flag)
+                value = arguments[index + 1]
+                del arguments[index:index + 2]
+                return value
+            while "--url" in arguments:
+                urls.append(take("--url"))
+            for flag in ("--headless", "--offline", "--no-remote", "--new-instance"):
+                if flag in arguments:
+                    arguments.remove(flag)
+            take("--profile")
+            take("--window-size")
+            output = take("--screenshot")
+            index = 0
+            while index < len(arguments):
+                value = arguments[index]
+                if value.startswith("-"):
+                    index += 1  # Pinned unknown-flag handler also skips its next argument.
+                else:
+                    urls.append(value)
+                index += 1
+            if output and not urls:
+                return [output], None
+            return urls, output
+        binary = self.root / "mullvadbrowser.exe"
+        for label in ("calibration-baseline", "sample-01-baseline"):
+            directory = self.root / label
+            page, image, profile = directory / "workload.html", directory / "screenshot.png", directory / "profile"
+            command = runtime.browser_command(binary, profile, image, page)
+            self.assertEqual(command.count("--url"), 1)
+            self.assertEqual(command[-2:], ["--url", page.as_uri()])
+            self.assertEqual(command[command.index("--screenshot") + 1], str(image))
+            self.assertEqual(route(command), ([page.as_uri()], str(image)))
+            positional = [item for item in command if item != "--url"]
+            self.assertEqual(route(positional), ([str(image)], None))
 
     def test_browser_diagnostics_forward_native_logging_environment_only_when_enabled(self):
         program = self.fake_browser()

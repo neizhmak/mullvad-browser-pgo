@@ -86,7 +86,11 @@ Portable mode retains `Browser/mullvadbrowser.exe`, the launcher, and the full
 tree. Source/profile/package provenance binds this exact product basename.
 Installed-file inventories are saved before validation and cleanup. Test profiles are isolated; browser privacy settings are unchanged.
 The self-contained `file://` workload uses offline headless rendering and
-records its result through a PNG pixel grid. Baseline calibration accommodates
+records its result through a PNG pixel grid. Pass the input URI with explicit
+`--url`; keep the `--screenshot` output path separate. Diagnostic run
+`36918566774` showed that a positional-input launch instead navigated to its
+Windows PNG output path and failed with `NS_ERROR_UNKNOWN_PROTOCOL`. An error
+page or missing workload result must never count as a valid measurement. Baseline calibration accommodates
 privacy-reduced timer precision. Measured launches use identical workloads,
 warmup, interleaved ordering, and raw samples. These are descriptive
 JavaScript/JSON/DOM throughput results, not startup or whole-browser claims.
