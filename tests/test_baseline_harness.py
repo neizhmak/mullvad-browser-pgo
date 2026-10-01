@@ -129,8 +129,9 @@ class BaselineHarnessTests(unittest.TestCase):
         self.baseline = self.prepared_baseline()
         self.args = argparse.Namespace(baseline_directory=self.baseline, output_directory=self.root / "output",
                                        upstream_lock=ROOT / "upstream.lock.json", samples=1, target_milliseconds=1200,
-                                       browser_timeout_seconds=5, installer_timeout_seconds=5)
+                                       browser_timeout_seconds=5, installer_timeout_seconds=5, browser_diagnostics=False)
         self.native_commands = []
+        self.browser_calls = []
         self.work = self.root / "disposable-work"
 
     def tearDown(self):
@@ -166,6 +167,10 @@ class BaselineHarnessTests(unittest.TestCase):
 
     def run_fixture(self, *, browser="pass", installer="pass", uninstall="pass", registry=None):
         original_native, original_browser = runtime.run_native, runtime.browser_command
+        original_run_browser = runtime.run_browser
+        def run_browser(*args, **kwargs):
+            self.browser_calls.append(dict(kwargs))
+            return original_run_browser(*args, **kwargs)
         def native(command, *args, **kwargs):
             self.native_commands.append(command)
             if isinstance(command, list) and Path(command[0]).name == "uninstall.exe":
@@ -179,6 +184,7 @@ class BaselineHarnessTests(unittest.TestCase):
              mock.patch.object(harness.tempfile, "mkdtemp", side_effect=mkdtemp), \
              mock.patch.object(runtime, "installer_command", side_effect=lambda binary, destination: [sys.executable, str(Path(__file__).resolve()), "--fixture", "install", installer, str(destination)]), \
              mock.patch.object(runtime, "browser_command", side_effect=lambda binary, profile, image, page: [sys.executable, str(Path(__file__).resolve()), "--fixture", "browser", browser] + original_browser(binary, profile, image, page)[1:]), \
+             mock.patch.object(runtime, "run_browser", side_effect=run_browser), \
              mock.patch.object(runtime, "run_native", side_effect=native):
             report = harness.run_smoke(self.args)
         return report, reject.call_count
@@ -202,6 +208,9 @@ class BaselineHarnessTests(unittest.TestCase):
         self.assertFalse(report["validated_pipeline"])
         self.assertFalse(report["default_preferences_modified"])
         self.assertFalse(report["timer_preferences_modified"])
+        self.assertFalse(report["browser_diagnostics"])
+        self.assertEqual(len(self.browser_calls), 2)
+        self.assertTrue(all("diagnostics" not in call for call in self.browser_calls))
         self.assertEqual(registry_calls, 2)
         self.assertEqual(len(self.native_commands), 4)
         self.assertEqual(len(report["samples"]), 1)
@@ -229,6 +238,31 @@ class BaselineHarnessTests(unittest.TestCase):
             self.assertFalse((directory / "profile").exists())
         self.assertFalse((self.args.output_directory / "packages.json").exists())
         self.assertEqual(runtime.verify_baseline(self.baseline, LOCK)[0]["run_id"], runtime.BASELINE_RUN)
+
+    def test_opt_in_diagnostics_reaches_real_native_fixture_for_both_launches(self):
+        self.args.browser_diagnostics = True
+        report, _ = self.run_fixture()
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["browser_diagnostics"])
+        self.assertTrue(report["baseline_only"])
+        self.assertFalse(report["validated_pipeline"])
+        self.assertFalse(report["default_preferences_modified"])
+        self.assertFalse(report["timer_preferences_modified"])
+        self.assertEqual(len(self.browser_calls), 2)
+        self.assertTrue(all(call["diagnostics"] is True for call in self.browser_calls))
+        self.assertEqual(runtime.validate_workloads(report["samples"][0]), report["iterations"])
+        self.assertTrue(report["profiles_removed"])
+        self.assertTrue(report["cleanup"][0]["uninstalled"])
+
+    def test_cli_diagnostics_flag_is_false_by_default_and_true_only_when_requested(self):
+        for argv, expected in (([], False), (["--browser-diagnostics"], True)):
+            with self.subTest(argv=argv), mock.patch.object(harness, "run_smoke") as smoke:
+                self.assertEqual(harness.main(argv), 0)
+                args = smoke.call_args.args[0]
+                self.assertIs(args.browser_diagnostics, expected)
+                self.assertEqual(args.browser_timeout_seconds, 180)
+                self.assertEqual(args.samples, 1)
+                self.assertEqual(args.target_milliseconds, 1200)
 
     def test_optional_three_samples_have_the_same_calibrated_counts(self):
         self.args.samples = 3

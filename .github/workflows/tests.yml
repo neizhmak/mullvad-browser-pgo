@@ -8,6 +8,10 @@ on:
         description: Verify the offline harness against the authenticated same-lock native baseline
         type: boolean
         default: true
+      baseline_diagnostics:
+        description: Preserve native navigation logs for a baseline-only diagnostic run (not a performance comparison)
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -69,8 +73,14 @@ jobs:
         shell: pwsh
         run: python scripts/windows-runtime-check.py prepare-baseline --output-directory "$env:RUNNER_TEMP/baseline-smoke" --repository "$env:GITHUB_REPOSITORY"
       - name: Validate offline harness on the real stock Windows browser
+        env:
+          BASELINE_DIAGNOSTICS: ${{ inputs.baseline_diagnostics }}
         shell: pwsh
-        run: python scripts/check-baseline-harness.py --baseline-directory "$env:RUNNER_TEMP/baseline-smoke" --output-directory "$env:RUNNER_TEMP/baseline-harness"
+        run: |
+          $options = @()
+          if ($env:BASELINE_DIAGNOSTICS -eq 'true') { $options += '--browser-diagnostics' }
+          python scripts/check-baseline-harness.py --baseline-directory "$env:RUNNER_TEMP/baseline-smoke" --output-directory "$env:RUNNER_TEMP/baseline-harness" @options
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve actual baseline screenshots, raw results and native logs
         if: always()
         uses: actions/upload-artifact@v4

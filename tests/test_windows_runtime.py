@@ -342,7 +342,36 @@ class RuntimeTests(unittest.TestCase):
             runtime.run_native([sys.executable, "-c", "import sys; print('stdout'); print('stderr',file=sys.stderr); sys.exit(7)"], log, 5)
         self.assertEqual(caught.exception.returncode, 7)
         self.assertIn("stdout", log.read_text()); self.assertIn("stderr", log.read_text())
-        self.assertEqual(runtime.read_json(log.with_suffix(".log.json"))["returncode"], 7)
+        metadata = runtime.read_json(log.with_suffix(".log.json"))
+        self.assertEqual(metadata["returncode"], 7)
+        self.assertEqual(metadata["root_returncode"], 7)
+        self.assertEqual(metadata["phase"], "completed")
+        self.assertIsNone(metadata["timeout_phase"])
+
+    def test_native_environment_overrides_inherit_without_leaking_or_mutating(self):
+        log, output = self.root / "environment.log", self.root / "environment.json"
+        program = "import os,json; print(json.dumps({k:os.environ.get(k) for k in ('MB_PARENT','MB_CHILD','MB_UNICODE')}))"
+        with mock.patch.dict(os.environ, {"MB_PARENT": "inherited-parent"}, clear=False):
+            metadata = runtime.run_native([sys.executable, "-c", program], log, 10, stdout_file=output,
+                                          env={"MB_CHILD": "opaque-secret-value", "MB_UNICODE": "Mullvad-\u043f\u0440\u0438\u0432\u0430\u0442\u043d\u043e"})
+            self.assertNotIn("MB_CHILD", os.environ)
+        observed = runtime.read_json(output)
+        self.assertEqual(observed, {"MB_PARENT": "inherited-parent", "MB_CHILD": "opaque-secret-value", "MB_UNICODE": "Mullvad-\u043f\u0440\u0438\u0432\u0430\u0442\u043d\u043e"})
+        self.assertNotIn("opaque-secret-value", json.dumps(metadata))
+        self.assertNotIn("opaque-secret-value", log.with_suffix(".log.json").read_text())
+        self.assertNotIn("env", metadata)
+        self.assertEqual(metadata["root_returncode"], 0)
+        self.assertEqual(metadata["phase"], "completed")
+        self.assertIsNone(metadata["timeout_phase"])
+        if os.name == "nt":
+            self.assertEqual(metadata["active_job_process_count"], 0)
+
+    def test_native_none_environment_is_inherited_unchanged(self):
+        output = self.root / "inherited.txt"
+        with mock.patch.dict(os.environ, {"MB_INHERITED": "present-in-child"}, clear=False):
+            runtime.run_native([sys.executable, "-c", "import os; print(os.environ.get('MB_INHERITED'))"],
+                               self.root / "inherited.log", 10, stdout_file=output)
+        self.assertEqual(output.read_text().strip(), "present-in-child")
 
     def test_native_timeout_bounds_tree_and_preserves_diagnostics(self):
         log = self.root / "timeout.log"
@@ -350,7 +379,13 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(runtime.NativeError) as caught:
             runtime.run_native([sys.executable, "-c", program], log, 1.5)
         self.assertEqual(caught.exception.returncode, 124)
-        self.assertTrue(runtime.read_json(log.with_suffix(".log.json"))["timed_out"])
+        metadata = runtime.read_json(log.with_suffix(".log.json"))
+        self.assertTrue(metadata["timed_out"])
+        self.assertEqual(metadata["phase"], "timed_out")
+        self.assertEqual(metadata["timeout_phase"], "root_wait")
+        self.assertIsNone(metadata["root_returncode"])
+        if os.name == "nt":
+            self.assertGreaterEqual(metadata["active_job_process_count"], 1)
         if os.name != "nt":
             pid = log.read_text().strip()
             status = Path("/proc") / pid / "status"
@@ -367,6 +402,31 @@ class RuntimeTests(unittest.TestCase):
                     self.assertNotEqual(_winapi.GetExitCodeProcess(handle), 259)  # STILL_ACTIVE
                 finally:
                     _winapi.CloseHandle(handle)
+
+    @unittest.skipUnless(os.name == "nt", "Windows job-drain metadata before kill-on-close")
+    def test_windows_descendant_timeout_records_successful_root_before_kill(self):
+        log = self.root / "descendant-timeout.log"
+        program = "import subprocess,sys; p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); print(p.pid,flush=True)"
+        with self.assertRaises(runtime.NativeError) as caught:
+            runtime.run_native([sys.executable, "-c", program], log, 1.5)
+        self.assertEqual(caught.exception.returncode, 124)
+        metadata = runtime.read_json(log.with_suffix(".log.json"))
+        self.assertTrue(metadata["timed_out"])
+        self.assertEqual(metadata["phase"], "timed_out")
+        self.assertEqual(metadata["timeout_phase"], "job_drain")
+        self.assertEqual(metadata["root_returncode"], 0)
+        self.assertGreaterEqual(metadata["active_job_process_count"], 1)
+        import _winapi
+        try:
+            handle = _winapi.OpenProcess(0x101000, False, int(log.read_text().strip()))
+        except OSError:
+            pass  # A reaped descendant no longer has a process handle.
+        else:
+            try:
+                self.assertEqual(_winapi.WaitForSingleObject(handle, 5000), _winapi.WAIT_OBJECT_0)
+                self.assertNotEqual(_winapi.GetExitCodeProcess(handle), 259)
+            finally:
+                _winapi.CloseHandle(handle)
 
     def test_native_binary_stdout_separate_from_stderr(self):
         binary, log = self.root / "archive.bin", self.root / "native.log"
@@ -391,7 +451,12 @@ class RuntimeTests(unittest.TestCase):
         log = self.root / "missing.log"
         with self.assertRaises(runtime.NativeError):
             runtime.run_native([str(self.root / "nonexistent-program")], log, 5)
-        self.assertEqual(runtime.read_json(log.with_suffix(".log.json"))["returncode"], 1)
+        metadata = runtime.read_json(log.with_suffix(".log.json"))
+        self.assertEqual(metadata["returncode"], 1)
+        self.assertEqual(metadata["phase"], "failed")
+        self.assertEqual(metadata["failure_phase"], "starting")
+        self.assertIsNone(metadata["root_returncode"])
+        self.assertIsNone(metadata["timeout_phase"])
 
     def test_native_browser_smoke_with_real_fake_subprocess(self):
         with self.patched_browser(self.fake_browser()):
@@ -402,6 +467,42 @@ class RuntimeTests(unittest.TestCase):
         command = report["native_process"]["command"]
         self.assertIn("--offline", command); self.assertIn("--no-remote", command)
         self.assertTrue(command[-1].startswith("file://"))
+        self.assertFalse(report["browser_diagnostics"])
+        self.assertEqual(runtime.read_json(self.root / "smoke/launch.json"), {"schema": 1, "browser_diagnostics": False})
+        self.assertFalse((self.root / "smoke/navigation.log").exists())
+
+    def test_browser_diagnostics_forward_native_logging_environment_only_when_enabled(self):
+        program = self.fake_browser()
+        with program.open("a") as stream:
+            stream.write("import os\nfrom pathlib import Path\nPath(os.environ['MOZ_LOG_FILE']).write_text(os.environ['MOZ_LOG'])\n")
+        with self.patched_browser(program):
+            report = runtime.run_browser(self.root / "mullvadbrowser.exe", self.root, "diagnostic", 10, diagnostics=True)
+        self.assertTrue(report["browser_diagnostics"])
+        self.assertEqual(runtime.read_json(self.root / "diagnostic/launch.json"), {"schema": 1, "browser_diagnostics": True})
+        self.assertEqual((self.root / "diagnostic/navigation.log").read_text(), "timestamp,sync,DocLoader:5,BCWebProgress:5")
+        self.assertNotIn("timestamp,sync", json.dumps(report["native_process"]))
+        self.assertNotIn("MOZ_LOG_FILE", json.dumps(report["native_process"]))
+        self.assertFalse((self.root / "diagnostic/profile").exists())
+
+    def test_browser_diagnostics_remain_disabled_for_default_launch_environment(self):
+        program = self.fake_browser()
+        with program.open("a") as stream:
+            stream.write("import os,json\nfrom pathlib import Path\nPath(__file__).with_suffix('.env.json').write_text(json.dumps([os.environ.get('MOZ_LOG'),os.environ.get('MOZ_LOG_FILE')]))\n")
+        with mock.patch.dict(os.environ, {"MOZ_LOG": "parent-value", "MOZ_LOG_FILE": "parent-path"}), self.patched_browser(program):
+            runtime.run_browser(self.root / "mullvadbrowser.exe", self.root, "no-diagnostic", 10)
+        self.assertEqual(runtime.read_json(program.with_suffix(".env.json")), ["parent-value", "parent-path"])
+        self.assertFalse((self.root / "no-diagnostic/navigation.log").exists())
+
+    def test_browser_diagnostics_flag_survives_failure_without_weakening_exit_gate(self):
+        with self.patched_browser(self.fake_browser("nonzero")), self.assertRaises(runtime.NativeError) as caught:
+            runtime.run_browser(self.root / "mullvadbrowser.exe", self.root, "failed-diagnostic", 10, diagnostics=True)
+        self.assertEqual(caught.exception.returncode, 7)
+        self.assertEqual(runtime.read_json(self.root / "failed-diagnostic/launch.json"), {"schema": 1, "browser_diagnostics": True})
+        self.assertFalse((self.root / "failed-diagnostic/profile").exists())
+        metadata = runtime.read_json(self.root / "failed-diagnostic/browser.log.json")
+        self.assertEqual(metadata["root_returncode"], 7)
+        self.assertEqual(metadata["returncode"], 7)
+        self.assertNotIn("MOZ_LOG", json.dumps(metadata))
 
     def test_native_browser_rejects_bad_js_report_and_propagates_exit(self):
         for behavior in ("bad-nonce", "bad-checksum", "nonzero"):

@@ -268,7 +268,7 @@ class WindowsProcess:
     CPython's _winapi wrapper exposes the native handles. Suspension removes the
     child-spawn race that a Popen-then-assign implementation would have.
     """
-    def __init__(self, command, cwd, output, diagnostics):
+    def __init__(self, command, cwd, output, diagnostics, env=None):
         import _winapi
         import msvcrt
         self.api, self.command, self.returncode = _winapi, command, None
@@ -287,7 +287,7 @@ class WindowsProcess:
                 line = command if isinstance(command, str) else subprocess.list2cmdline(command)
                 self._handle, self.thread, self.pid, _ = _winapi.CreateProcess(
                     None, line, None, None, True, 0x4 | subprocess.CREATE_NO_WINDOW,
-                    None, str(cwd) if cwd else None, startup)
+                    env, str(cwd) if cwd else None, startup)
             finally:
                 for handle, old in zip(handles, old_flags):
                     os.set_handle_inheritable(handle, old)
@@ -327,13 +327,19 @@ class WindowsProcess:
         self.api.CloseHandle(self._handle)
 
 
-def run_native(command, log, timeout, *, cwd=None, stdout_file=None):
-    """Bound the full native process tree and retain logs/status even on failure."""
+def run_native(command, log, timeout, *, cwd=None, stdout_file=None, env=None):
+    """Bound the full native process tree and retain logs/status even on failure.
+
+    Optional environment overrides are merged into the inherited environment.
+    Environment contents are never included in the recorded process metadata.
+    """
     if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         fail("native timeout must be positive")
     log = Path(log)
     log.parent.mkdir(parents=True, exist_ok=True)
-    metadata = {"command": command, "timeout_seconds": timeout, "timed_out": False}
+    environment = None if env is None else os.environ | dict(env)
+    metadata = {"command": command, "timeout_seconds": timeout, "timed_out": False,
+                "phase": "starting", "root_returncode": None, "timeout_phase": None}
     started = time.monotonic()
     process, job = None, None
     status, error = 1, None
@@ -341,32 +347,54 @@ def run_native(command, log, timeout, *, cwd=None, stdout_file=None):
         output = Path(stdout_file).open("wb") if stdout_file else diagnostics
         try:
             if os.name == "nt":
-                process = WindowsProcess(command, cwd, output, diagnostics)
+                process = WindowsProcess(command, cwd, output, diagnostics, env=environment)
                 job = WindowsJob(process)
                 process.resume()
             else:
                 process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.DEVNULL, stdout=output,
-                                           stderr=diagnostics, start_new_session=True)
+                                           stderr=diagnostics, start_new_session=True, env=environment)
             metadata["pid"] = process.pid
             try:
+                metadata["phase"] = "root_wait"
                 status = process.wait(timeout=timeout)
+                metadata["root_returncode"] = status
                 if job and status == 0:
                     # NSIS uninstallers may hand work to a second native process.
-                    while job.active():
+                    metadata["phase"] = "job_drain"
+                    active = job.active()
+                    while active:
                         remaining = timeout - (time.monotonic() - started)
                         if remaining <= 0:
                             raise subprocess.TimeoutExpired(command, timeout)
                         threading.Event().wait(min(0.05, remaining))
+                        active = job.active()
+                metadata["phase"] = "completed"
             except subprocess.TimeoutExpired:
                 metadata["timed_out"] = True
+                metadata["timeout_phase"] = metadata["phase"]
+                metadata["phase"] = "timed_out"
                 status = 124
                 error = "native process tree exceeded timeout"
         except OSError as native_error:
+            metadata["failure_phase"] = metadata["phase"]
+            metadata["phase"] = "failed"
             error = "native process failed to start or isolate: " + str(native_error)
             status = 1
         finally:
             if process:
+                # Record the live state before any kill or kill-on-close action.
+                # A timeout must remain a failure even if the root exits in the
+                # small interval between the timeout and this snapshot.
+                if metadata["root_returncode"] is None:
+                    try:
+                        metadata["root_returncode"] = process.poll()
+                    except OSError as snapshot_error:
+                        metadata["root_snapshot_error"] = str(snapshot_error)
                 if job:
+                    try:
+                        metadata["active_job_process_count"] = job.active()
+                    except OSError as snapshot_error:
+                        metadata["job_snapshot_error"] = str(snapshot_error)
                     job.terminate()
                     job.close()
                 elif os.name != "nt":
@@ -645,7 +673,7 @@ def browser_command(binary, profile, screenshot, page):
             "--profile", str(profile), "--window-size", "1280,960", "--screenshot", str(screenshot), page.as_uri()]
 
 
-def run_browser(binary, directory, label, timeout, *, iterations=None, target_ms=1200):
+def run_browser(binary, directory, label, timeout, *, iterations=None, target_ms=1200, diagnostics=False):
     directory = Path(directory) / label
     directory.mkdir(parents=True, exist_ok=False)
     profile, page, screenshot = directory / "profile", directory / "workload.html", directory / "screenshot.png"
@@ -657,8 +685,14 @@ def run_browser(binary, directory, label, timeout, *, iterations=None, target_ms
     if template.count("__RUNTIME_CONFIG__") != 1:
         fail("invalid offline workload template")
     page.write_text(template.replace("__RUNTIME_CONFIG__", json.dumps(config, sort_keys=True)), encoding="utf-8")
+    # Logs are opt-in for diagnosis, not enabled in performance comparisons.
+    # This changes only the child environment, never a profile preference.
+    diagnostic_environment = {"MOZ_LOG": "timestamp,sync,DocLoader:5,BCWebProgress:5",
+                              "MOZ_LOG_FILE": str(directory / "navigation.log")} if diagnostics else None
+    write_json(directory / "launch.json", {"schema": 1, "browser_diagnostics": bool(diagnostics)})
     try:
-        metadata = run_native(browser_command(binary, profile, screenshot, page), directory / "browser.log", timeout, cwd=binary.parent)
+        metadata = run_native(browser_command(binary, profile, screenshot, page), directory / "browser.log", timeout,
+                              cwd=binary.parent, env=diagnostic_environment)
         if not screenshot.is_file():
             fail("browser exited without producing the native offline screenshot: " + label)
         result = screenshot_report(screenshot, nonce)
@@ -668,6 +702,7 @@ def run_browser(binary, directory, label, timeout, *, iterations=None, target_ms
         if not iterations and any(item["elapsed_ms"] < target_ms for item in result["workloads"].values()):
             fail("offline timer calibration did not meet its target")
         result["native_process"] = metadata
+        result["browser_diagnostics"] = bool(diagnostics)
         write_json(directory / "result.json", result)
         return result
     finally:

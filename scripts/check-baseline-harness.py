@@ -30,6 +30,7 @@ def run_smoke(args):
               "baseline_only": True, "validated_pipeline": False, "public_browser_release": False,
               "offline": True, "suite": runtime.SUITE, "default_preferences_modified": False,
               "timer_preferences_modified": False,
+              "browser_diagnostics": getattr(args, "browser_diagnostics", False),
               "network_scope": "Firefox --offline and file-only CSP-denied workload; not an OS-wide egress sandbox",
               "evidence_scope": "stock baseline installer and offline harness only; no PGO build or comparison",
               "samples": [], "cleanup": [], "errors": []}
@@ -84,8 +85,10 @@ def run_smoke(args):
             # process deadlines/jobs, PNG decoding, nonce and JS checksums.
             runtime.verify_browser_tree(destination, version, portable=False)
             checked_binary = runtime.checked_file(destination, binary_record)
-            return runtime.run_browser(checked_binary, output, label, args.browser_timeout_seconds,
-                                       iterations=iterations, target_ms=args.target_milliseconds)
+            options = {"iterations": iterations, "target_ms": args.target_milliseconds}
+            if report["browser_diagnostics"]:
+                options["diagnostics"] = True
+            return runtime.run_browser(checked_binary, output, label, args.browser_timeout_seconds, **options)
 
         calibration = launch("calibration-baseline")
         iterations = runtime.validate_workloads(calibration)
@@ -169,6 +172,8 @@ def main(argv=None):
     parser.add_argument("--output-directory", type=Path, default=temporary / "baseline-harness",
                         help="fresh diagnostics directory (default: runner temp/baseline-harness)")
     parser.add_argument("--upstream-lock", type=Path, default=ROOT / "upstream.lock.json")
+    parser.add_argument("--browser-diagnostics", action="store_true",
+                        help="opt in to native browser navigation logs; does not change preferences or workload")
     parser.add_argument("--samples", type=runtime.positive_int, default=1,
                         help="fixed-count measured launches after calibration, 1..3 (default: 1)")
     parser.add_argument("--target-milliseconds", type=runtime.positive_int, default=1200)

@@ -110,6 +110,19 @@ an existing user installation.
 
 ## Diagnostics and compatibility
 
+A baseline-only diagnostic run can add navigation logging without changing
+privacy or timer preferences, workload counts, native deadlines, or validation:
+
+```sh
+gh workflow run tests.yml --ref codex/complete-windows-alpha-pgo \
+  -f baseline_smoke=true -f baseline_diagnostics=true
+```
+
+The helper accepts `--browser-diagnostics`. This mode preserves per-process
+native navigation logs and distinguishes the root-process wait from the
+remaining-descendant wait. Logging is disabled for normal comparisons; do not
+use diagnostic timings as performance evidence. A timeout still fails the gate.
+
 - Training: `pgo-training-logs` preserves failed browser output/minidumps and
   raw profiles. A nonzero native command status or crash is never turned into
   a successful manifest.
