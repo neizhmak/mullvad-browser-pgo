@@ -497,7 +497,9 @@ const document={getElementById:id=>elements[id],createElement:kind=>new Element(
         path = self.root / "workload.js"
         path.write_text(dom + script + "\\nconsole.log(JSON.stringify(Object.fromEntries(Object.entries(units).map(([name,unit])=>[name,unit()]))));\\n".replace("\\n", "\n"))
         output = self.root / "javascript.json"
-        runtime.run_native([shutil.which("node"), str(path)], self.root / "javascript.log", 10, stdout_file=output)
+        # A cold hosted Windows runner can scan/start node.exe slowly. Keep
+        # a bounded deadline without turning startup timing into a JS gate.
+        runtime.run_native([shutil.which("node"), str(path)], self.root / "javascript.log", 60, stdout_file=output)
         self.assertEqual(runtime.read_json(output), runtime.CHECKSUMS)
 
     def test_offline_template_does_not_change_preferences_or_fetch_remote_resources(self):
