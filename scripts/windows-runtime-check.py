@@ -167,6 +167,7 @@ def verify_packages(directory, lock):
             or manifest.get("version") != version or manifest.get("channel") != "alpha"
             or manifest.get("platform") != "windows-x86_64" or manifest.get("upstream_lock") != lock
             or manifest.get("public_browser_release") is not False
+            or manifest.get("browser_executable") != "mullvadbrowser.exe"
             or not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("profile_identity", "")))):
         fail("final package identity, lock or non-public status mismatch")
     firefox = manifest.get("firefox", {})
@@ -174,12 +175,14 @@ def verify_packages(directory, lock):
     substs = proof.get("substs", {})
     if (firefox.get("upstream_lock") != lock
             or firefox.get("profile_identity") != manifest["profile_identity"]
+            or proof.get("executable") != "mullvadbrowser.exe"
             or not substs.get("MOZ_PROFILE_USE") or not substs.get("MOZ_PGO_RUST")
             or substs.get("MOZ_PROFILE_GENERATE")):
         fail("package manifest lacks the matching C++ and Rust profile-use proof")
     layout = manifest.get("portable_layout", {})
     root = layout.get("root")
     if (not isinstance(root, str) or len(safe_path(root).parts) != 1
+            or layout.get("executable") != "Browser/mullvadbrowser.exe"
             or layout.get("launcher") != "Start Mullvad Browser.cmd"
             or layout.get("portable_detection") != "absence of Browser/system-install"
             or layout.get("complete_browser_tree") is not True):
@@ -678,9 +681,52 @@ def run_browser(binary, directory, label, timeout, *, iterations=None, target_ms
         shutil.rmtree(profile)
 
 
-def verify_browser_tree(directory, version, *, portable):
+def record_browser_inventory(directory, output_path):
+    """Retain actual layout before validation or uninstall can remove evidence."""
     directory = Path(directory)
-    required = ["firefox.exe", "xul.dll", "omni.ja", "browser/omni.ja", "application.ini", "updater.exe", "postupdate.exe",
+    inventory = {"schema": 1, "directory": str(directory), "expected_executable": "mullvadbrowser.exe", "entries": []}
+    pending = [directory]
+    while pending and len(inventory["entries"]) < 50000:
+        parent = pending.pop()
+        try:
+            with os.scandir(parent) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    item = {"path": path.relative_to(directory).as_posix()}
+                    try:
+                        data = entry.stat(follow_symlinks=False)
+                        if stat.S_ISLNK(data.st_mode) or getattr(data, "st_file_attributes", 0) & 0x400:
+                            item["kind"] = "link-or-reparse-point"
+                        elif stat.S_ISREG(data.st_mode):
+                            item.update(kind="file", size=data.st_size)
+                        elif stat.S_ISDIR(data.st_mode):
+                            item["kind"] = "directory"
+                            pending.append(path)
+                        else:
+                            item["kind"] = "non-regular"
+                    except OSError as error:
+                        item.update(kind="unreadable", error=str(error))
+                    inventory["entries"].append(item)
+                    if len(inventory["entries"]) >= 50000:
+                        inventory["truncated"] = True
+                        break
+        except OSError as error:
+            inventory.setdefault("walk_errors", []).append({"path": str(parent), "error": str(error)})
+    inventory["entries"].sort(key=lambda item: item["path"])
+    write_json(output_path, inventory)
+    return inventory
+
+
+def save_installation_inventory(directory, output_path):
+    """Alias for callers that inventory a disposable native installation."""
+    return record_browser_inventory(directory, output_path)
+
+
+def verify_browser_tree(directory, version, *, portable, inventory_path=None):
+    directory = Path(directory)
+    if inventory_path is not None:
+        record_browser_inventory(directory, inventory_path)
+    required = ["mullvadbrowser.exe", "xul.dll", "omni.ja", "browser/omni.ja", "application.ini", "updater.exe", "postupdate.exe",
                 "distribution/extensions/uBlock0@raymondhill.net.xpi",
                 "distribution/extensions/{73a6fe31-595d-460b-a920-fcc0f8843232}.xpi",
                 "distribution/extensions/{d19a89b9-76c1-4a61-bcd4-49e8de916403}.xpi", "version.json", "update-settings.ini"]
@@ -688,7 +734,7 @@ def verify_browser_tree(directory, version, *, portable):
         path = directory / name
         if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
             fail("incomplete native browser tree: " + name)
-    for name in ("firefox.exe", "xul.dll", "updater.exe", "postupdate.exe"):
+    for name in ("mullvadbrowser.exe", "xul.dll", "updater.exe", "postupdate.exe"):
         with (directory / name).open("rb") as stream:
             if stream.read(2) != b"MZ":
                 fail("browser tree contains a non-PE binary: " + name)
@@ -816,16 +862,18 @@ def run_checks(args):
         safe_extract_zip(assets["portable"], portable)
         portable_root = portable / manifest["portable_layout"]["root"]
         launcher = portable_root / "Start Mullvad Browser.cmd"
-        if not launcher.is_file() or b'"%~dp0Browser\\firefox.exe" %*' not in launcher.read_bytes():
+        if not launcher.is_file() or b'"%~dp0Browser\\mullvadbrowser.exe" %*' not in launcher.read_bytes():
             fail("portable launcher does not point at its own browser")
-        browsers = {"portable": portable_root / "Browser/firefox.exe"}
-        report["packages"] = {"portable": verify_browser_tree(browsers["portable"].parent, manifest["version"], portable=True)}
+        browsers = {"portable": portable_root / "Browser/mullvadbrowser.exe"}
+        report["packages"] = {"portable": verify_browser_tree(browsers["portable"].parent, manifest["version"], portable=True,
+                                                          inventory_path=output / "portable-inventory.json")}
         if baseline:
             destination = work / "baseline-install"
             destination.mkdir()
             installed.append(("baseline", destination))
             run_native(installer_command(baseline_installer, destination), output / "baseline-install.log", args.installer_timeout_seconds)
-            report["packages"]["baseline"] = verify_browser_tree(destination, manifest["version"], portable=False)
+            report["packages"]["baseline"] = verify_browser_tree(destination, manifest["version"], portable=False,
+                                                                inventory_path=output / "baseline-install-inventory.json")
             # Two stock installers share an uninstall key and shortcut names.
             # Copy the verified baseline tree and uninstall it before installing
             # PGO. Never overwrite another system installation's registration.
@@ -834,8 +882,9 @@ def run_checks(args):
             for source in destination.rglob("*"):
                 if source.is_file() and sha256(source) != sha256(baseline_runtime / source.relative_to(destination)):
                     fail("baseline installed-copy checksum mismatch")
-            browsers["baseline"] = baseline_runtime / "firefox.exe"
-            verify_browser_tree(baseline_runtime, manifest["version"], portable=False)
+            browsers["baseline"] = baseline_runtime / "mullvadbrowser.exe"
+            verify_browser_tree(baseline_runtime, manifest["version"], portable=False,
+                                inventory_path=output / "baseline-copy-inventory.json")
             run_native([str(destination / "uninstall.exe"), "/S"], output / "baseline-uninstall.log", args.installer_timeout_seconds)
             report["cleanup"].append({"variant": "baseline", "uninstalled": True})
             installed.remove(("baseline", destination))
@@ -845,10 +894,11 @@ def run_checks(args):
         destination.mkdir()
         installed.append(("installer", destination))  # Clean partially completed installers too.
         run_native(installer_command(assets["installer"], destination), output / "installer-install.log", args.installer_timeout_seconds)
-        browsers["installer"] = destination / "firefox.exe"
-        report["packages"]["installer"] = verify_browser_tree(destination, manifest["version"], portable=False)
+        browsers["installer"] = destination / "mullvadbrowser.exe"
+        report["packages"]["installer"] = verify_browser_tree(destination, manifest["version"], portable=False,
+                                                             inventory_path=output / "installer-inventory.json")
         report["installed_portable_same_binaries"] = {}
-        for name in ("firefox.exe", "xul.dll", "application.ini"):
+        for name in ("mullvadbrowser.exe", "xul.dll", "application.ini"):
             installed_hash = sha256(browsers["installer"].parent / name)
             if installed_hash != sha256(browsers["portable"].parent / name):
                 fail("installer and portable contain different product bytes: " + name)
@@ -883,6 +933,12 @@ def run_checks(args):
         report["error"] = str(exception)
     finally:
         for name, destination in reversed(installed):
+            inventory_path = output / ("baseline-install-inventory.json" if name == "baseline" else name + "-inventory.json")
+            if not inventory_path.exists():
+                try:
+                    record_browser_inventory(destination, inventory_path)
+                except Exception as inventory_error:
+                    report.setdefault("inventory_errors", []).append({"variant": name, "error": str(inventory_error)})
             uninstaller = destination / "uninstall.exe"
             try:
                 if not uninstaller.is_file():

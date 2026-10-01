@@ -1,7 +1,7 @@
 diff --git a/projects/firefox/build b/projects/firefox/build
 --- a/projects/firefox/build
 +++ b/projects/firefox/build
-@@ -118,14 +118,85 @@
+@@ -118,14 +118,88 @@
    [% END -%]
  [% END -%]
  
@@ -74,7 +74,10 @@ diff --git a/projects/firefox/build b/projects/firefox/build
 +for key in disabled_update_options:
 +    if substs.get(key) or defines.get(key):
 +        raise SystemExit("unexpected updater security/background option: " + key)
-+proof = {"schema": 1, "firefox_revision": "[% c('var/git_commit') %]",
++executable = "[% c('var/exe_name') %].exe"
++if executable != "mullvadbrowser.exe":
++    raise SystemExit("PGO use supports the pinned Mullvad executable only")
++proof = {"schema": 1, "executable": executable, "firefox_revision": "[% c('var/git_commit') %]",
 +         "pgo_profile_sha256": "[% c('var/pgo_profile_sha256') %]",
 +         "pgo_jarlog_sha256": "[% c('var/pgo_jarlog_sha256') %]",
 +         "substs": {k: substs.get(k) for k in ("MOZ_PGO", "MOZ_PROFILE_USE", "MOZ_PGO_RUST", "MOZ_PROFILE_GENERATE", "PGO_PROFILE_PATH", "PROFILE_USE_CFLAGS", "PGO_JARLOG_PATH", *update_substs, *disabled_update_options)},
@@ -196,22 +199,27 @@ diff --git a/projects/browser/build b/projects/browser/build
  [% END -%]
  
  [% IF c("var/updater_enabled") -%]
-@@ -398,6 +404,34 @@
+@@ -398,6 +404,39 @@
      makensis browser-install.nsi
      python3 $rootdir/pe_checksum_fix.py browser-install.exe
      mv browser-install.exe $OUTDIR/[% c("var/project-name") %]-[% c("var/osname") %]-[% c("var/torbrowser_version") %].exe
 +    [% IF c('var/pgo_use') -%]
-+    # The stock standalone installer copies this entire tree, not bare firefox.exe.
++    # The stock standalone installer copies the full Mullvad Browser tree.
 +    # Its absence of Browser/system-install selects Mullvad portable data paths.
 +    python3 - '[% c("var/Project_Name") %]' "$OUTDIR/[% c("var/project-name") %]-[% c("var/osname") %]-portable-[% c("var/torbrowser_version") %].zip" '[% c("var/browser_release_date_timestamp") %]' <<'PY_PGO_PORTABLE'
 +import pathlib, stat, sys, time, zipfile
 +root = pathlib.Path(sys.argv[1])
-+if not (root / "Browser/firefox.exe").is_file():
-+    raise SystemExit("portable browser tree is missing firefox.exe")
++executable = "[% c('var/exe_name') %].exe"
++if executable != "mullvadbrowser.exe":
++    raise SystemExit("portable output must use the pinned Mullvad executable")
++if not (root / "Browser" / executable).is_file():
++    raise SystemExit("portable browser tree is missing " + executable)
++if (root / "Browser/firefox.exe").exists():
++    raise SystemExit("portable tree contains an unexpected Firefox executable")
 +if (root / "Browser/system-install").exists():
 +    raise SystemExit("portable tree contains the system-install marker")
 +launcher = root / "Start Mullvad Browser.cmd"
-+launcher.write_bytes(b'@echo off\r\nsetlocal\r\nstart "" /d "%~dp0" "%~dp0Browser\\firefox.exe" %*\r\n')
++launcher.write_bytes(('@echo off\r\nsetlocal\r\nstart "" /d "%~dp0" "%~dp0Browser\\' + executable + '" %*\r\n').encode("utf-8"))
 +stamp = time.gmtime(int(sys.argv[3]))[:6]
 +with zipfile.ZipFile(sys.argv[2], "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
 +    for path in sorted(root.rglob("*")):
@@ -231,7 +239,7 @@ diff --git a/projects/browser/build b/projects/browser/build
    [% ELSE -%]
      makensis browser-portable.nsi
      # Working around NSIS braindamage
-@@ -412,7 +446,7 @@
+@@ -412,7 +451,7 @@
    [% IF c("var/macos_universal") -%]
      cp -a $rootdir/[% c('input_files_by_name/firefox-aarch64') %]/artifacts "$OUTDIR"
    [% END -%]

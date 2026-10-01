@@ -99,7 +99,8 @@ class NativeFixture(unittest.TestCase):
         self.rbm_calls = self.base / "rbm-calls.jsonl"
         self.config_path = self.base / "rbm-fixture.json"
         self.config = {"show": {"firefox:filename": FIREFOX_FILENAME,
-                                "firefox:build_log": "logs/firefox-windows-x86_64.log"}}
+                                "firefox:build_log": "logs/firefox-windows-x86_64.log",
+                                "firefox:var/exe_name": "mullvadbrowser"}}
         self.env = os.environ | {
             "PATH": os.pathsep.join((str(self.bin), str(Path(sys.executable).parent),
                                      os.environ.get("PATH", ""))),
@@ -198,6 +199,7 @@ class SourceProvenanceTests(NativeFixture):
                     "upstream_lock": json.loads((ROOT / "upstream.lock.json").read_text()),
                     "firefox": {"repository": str(self.repository), "ref": self.ref,
                                 "revision": self.revision},
+                    "browser_executable": "mullvadbrowser.exe",
                     "profileserver": {"path": "build/pgo/profileserver.py",
                                       "revision": self.revision,
                                       "sha256": digest_bytes(self.selected_workload)},
@@ -217,6 +219,13 @@ class SourceProvenanceTests(NativeFixture):
                                f"{self.revision}:build/pgo/profileserver.py"], source_calls)
                 self.assertTrue(all(record["cwd"] == str(self.upstream)
                                     for record in self.calls(self.rbm_calls)))
+
+    def test_rejects_non_mullvad_browser_executable_selection(self):
+        for name in ("firefox", "torbrowser", "mullvadbrowser.exe", "../mullvadbrowser", ""):
+            with self.subTest(executable=name):
+                self.config["show"]["firefox:var/exe_name"] = name
+                self.source_failure()
+                self.assertFalse(self.git_calls.exists())
 
     def test_rejects_wrong_exact_source_revision(self):
         self.config["show"]["firefox:var/git_commit"] = self.other_revision
@@ -279,6 +288,7 @@ class ToolchainCaptureTests(NativeFixture):
             "schema": 2, "upstream_lock": json.loads((ROOT / "upstream.lock.json").read_text()),
             "firefox": {"repository": str(self.base / "local-source.git"),
                         "ref": "firefox-selected-tag", "revision": "c" * 40},
+            "browser_executable": "mullvadbrowser.exe",
             "profileserver": {"path": "build/pgo/profileserver.py", "revision": "c" * 40,
                               "sha256": digest_bytes(b"# selected workload\n")},
             "pgo_overlay_sha256": digest(ROOT / "patches/firefox-pgo-generate.patch"),

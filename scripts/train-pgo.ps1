@@ -38,6 +38,7 @@ try {
     if ($recorded.firefox.repository -ne $env:FIREFOX_REPOSITORY -or
         $recorded.firefox.ref -ne $env:FIREFOX_REF -or
         $recorded.firefox.revision -ne $env:FIREFOX_REVISION) { throw 'Firefox environment does not match build provenance' }
+    if ($recorded.browser_executable -cne 'mullvadbrowser.exe') { throw 'browser executable does not match locked Mullvad Windows scope' }
     if ($env:FIREFOX_REVISION -notmatch '^[0-9a-f]{40}$') { throw 'invalid Firefox revision' }
     if (Test-Path $source) { throw 'refusing stale Firefox source directory' }
     $gitLog = "$out\source-fetch.log"
@@ -75,9 +76,17 @@ try {
     $tar = @(Get-ChildItem $staged -File -Filter '*.tar')
     if ($tar.Count -ne 1) { throw 'expected exactly one intermediate package tar' }
     Invoke-NativeChecked '7z' @('x', $tar[0].FullName, "-o$staged", '-y') $unpackLog
-    $firefox = @(Get-ChildItem $staged -Recurse -File -Filter firefox.exe)
-    if ($firefox.Count -ne 1) { throw 'Firefox cannot start: expected exactly one firefox.exe in staged package' }
+    # Locked Mullvad Windows scope: upstream rbm.conf var/exe_name is
+    # mullvadbrowser, not firefox. Do not select the first Mozilla executable.
+    $firefox = @(Get-ChildItem $staged -Recurse -File -Filter $recorded.browser_executable)
+    if ($firefox.Count -ne 1) { throw 'Mullvad Browser cannot start: expected exactly one mullvadbrowser.exe in staged package' }
     $firefox = $firefox[0]
+    $stageRoot = (Resolve-Path -LiteralPath $staged).Path.TrimEnd([char[]]'\/') + [System.IO.Path]::DirectorySeparatorChar
+    if ($firefox.Name -ine $recorded.browser_executable -or
+        [System.IO.Path]::GetFileName($firefox.FullName) -ine $recorded.browser_executable -or
+        !$firefox.FullName.StartsWith($stageRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Mullvad Browser executable does not match the locked staged package'
+    }
     $log = "$out\profileserver.log"
     # The exact profileserver sets its own absolute LLVM profile path at
     # topsrcdir. Its mozrunner adds --wait-for-browser on Windows and propagates

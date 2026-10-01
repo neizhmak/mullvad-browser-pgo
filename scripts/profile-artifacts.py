@@ -26,7 +26,8 @@ HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 SOURCE_BINDINGS = ("upstream_lock", "firefox", "profileserver", "pgo_overlay_sha256",
                    "pgo_languages", "rust_pgo_identity_sha256", "clang_identity",
-                   "rust_identity", "toolchains", "generation_targets", "generation_configure_flags")
+                   "rust_identity", "toolchains", "generation_targets", "generation_configure_flags",
+                   "browser_executable")
 
 
 def require(condition, message):
@@ -126,6 +127,8 @@ def validate_build(data, require_package=True):
             "profile scope must be Alpha Windows x86_64 generation")
     require(data["generation_configure_flags"] == ["--enable-profile-generate=cross"],
             "profile generation flags must not disable Rust or enable profile use")
+    require(data["browser_executable"] == "mullvadbrowser.exe",
+            "browser executable must match locked Mullvad Windows scope")
     nonempty(data, "clang_identity")
     nonempty(data, "rust_identity")
     require(isinstance(data["toolchains"], dict), "missing exact toolchain archives")
@@ -192,6 +195,7 @@ def validate_registry(data, expected_identity=None):
             and type(training.get("profileserver_exit_code")) is int
             and training["profileserver_exit_code"] == 0, "missing successful training provenance")
     require(training.get("instrumented_package_sha256") == provenance["instrumented_package_sha256"]
+            and training.get("browser_executable") == provenance["browser_executable"]
             and training.get("profileserver_sha256") == provenance["profileserver"]["sha256"],
             "training source/package is not bound to profile provenance")
     require(training.get("jarlog") == assets["jarlog"], "training jarlog is not bound to published payload")
@@ -270,6 +274,7 @@ def record_training(directory, build_path, source_directory, package):
     manifest = {"schema": 1, "kind": "exact-firefox-profileserver-training",
                 "build_provenance_sha256": sha(build_path),
                 "instrumented_package_sha256": build["instrumented_package_sha256"],
+                "browser_executable": build["browser_executable"],
                 "profileserver_sha256": build["profileserver"]["sha256"],
                 "profileserver_exit_code": 0,
                 "raw_profiles": [{"name": path.relative_to(directory).as_posix(), **describe(path)}
@@ -291,6 +296,7 @@ def validate_training(directory, build_path):
     require(manifest.get("build_provenance_sha256") == sha(build_path),
             "raw profiles were generated from different build provenance")
     require(manifest.get("instrumented_package_sha256") == build["instrumented_package_sha256"]
+            and manifest.get("browser_executable") == build["browser_executable"]
             and manifest.get("profileserver_sha256") == build["profileserver"]["sha256"],
             "training source/package provenance mismatch")
     records = manifest.get("raw_profiles")
@@ -378,6 +384,8 @@ def run_profileserver(source, binary, output, build_path, timeout=3600, bootstra
             == build["profileserver"]["sha256"], "pinned profileserver SHA-256 mismatch")
     describe(source / "mach")
     describe(binary)
+    require(binary.name.casefold() == build["browser_executable"].casefold(),
+            "training binary does not match the provenance browser executable")
     output.mkdir(parents=True, exist_ok=True)
     require(not list(output.rglob("*.profraw")) and not (output / "jarlog").exists()
             and not (output / TRAINING_NAME).exists(), "refusing stale training outputs")

@@ -20,6 +20,9 @@ def main():
     def show(key):
         return output(str(upstream / "rbm/rbm"), "showconf", "firefox", key, *common, cwd=upstream)
     repository, ref, revision = show("git_url"), show("git_hash"), show("var/git_commit")
+    executable = show("var/exe_name")
+    if executable != "mullvadbrowser":
+        raise SystemExit("pinned Mullvad target did not select mullvadbrowser.exe")
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
         raise SystemExit("invalid exact Firefox revision")
     clone_root = Path(show("git_clone_dir"))
@@ -47,6 +50,7 @@ def main():
         "schema": 2,
         "upstream_lock": json.loads((root / "upstream.lock.json").read_text()),
         "firefox": {"repository": repository, "ref": ref, "revision": revision},
+        "browser_executable": executable + ".exe",
         "pgo_overlay_sha256": hashlib.sha256((root / "patches/firefox-pgo-generate.patch").read_bytes()).hexdigest(),
         "profileserver": {"path": path, "revision": revision, "sha256": hashlib.sha256(server).hexdigest()},
         "pgo_languages": ["c++", "rust"],

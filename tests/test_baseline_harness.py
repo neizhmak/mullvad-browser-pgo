@@ -38,7 +38,7 @@ VERSION = runtime.locked_version(LOCK)
 
 def fake_browser_tree(directory):
     directory.mkdir(parents=True, exist_ok=True)
-    names = ["firefox.exe", "xul.dll", "omni.ja", "browser/omni.ja", "updater.exe", "postupdate.exe", "uninstall.exe",
+    names = ["mullvadbrowser.exe", "xul.dll", "omni.ja", "browser/omni.ja", "updater.exe", "postupdate.exe", "uninstall.exe",
              "distribution/extensions/uBlock0@raymondhill.net.xpi",
              "distribution/extensions/{73a6fe31-595d-460b-a920-fcc0f8843232}.xpi",
              "distribution/extensions/{d19a89b9-76c1-4a61-bcd4-49e8de916403}.xpi"]
@@ -80,6 +80,8 @@ def fixture_main(argv):
             (destination / "uninstall.exe").unlink()
         elif behavior == "bad-update-route":
             (destination / "update-settings.ini").write_text("[Settings]\nACCEPTED_MAR_CHANNEL_IDS=release\n")
+        elif behavior == "wrong-product-name":
+            (destination / "mullvadbrowser.exe").rename(destination / "firefox.exe")
         elif behavior == "partial-install":
             return 9
         return 0
@@ -203,6 +205,14 @@ class BaselineHarnessTests(unittest.TestCase):
         self.assertEqual(registry_calls, 2)
         self.assertEqual(len(self.native_commands), 4)
         self.assertEqual(len(report["samples"]), 1)
+        self.assertEqual(report["browser_executable"]["filename"], "mullvadbrowser.exe")
+        inventory = runtime.read_json(self.args.output_directory / "baseline-installed-files.json")
+        names = {item["path"] for item in inventory["entries"]}
+        self.assertIn("mullvadbrowser.exe", names)
+        self.assertIn("uninstall.exe", names)
+        self.assertNotIn("firefox.exe", names)
+        self.assertFalse(inventory.get("truncated", False))
+        self.assertEqual(inventory["expected_executable"], "mullvadbrowser.exe")
         self.assertEqual(report["calibration"]["mode"], "calibrate")
         self.assertEqual(report["samples"][0]["mode"], "measure")
         self.assertEqual(runtime.validate_workloads(report["samples"][0]), report["iterations"])
@@ -287,12 +297,26 @@ class BaselineHarnessTests(unittest.TestCase):
         report = self.assert_failure_cleanup()
         self.assertTrue(report["cleanup"][0]["uninstalled"])
         self.assertNotIn("calibration", report)
+        inventory = runtime.read_json(self.args.output_directory / "baseline-installed-files.json")
+        self.assertIn("mullvadbrowser.exe", {item["path"] for item in inventory["entries"]})
         self.assertEqual(len(self.native_commands), 2)
 
     def test_secure_alpha_tree_must_pass_before_browser_launch(self):
         with self.assertRaisesRegex(runtime.CheckError, "signed Mullvad Alpha"):
             self.run_fixture(installer="bad-update-route")
         self.assert_failure_cleanup()
+        self.assertEqual(len(self.native_commands), 2)
+        self.assertFalse((self.args.output_directory / "calibration-baseline").exists())
+        self.assertTrue((self.args.output_directory / "baseline-installed-files.json").is_file())
+
+    def test_generic_firefox_executable_is_not_a_product_fallback(self):
+        with self.assertRaisesRegex(runtime.CheckError, "mullvadbrowser.exe"):
+            self.run_fixture(installer="wrong-product-name")
+        self.assert_failure_cleanup()
+        inventory = runtime.read_json(self.args.output_directory / "baseline-installed-files.json")
+        names = {item["path"] for item in inventory["entries"]}
+        self.assertIn("firefox.exe", names)
+        self.assertNotIn("mullvadbrowser.exe", names)
         self.assertEqual(len(self.native_commands), 2)
         self.assertFalse((self.args.output_directory / "calibration-baseline").exists())
 

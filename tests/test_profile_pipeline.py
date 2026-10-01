@@ -85,6 +85,7 @@ if args[3]=='-c':
  if mode=='bootstrap-fail':print('cannot import mozrunner',file=sys.stderr);sys.exit(17)
  print('Pinned build Python: fake probe');sys.exit(0)
 assert args[3]=='build/pgo/profileserver.py' and args[4]=='--binary',args
+assert pathlib.Path(args[5]).name=='mullvadbrowser.exe',args
 pathlib.Path('default_123_random_456.profraw').write_bytes(b'firefox C++ AND Rust counters')
 (out/'profile-run-1.log').write_text('native initialization complete\n')
 (out/'profile-run-2.log').write_text('LLVM Profile Error: invalid profile' if mode=='llvm-error' else 'native workload complete\n')
@@ -125,7 +126,7 @@ class ProfilePipelineTests(unittest.TestCase):
         (self.source / 'mach').write_text(FAKE_MACH)
         self.package = self.base / 'instrumented.tar.xz'
         self.package.write_bytes(b'instrumented Windows Firefox package')
-        self.binary = self.base / 'firefox.exe'
+        self.binary = self.base / 'mullvadbrowser.exe'
         self.binary.write_bytes(b'MZ binary fixture')
         self.training = self.base / 'training'
         self.training.mkdir()
@@ -147,6 +148,7 @@ class ProfilePipelineTests(unittest.TestCase):
                       'profileserver':{'path':'build/pgo/profileserver.py','revision':'c'*40,'sha256':digest(self.source/'build/pgo/profileserver.py')},
                       'pgo_overlay_sha256':'d'*64,'pgo_languages':['c++','rust'],'rust_pgo_identity_sha256':'e'*64,
                       'instrumented_package_sha256':digest(self.package),
+                      'browser_executable':'mullvadbrowser.exe',
                       'clang_identity':'clang version 21.1.8 (pinned source)','rust_identity':'rustc 1.94.0 (pinned source)',
                       'toolchains':{'clang':{'archive_filename':'mingw-clang.tar.zst','sha256':'f'*64,'size':8,'version':'clang version 21.1.8'},
                                     'rust':{'archive_filename':'rust-profiler.tar.zst','sha256':'0'*64,'size':9,'version':'rustc 1.94.0 (LLVM 22.0)'}},
@@ -214,6 +216,41 @@ class ProfilePipelineTests(unittest.TestCase):
         return self.run_tool('profile-artifacts.py','run-profileserver','--source-directory',self.source,
                              '--binary',self.binary,'--output-directory',self.training,
                              '--build-provenance',self.build_path)
+
+    def test_training_package_selection_is_locked_to_mullvad_executable(self):
+        # Keep the native package-selection gate aligned with pinned rbm.conf
+        # var/exe_name=mullvadbrowser. Never fall back to Mozilla's executable.
+        train=(SCRIPTS/'train-pgo.ps1').read_text()
+        self.assertIn('-Filter $recorded.browser_executable',train)
+        self.assertNotIn('-Filter firefox.exe',train)
+        self.assertIn("$recorded.browser_executable -cne 'mullvadbrowser.exe'",train)
+        self.assertIn("if ($firefox.Count -ne 1)",train)
+        self.assertIn("GetFileName($firefox.FullName) -ine $recorded.browser_executable",train)
+        self.assertIn('$firefox.FullName.StartsWith($stageRoot',train)
+
+    def test_training_requires_browser_executable_provenance(self):
+        del self.build['browser_executable']
+        put_json(self.build_path,self.build)
+        result=self.train()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('missing build provenance field: browser_executable',result.stderr)
+        self.assertFalse((self.training/'mach-calls.jsonl').exists())
+
+    def test_training_rejects_non_mullvad_browser_provenance(self):
+        self.build['browser_executable']='firefox.exe'
+        put_json(self.build_path,self.build)
+        result=self.train()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('locked Mullvad Windows scope',result.stderr)
+        self.assertFalse((self.training/'mach-calls.jsonl').exists())
+
+    def test_training_binary_name_must_match_provenance(self):
+        self.binary=self.base/'firefox.exe'
+        self.binary.write_bytes(b'MZ wrong packaged executable')
+        result=self.train()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('provenance browser executable',result.stderr)
+        self.assertFalse((self.training/'mach-calls.jsonl').exists())
 
     def test_training_native_mach_contract_and_env(self):
         self.env['LLVM_PROFDATA']='wrong-host-tool'

@@ -2,6 +2,7 @@
 """Behavioral checks for profile-use configuration, handoff, and Windows packaging."""
 from pathlib import Path
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -45,9 +46,10 @@ class PGOUseTests(unittest.TestCase):
         self.profile.mkdir()
         (self.profile / "merged.profdata").write_bytes(b"profile")
         (self.profile / "jarlog").write_bytes(b"jarlog")
-        (self.profile / "provenance.json").write_text(json.dumps({"firefox": {"revision": "a" * 40}}))
+        (self.profile / "provenance.json").write_text(json.dumps({"firefox": {"revision": "a" * 40},
+                                                                   "browser_executable": "mullvadbrowser.exe"}))
         self.identity = "b" * 64
-        self.proof = {"schema": 1, "firefox_revision": "a" * 40,
+        self.proof = {"schema": 1, "executable": "mullvadbrowser.exe", "firefox_revision": "a" * 40,
                       "pgo_profile_sha256": digest(self.profile / "merged.profdata"),
                       "pgo_jarlog_sha256": digest(self.profile / "jarlog"),
                       "substs": {"MOZ_PROFILE_USE": "1", "MOZ_PGO_RUST": "1", "MOZ_PROFILE_GENERATE": "",
@@ -56,8 +58,14 @@ class PGOUseTests(unittest.TestCase):
                       "defines": dict(UPDATE_DEFINES)}
         self.output = self.directory / "firefox-mullvad-browser-test"
         self.output.mkdir()
-        for filename in ["browser.tar.zst", "nsis-plugins.tar.zst", "mar-tools-windows-x86_64-16.0a9.zip"]:
+        for filename in ["nsis-plugins.tar.zst", "mar-tools-windows-x86_64-16.0a9.zip"]:
             (self.output / filename).write_bytes(filename.encode())
+        # A small real TAR exercises the same native archive checks as .tar.zst.
+        with tarfile.open(self.output / "browser.tar.zst", "w") as archive:
+            data = b"MZtest-mullvad"
+            member = tarfile.TarInfo("Browser/mullvadbrowser.exe")
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
         (self.output / "pgo-use-proof.json").write_text(json.dumps(self.proof))
         self.artifact = self.directory / "handoff"
 
@@ -77,12 +85,12 @@ class PGOUseTests(unittest.TestCase):
                             "--profile-directory", self.profile, "--profile-identity", self.identity)
 
     def make_portable(self, path, system_marker=False, update_url=None, mar_channels=None):
-        required = {"Browser/firefox.exe": b"MZfake", "Browser/xul.dll": b"MZfake", "Browser/updater.exe": b"MZfake",
+        required = {"Browser/mullvadbrowser.exe": b"MZfake", "Browser/xul.dll": b"MZfake", "Browser/updater.exe": b"MZfake",
                     "Browser/omni.ja": b"data", "Browser/browser/omni.ja": b"data",
                     "Browser/application.ini": ("[App]\nName=MullvadBrowser\nVersion=153.0esr\n[AppUpdate]\nURL=" +
                         (update_url or OFFICIAL_UPDATE_URL + "/%CHANNEL%/%BUILD_TARGET%/%VERSION%/ALL") + "\n").encode(),
                     "Browser/update-settings.ini": ("[Settings]\nACCEPTED_MAR_CHANNEL_IDS=" + (mar_channels or MAR_CHANNEL) + "\n").encode(),
-                    "Browser/postupdate.exe": b"MZfake", "Start Mullvad Browser.cmd": b'@echo off\r\nstart "" "%~dp0Browser\\firefox.exe" %*\r\n',
+                    "Browser/postupdate.exe": b"MZfake", "Start Mullvad Browser.cmd": b'@echo off\r\nstart "" "%~dp0Browser\\mullvadbrowser.exe" %*\r\n',
                     "Browser/distribution/extensions/uBlock0@raymondhill.net.xpi": b"extension",
                     "Browser/distribution/extensions/{73a6fe31-595d-460b-a920-fcc0f8843232}.xpi": b"extension",
                     "Browser/distribution/extensions/{d19a89b9-76c1-4a61-bcd4-49e8de916403}.xpi": b"extension"}
@@ -109,6 +117,34 @@ class PGOUseTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), digest(self.artifact / "firefox-output.tar"))
         (self.artifact / "firefox-output.tar").write_bytes(b"changed")
         self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_wrong_firefox_name_is_not_accepted_as_mullvad_output(self):
+        self.proof["executable"] = "firefox.exe"
+        (self.output / "pgo-use-proof.json").write_text(json.dumps(self.proof))
+        wrong_proof = self.snapshot()
+        self.assertNotEqual(wrong_proof.returncode, 0)
+        self.assertIn("Mullvad executable", wrong_proof.stderr)
+        self.proof["executable"] = "mullvadbrowser.exe"
+        (self.output / "pgo-use-proof.json").write_text(json.dumps(self.proof))
+        with tarfile.open(self.output / "browser.tar.zst", "w") as archive:
+            data = b"MZnot-mullvad"
+            member = tarfile.TarInfo("Browser/firefox.exe")
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+        wrong_archive = self.snapshot()
+        self.assertNotEqual(wrong_archive.returncode, 0)
+        self.assertIn("wrong Mullvad executable", wrong_archive.stderr)
+        # A portable archive with only the upstream Firefox name also fails.
+        packages = self.directory / "packages"
+        packages.mkdir()
+        portable = packages / "mullvad-browser-windows-x86_64-portable-16.0a9.zip"
+        self.make_portable(portable)
+        with zipfile.ZipFile(portable, "a") as archive:
+            archive.writestr("Mullvad Browser/Browser/firefox.exe", b"MZunexpected")
+        (packages / "mullvad-browser-windows-x86_64-16.0a9.exe").write_bytes(b"MZinstaller")
+        wrong_package = self.collect()
+        self.assertNotEqual(wrong_package.returncode, 0)
+        self.assertIn("unexpected Firefox executable", wrong_package.stderr)
 
     def test_handoff_rejects_missing_cross_language_proof_and_wrong_profile(self):
         self.proof["substs"]["MOZ_PGO_RUST"] = ""
@@ -194,6 +230,8 @@ class PGOUseTests(unittest.TestCase):
         manifest = json.loads((self.directory / "final/packages.json").read_text())
         self.assertEqual({item["kind"] for item in manifest["assets"]}, {"installer", "portable"})
         self.assertFalse(manifest["public_browser_release"])
+        self.assertEqual(manifest["browser_executable"], "mullvadbrowser.exe")
+        self.assertEqual(manifest["portable_layout"]["executable"], "Browser/mullvadbrowser.exe")
         for item in manifest["assets"]:
             self.assertEqual(item["sha256"], digest(self.directory / "final" / item["filename"]))
 
@@ -203,6 +241,7 @@ class PGOUseTests(unittest.TestCase):
         code = code.replace("[% c('var/pgo_profile_sha256') %]", self.proof["pgo_profile_sha256"])
         code = code.replace("[% c('var/pgo_jarlog_sha256') %]", self.proof["pgo_jarlog_sha256"])
         code = code.replace("[% c('var/torbrowser_version') %]", "16.0a9")
+        code = code.replace("[% c('var/exe_name') %]", "mullvadbrowser")
         obj = self.directory / "obj-test"
         obj.mkdir()
         (obj / "config.status.json").write_text(json.dumps({"substs": self.proof["substs"], "defines": self.proof["defines"]}))
@@ -231,11 +270,11 @@ class PGOUseTests(unittest.TestCase):
     def test_portable_packaging_block_is_deterministic_and_uses_full_tree(self):
         root = self.directory / "Mullvad Browser"
         (root / "Browser").mkdir(parents=True)
-        (root / "Browser/firefox.exe").write_bytes(b"MZfake")
+        (root / "Browser/mullvadbrowser.exe").write_bytes(b"MZfake")
         (root / "Browser/distribution").mkdir()
         (root / "Browser/distribution/preserved.txt").write_bytes(b"privacy settings")
         program = self.directory / "portable.py"
-        program.write_text(added_block("PY_PGO_PORTABLE"))
+        program.write_text(added_block("PY_PGO_PORTABLE").replace("[% c('var/exe_name') %]", "mullvadbrowser"))
         first, second = self.directory / "first.zip", self.directory / "second.zip"
         for path in [first, second]:
             result = subprocess.run([sys.executable, program, root.name, path, "1784727000"], cwd=self.directory, capture_output=True, text=True)
@@ -243,7 +282,7 @@ class PGOUseTests(unittest.TestCase):
         self.assertEqual(digest(first), digest(second))
         with zipfile.ZipFile(first) as archive:
             self.assertIn("Mullvad Browser/Browser/distribution/preserved.txt", archive.namelist())
-            self.assertIn(b'"%~dp0Browser\\firefox.exe" %*', archive.read("Mullvad Browser/Start Mullvad Browser.cmd"))
+            self.assertIn(b'"%~dp0Browser\\mullvadbrowser.exe" %*', archive.read("Mullvad Browser/Start Mullvad Browser.cmd"))
         (root / "Browser/system-install").touch()
         bad = subprocess.run([sys.executable, program, root.name, second, "1784727000"], cwd=self.directory, capture_output=True, text=True)
         self.assertNotEqual(bad.returncode, 0)

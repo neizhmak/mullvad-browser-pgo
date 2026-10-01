@@ -88,7 +88,7 @@ def origin(archive):
 
 def browser_tree(directory, portable=False):
     directory.mkdir(parents=True, exist_ok=True)
-    files = ["firefox.exe", "xul.dll", "omni.ja", "browser/omni.ja", "updater.exe", "postupdate.exe",
+    files = ["mullvadbrowser.exe", "xul.dll", "omni.ja", "browser/omni.ja", "updater.exe", "postupdate.exe",
              "distribution/extensions/uBlock0@raymondhill.net.xpi",
              "distribution/extensions/{73a6fe31-595d-460b-a920-fcc0f8843232}.xpi",
              "distribution/extensions/{d19a89b9-76c1-4a61-bcd4-49e8de916403}.xpi"]
@@ -136,7 +136,7 @@ class RuntimeTests(unittest.TestCase):
         packages.mkdir()
         tree = self.root / "tree" / "Mullvad Browser"
         browser_tree(tree / "Browser", portable=True)
-        (tree / "Start Mullvad Browser.cmd").write_bytes(b'@echo off\r\n"%~dp0Browser\\firefox.exe" %*\r\n')
+        (tree / "Start Mullvad Browser.cmd").write_bytes(b'@echo off\r\n"%~dp0Browser\\mullvadbrowser.exe" %*\r\n')
         installer = packages / f"mullvad-browser-windows-x86_64-{VERSION}.exe"
         installer.write_bytes(b"MZ installer bytes")
         portable = packages / f"mullvad-browser-windows-x86_64-portable-{VERSION}.zip"
@@ -149,9 +149,10 @@ class RuntimeTests(unittest.TestCase):
         identity = "c" * 64
         manifest = {"schema": 1, "kind": "unofficial-mullvad-windows-alpha-pgo", "version": VERSION, "channel": "alpha",
                     "platform": "windows-x86_64", "upstream_lock": LOCK, "public_browser_release": False, "profile_identity": identity,
+                    "browser_executable": "mullvadbrowser.exe",
                     "firefox": {"upstream_lock": LOCK, "profile_identity": identity,
-                                "proof": {"substs": {"MOZ_PROFILE_USE": True, "MOZ_PGO_RUST": True, "MOZ_PROFILE_GENERATE": False}}},
-                    "portable_layout": {"root": "Mullvad Browser", "launcher": "Start Mullvad Browser.cmd",
+                                "proof": {"executable": "mullvadbrowser.exe", "substs": {"MOZ_PROFILE_USE": True, "MOZ_PGO_RUST": True, "MOZ_PROFILE_GENERATE": False}}},
+                    "portable_layout": {"root": "Mullvad Browser", "launcher": "Start Mullvad Browser.cmd", "executable": "Browser/mullvadbrowser.exe",
                                         "portable_detection": "absence of Browser/system-install", "complete_browser_tree": True}, "assets": assets}
         runtime.write_json(packages / "packages.json", manifest)
         return packages, manifest, tree
@@ -200,10 +201,12 @@ class RuntimeTests(unittest.TestCase):
     def test_package_identity_rejects_wrong_lock_public_release_or_rust(self):
         packages, original, _ = self.package_fixture()
         variants = []
-        for field, value in (("channel", "release"), ("public_browser_release", True), ("schema", True)):
+        for field, value in (("channel", "release"), ("public_browser_release", True), ("schema", True),
+                             ("browser_executable", "firefox.exe"), ("browser_executable", None)):
             item = copy.deepcopy(original); item[field] = value; variants.append(item)
         item = copy.deepcopy(original); item["upstream_lock"] = {}; variants.append(item)
         item = copy.deepcopy(original); item["firefox"]["proof"]["substs"]["MOZ_PGO_RUST"] = False; variants.append(item)
+        item = copy.deepcopy(original); item["firefox"]["proof"]["executable"] = "firefox.exe"; variants.append(item)
         for manifest in variants:
             with self.subTest(manifest=manifest):
                 runtime.write_json(packages / "packages.json", manifest)
@@ -392,7 +395,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_native_browser_smoke_with_real_fake_subprocess(self):
         with self.patched_browser(self.fake_browser()):
-            report = runtime.run_browser(self.root / "firefox.exe", self.root, "smoke", 10)
+            report = runtime.run_browser(self.root / "mullvadbrowser.exe", self.root, "smoke", 10)
         self.assertEqual(report["mode"], "calibrate")
         self.assertFalse((self.root / "smoke/profile").exists())
         self.assertTrue((self.root / "smoke/screenshot.png").is_file())
@@ -403,7 +406,7 @@ class RuntimeTests(unittest.TestCase):
     def test_native_browser_rejects_bad_js_report_and_propagates_exit(self):
         for behavior in ("bad-nonce", "bad-checksum", "nonzero"):
             with self.subTest(behavior=behavior), self.patched_browser(self.fake_browser(behavior)), self.assertRaises(runtime.CheckError):
-                runtime.run_browser(self.root / "firefox.exe", self.root, behavior, 10)
+                runtime.run_browser(self.root / "mullvadbrowser.exe", self.root, behavior, 10)
             self.assertFalse((self.root / behavior / "profile").exists())
 
     def test_browser_tree_uses_product_version_not_gecko_version(self):
@@ -414,6 +417,37 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime.CheckError, "marker"):
             runtime.verify_browser_tree(tree, VERSION, portable=True)
         self.assertTrue(runtime.verify_browser_tree(tree, VERSION, portable=False)["system_install"])
+
+    def test_browser_tree_rejects_firefox_name_and_preserves_actual_inventory(self):
+        tree = self.root / "Browser"; browser_tree(tree, portable=True)
+        (tree / "mullvadbrowser.exe").rename(tree / "firefox.exe")
+        output = self.root / "installed-inventory.json"
+        with self.assertRaisesRegex(runtime.CheckError, "mullvadbrowser.exe"):
+            runtime.verify_browser_tree(tree, VERSION, portable=True, inventory_path=output)
+        inventory = runtime.read_json(output)
+        files = {entry["path"]: entry for entry in inventory["entries"]}
+        self.assertEqual(inventory["expected_executable"], "mullvadbrowser.exe")
+        self.assertEqual(files["firefox.exe"]["kind"], "file")
+        self.assertEqual(files["firefox.exe"]["size"], len(b"MZ fake package bytes"))
+        self.assertNotIn("mullvadbrowser.exe", files)
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlink fixture; Windows junctions use reparse detection")
+    def test_inventory_does_not_follow_linked_directories(self):
+        tree = self.root / "installed"; tree.mkdir()
+        outside = self.root / "outside"; outside.mkdir()
+        (outside / "private-file").write_text("do not inspect outside test installation")
+        (tree / "linked-directory").symlink_to(outside, target_is_directory=True)
+        inventory = runtime.record_browser_inventory(tree, self.root / "inventory.json")
+        self.assertEqual(inventory["entries"], [{"path": "linked-directory", "kind": "link-or-reparse-point"}])
+
+    def test_packages_reject_missing_or_wrong_portable_executable_identity(self):
+        packages, manifest, _ = self.package_fixture()
+        for name in (None, "Browser/firefox.exe", "mullvadbrowser.exe"):
+            value = copy.deepcopy(manifest)
+            value["portable_layout"]["executable"] = name
+            runtime.write_json(packages / "packages.json", value)
+            with self.subTest(executable=name), self.assertRaisesRegex(runtime.CheckError, "portable layout"):
+                runtime.verify_packages(packages, LOCK)
 
     def test_browser_tree_rejects_changed_official_update_route(self):
         tree = self.root / "Browser"; browser_tree(tree, portable=True)
@@ -476,6 +510,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(report["sample_order"][1]["variants"], ["portable", "installer", "baseline"])
         self.assertEqual(list(args.output_directory.glob("*/profile")), [])
         self.assertTrue(report["registry_cleanup_verified"])
+        self.assertIn("mullvadbrowser.exe", report["installed_portable_same_binaries"])
+        for name in ("baseline-install", "baseline-copy", "installer", "portable"):
+            inventory = runtime.read_json(args.output_directory / (name + "-inventory.json"))
+            paths = {item["path"] for item in inventory["entries"]}
+            self.assertIn("mullvadbrowser.exe", paths)
+            self.assertNotIn("firefox.exe", paths)
 
     @unittest.skipUnless(shutil.which("node"), "optional native JavaScript syntax and deterministic workload check")
     def test_javascript_units_have_the_recorded_checksums(self):

@@ -69,9 +69,11 @@ def run_smoke(args):
         installed = True  # A partially completed installer must also be cleaned.
         runtime.run_native(runtime.installer_command(installer, destination), output / "baseline-install.log",
                            args.installer_timeout_seconds)
-        report["installed_tree"] = runtime.verify_browser_tree(destination, version, portable=False)
-        binary = destination / "firefox.exe"
-        binary_record = {"filename": "firefox.exe", "size": binary.stat().st_size,
+        # The shared helper writes exact installed layout before validation.
+        report["installed_tree"] = runtime.verify_browser_tree(
+            destination, version, portable=False, inventory_path=output / "baseline-installed-files.json")
+        binary = destination / "mullvadbrowser.exe"
+        binary_record = {"filename": "mullvadbrowser.exe", "size": binary.stat().st_size,
                          "sha256": runtime.sha256(binary)}
         report["browser_executable"] = binary_record
         runtime.write_json(output / REPORT_NAME, report)
@@ -98,6 +100,19 @@ def run_smoke(args):
         record_error("smoke", exception)
     finally:
         if installed:
+            # Capture partial installs or retry a missing inventory before
+            # uninstall. Only the disposable install is inspected.
+            try:
+                inventory_path = output / "baseline-installed-files.json"
+                if not inventory_path.is_file():
+                    inventory = runtime.record_browser_inventory(destination, inventory_path)
+                else:
+                    inventory = runtime.read_json(inventory_path)
+                report["installed_inventory"] = {"filename": inventory_path.name,
+                                                 "sha256": runtime.sha256(inventory_path),
+                                                 "entries": len(inventory["entries"])}
+            except Exception as exception:
+                record_error("installed-inventory", exception)
             try:
                 uninstaller = destination / "uninstall.exe"
                 if uninstaller.is_symlink() or not uninstaller.is_file():

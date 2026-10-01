@@ -79,8 +79,12 @@ python scripts/windows-runtime-check.py prepare-baseline --output-directory "$en
 
 Default input/output directories are `RUNNER_TEMP/pgo-packages`, `baseline`,
 and `pgo-runtime-check`. Hash-verified installers use silent installation into
-disposable paths. Portable checks retain the launcher and complete browser
-tree. Test profiles are isolated; browser privacy settings are unchanged.
+disposable paths. The pinned Mullvad target sets `var/exe_name=mullvadbrowser`;
+its installed executable is `mullvadbrowser.exe`, not Firefox's default name.
+System installation flattens the `Browser/` contents into the install root.
+Portable mode retains `Browser/mullvadbrowser.exe`, the launcher, and the full
+tree. Source/profile/package provenance binds this exact product basename.
+Installed-file inventories are saved before validation and cleanup. Test profiles are isolated; browser privacy settings are unchanged.
 The self-contained `file://` workload uses offline headless rendering and
 records its result through a PNG pixel grid. Baseline calibration accommodates
 privacy-reduced timer precision. Measured launches use identical workloads,

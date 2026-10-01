@@ -8,12 +8,14 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import subprocess
 import tarfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = "/var/tmp/dist/pgo/merged.profdata"
 JARLOG_PATH = "/var/tmp/dist/pgo/jarlog"
+MULLVAD_EXECUTABLE = "mullvadbrowser.exe"  # pinned rbm.conf mullvadbrowser target
 OFFICIAL_UPDATE_URL = "https://cdn.mullvad.net/browser/update_responses/update_1"
 OFFICIAL_MAR_CHANNEL = "mullvadbrowser-mullvad-alpha"
 UPDATE_OPTIONS = {
@@ -82,10 +84,14 @@ def profile_hashes(directory):
 def verify_proof(proof, profile_directory):
     if proof.get("schema") != 1:
         raise SystemExit("invalid Firefox profile-use proof schema")
+    if proof.get("executable") != MULLVAD_EXECUTABLE:
+        raise SystemExit("Firefox proof does not select the pinned Mullvad executable")
     for key, value in profile_hashes(profile_directory).items():
         if proof.get(key) != value:
             raise SystemExit("Firefox proof profile identity mismatch: " + key)
     provenance = read_json(Path(profile_directory) / "provenance.json")
+    if provenance.get("browser_executable") != MULLVAD_EXECUTABLE:
+        raise SystemExit("profile provenance does not select the pinned Mullvad executable")
     if proof.get("firefox_revision") != provenance["firefox"]["revision"]:
         raise SystemExit("Firefox proof source revision mismatch")
     substs = proof.get("substs", {})
@@ -102,6 +108,22 @@ def verify_proof(proof, profile_directory):
     verify_update_configuration(proof)
 
 
+def verify_browser_archive(path):
+    # GNU tar reads the upstream .tar.zst through installed zstd, without extraction.
+    try:
+        listed = subprocess.run(["tar", "-tf", str(path)], check=True, capture_output=True,
+                                text=True, timeout=180).stdout.splitlines()
+        expected = "Browser/" + MULLVAD_EXECUTABLE
+        if listed.count(expected) != 1 or "Browser/firefox.exe" in listed:
+            raise SystemExit("selected Firefox archive has the wrong Mullvad executable")
+        content = subprocess.run(["tar", "-xOf", str(path), expected], check=True,
+                                 capture_output=True, timeout=180).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SystemExit("cannot verify selected Mullvad browser archive: " + str(error))
+    if not content.startswith(b"MZ"):
+        raise SystemExit("selected Mullvad executable is not a Windows PE file")
+
+
 def snapshot_firefox(args):
     directory = args.directory.resolve()
     if not directory.is_dir() or not re.fullmatch(r"firefox-[A-Za-z0-9._-]+", args.rbm_filename):
@@ -112,6 +134,8 @@ def snapshot_firefox(args):
             raise SystemExit("selected Firefox output is incomplete: " + pattern)
     proof = read_json(directory / "pgo-use-proof.json")
     verify_proof(proof, args.profile_directory)
+    browser_archive = next(directory.glob("browser.tar.*"))
+    verify_browser_archive(browser_archive)
     files = []
     for path in sorted(directory.rglob("*")):
         if path.is_symlink() or (not path.is_file() and not path.is_dir()):
@@ -132,6 +156,7 @@ def snapshot_firefox(args):
                 archive.addfile(info, stream)
     manifest = {"schema": 1, "kind": "windows-cross-pgo-firefox-output",
                 "rbm_filename": args.rbm_filename, "profile_identity": args.profile_identity,
+                "browser_executable": MULLVAD_EXECUTABLE,
                 "upstream_lock": read_json(ROOT / "upstream.lock.json"),
                 "pgo_use_overlay_sha256": sha(ROOT / "patches/firefox-pgo-use.patch"),
                 "proof": proof, "files": files,
@@ -145,6 +170,7 @@ def verify_firefox(args):
     manifest = read_json(args.artifact_directory / "firefox-output.json")
     if (manifest.get("schema") != 1 or manifest.get("kind") != "windows-cross-pgo-firefox-output"
             or manifest.get("profile_identity") != args.profile_identity
+            or manifest.get("browser_executable") != MULLVAD_EXECUTABLE
             or manifest.get("upstream_lock") != read_json(ROOT / "upstream.lock.json")
             or manifest.get("pgo_use_overlay_sha256") != sha(ROOT / "patches/firefox-pgo-use.patch")):
         raise SystemExit("optimized Firefox handoff identity mismatch")
@@ -209,7 +235,7 @@ def verify_package_updates(archive, prefix):
 
 def portable_layout(path, application_directory):
     prefix = application_directory + "/"
-    required = ["Browser/firefox.exe", "Browser/xul.dll", "Browser/omni.ja",
+    required = ["Browser/mullvadbrowser.exe", "Browser/xul.dll", "Browser/omni.ja",
                 "Browser/browser/omni.ja", "Browser/application.ini", "Browser/updater.exe",
                 "Browser/postupdate.exe", "Browser/update-settings.ini", "Start Mullvad Browser.cmd",
                 "Browser/distribution/extensions/uBlock0@raymondhill.net.xpi",
@@ -225,6 +251,8 @@ def portable_layout(path, application_directory):
             safe_name(name)
             if not info.filename.startswith(prefix) or stat.S_ISLNK(info.external_attr >> 16):
                 raise SystemExit("portable ZIP has an unexpected root or symlink")
+        if prefix + "Browser/firefox.exe" in names:
+            raise SystemExit("portable ZIP contains an unexpected Firefox executable")
         if prefix + "Browser/system-install" in names:
             raise SystemExit("portable ZIP contains the system-install marker")
         for relative in required:
@@ -233,13 +261,13 @@ def portable_layout(path, application_directory):
                 raise SystemExit("portable ZIP is incomplete: " + relative)
         updates = verify_package_updates(archive, prefix)
         launcher = archive.read(prefix + "Start Mullvad Browser.cmd")
-        if b'"%~dp0Browser\\firefox.exe" %*' not in launcher:
-            raise SystemExit("portable launcher does not start its own Browser/firefox.exe")
-        for relative in ("Browser/firefox.exe", "Browser/xul.dll", "Browser/updater.exe"):
+        if b'"%~dp0Browser\\mullvadbrowser.exe" %*' not in launcher:
+            raise SystemExit("portable launcher does not start its own Browser/mullvadbrowser.exe")
+        for relative in ("Browser/mullvadbrowser.exe", "Browser/xul.dll", "Browser/updater.exe"):
             with archive.open(prefix + relative) as binary:
                 if binary.read(2) != b"MZ":
                     raise SystemExit("portable ZIP contains a non-PE executable: " + relative)
-    return {"root": application_directory, "launcher": "Start Mullvad Browser.cmd",
+    return {"root": application_directory, "launcher": "Start Mullvad Browser.cmd", "executable": "Browser/mullvadbrowser.exe",
             "portable_detection": "absence of Browser/system-install", "complete_browser_tree": True,
             "updates": updates}
 
@@ -264,6 +292,9 @@ def collect_packages(args):
     firefox = read_json(args.firefox_manifest)
     if firefox.get("profile_identity") != args.profile_identity:
         raise SystemExit("final package profile identity mismatch")
+    if (firefox.get("browser_executable") != MULLVAD_EXECUTABLE
+            or firefox.get("proof", {}).get("executable") != MULLVAD_EXECUTABLE):
+        raise SystemExit("final package handoff selects the wrong browser executable")
     verify_update_configuration(firefox.get("proof", {}))
     if args.destination.exists() and any(args.destination.iterdir()):
         raise SystemExit("refusing to collect into a nonempty final package directory")
@@ -276,6 +307,7 @@ def collect_packages(args):
                        "sha256": sha(destination), "size": destination.stat().st_size})
     manifest = {"schema": 1, "kind": "unofficial-mullvad-windows-alpha-pgo",
                 "version": args.version, "platform": "windows-x86_64", "channel": "alpha",
+                "browser_executable": MULLVAD_EXECUTABLE,
                 "profile_identity": args.profile_identity,
                 "upstream_lock": read_json(ROOT / "upstream.lock.json"),
                 "firefox": firefox, "portable_layout": layout, "assets": assets,
