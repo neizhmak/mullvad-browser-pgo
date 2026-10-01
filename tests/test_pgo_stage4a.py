@@ -18,6 +18,13 @@ PROFILE=(ROOT/'scripts/profile-artifacts.py').read_text()
 VALIDATOR=ROOT/'scripts/validate-pgo-rendering.py'
 BASELINE=(ROOT/'.github/workflows/baseline.yml').read_text()
 class Stage4ATests(unittest.TestCase):
+ def test_technical_profile_release_uses_default_anchor_not_workflow_commit(self):
+  create_lines = [line.strip() for line in WORKFLOW.splitlines() if 'gh release create' in line]
+  self.assertEqual(len(create_lines),1)
+  self.assertNotIn('--target',create_lines[0])
+  self.assertIn('--prerelease',create_lines[0]); self.assertIn('--latest=false',create_lines[0])
+  self.assertIn('default branch',create_lines[0])
+  self.assertIn('profile registry binds the exact build and training inputs',create_lines[0])
  def test_baseline_remains_non_pgo_control(self):
   self.assertNotIn('profile-generate',BASELINE); self.assertNotIn('pgo-generate',BASELINE)
   self.assertIn('make mullvadbrowser-alpha-windows-x86_64', (ROOT/'scripts/run-baseline-build.sh').read_text())

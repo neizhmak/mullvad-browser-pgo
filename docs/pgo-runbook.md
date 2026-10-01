@@ -158,6 +158,12 @@ version/routing policy, protected signing, rollback/rotation, and positive and
 negative update integration tests. See `updates.md`.
 
 The current jobs create Actions installer/portable artifacts and technical
-prereleases only. Public browser publication and additional/current-version
-platforms remain later work. Never treat unsigned installer bootstrap identity
+prereleases only. Technical tags use GitHub's default-branch anchor, not the
+feature-branch workflow commit: `GITHUB_TOKEN` cannot create a new release tag
+on a commit whose workflow files differ from the default branch. The integrity
+registry, source lock, compiler/archive hashes, and recipe/profile identities
+bind the actual inputs independently of that tag anchor. A release shell without
+its verified registry is incomplete and cannot be restored as a valid cache.
+Public browser publication and additional/current-version platforms remain later
+work. Never treat unsigned installer bootstrap identity
 as permission to bypass MAR signatures.

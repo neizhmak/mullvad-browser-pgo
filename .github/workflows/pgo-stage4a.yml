@@ -245,7 +245,7 @@ jobs:
           if gh release view "$PROFILE_RELEASE" >/dev/null 2>&1; then
             test "$(gh release view "$PROFILE_RELEASE" --json isPrerelease --jq .isPrerelease)" = true
           else
-            gh release create "$PROFILE_RELEASE" --prerelease --latest=false --target "$GITHUB_SHA" --title "Verified Windows PGO inputs" --notes 'Technical C++/Rust profile checkpoint, not a browser product release.'
+            gh release create "$PROFILE_RELEASE" --prerelease --latest=false --title "Verified Windows PGO inputs" --notes 'Technical C++/Rust profile checkpoint, not a browser product release. The Git tag anchors to the repository default branch; the profile registry binds the exact build and training inputs.'
           fi
       - name: Publish verified payloads with registry last
         env:

@@ -465,10 +465,17 @@ def publish(args, root):
         raise SystemExit(f"unexpected RBM project in stage registry: {args.stage}")
     registry.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if not exists:
+        # Let GitHub anchor new technical tags to the default branch. Targeting
+        # a feature/workflow commit can require a workflow scope unavailable to
+        # GITHUB_TOKEN, even with contents:write. This tag is a cache index, not
+        # build provenance; the independently verified registry binds the inputs.
+        # Existing tags/releases are never retargeted.
         run("gh", "release", "create", args.release, "--repo", args.repository,
             "--title", f"RBM dependencies for {provenance['tag']}",
-            "--notes", "Outputs produced by the pinned RBM recipes; see registry provenance.",
-            "--prerelease", "--latest=false", "--target", os.environ["GITHUB_SHA"])
+            "--notes", "New technical tags use the repository default branch as a storage/index "
+                       "anchor, not the build source. Build input and artifact provenance is "
+                       "recorded in the verified stage registries. Existing tags are never retargeted.",
+            "--prerelease", "--latest=false")
     # Upload and verify each payload without retaining a second local output tree.
     with tempfile.TemporaryDirectory(prefix=".uploads-", dir=registry.parent) as temporary:
         for path, artifact in zip(paths, artifacts):

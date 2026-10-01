@@ -254,7 +254,11 @@ class PublicationTests(unittest.TestCase):
         create_args = (self.store / "create-args").read_text()
         self.assertIn("--prerelease", create_args)
         self.assertIn("--latest=false", create_args)
-        self.assertIn("--target 0123456789abcdef0123456789abcdef01234567", create_args)
+        self.assertNotIn("--target", create_args)
+        self.assertNotIn(self.env["GITHUB_SHA"], create_args)
+        self.assertIn("repository default branch", create_args)
+        self.assertIn("not the build source", create_args)
+        self.assertIn("verified stage registries", create_args)
 
     def test_two_gibibyte_asset_is_rejected_before_upload(self):
         with self.artifact.open("wb") as stream:
@@ -551,9 +555,15 @@ class PublicationTests(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertTrue((self.registry_dir / "registry-clang.json").exists())
         self.assertFalse((self.store / self.release / "registry-clang.json").exists())
+        prepared_bytes = (self.registry_dir / "registry-clang.json").read_bytes()
         self.env["FAKE_UPLOAD_FAILURES"] = "0"
+        self.env["GITHUB_SHA"] = "e" * 40
+        self.env["GITHUB_RUN_ID"] = "123456789"
+        self.env["GITHUB_RUN_ATTEMPT"] = "2"
         resumed = self.publish()
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual((self.store / self.release / "registry-clang.json").read_bytes(),
+                         prepared_bytes)
         self.assertEqual(self.stage_complete().returncode, 0)
         self.assert_no_temporary_payloads()
 
@@ -623,6 +633,32 @@ class PublicationTests(unittest.TestCase):
         result = self.stage_complete()
         self.assertEqual(result.returncode, 2)
         self.assertIn("provenance mismatch", result.stderr)
+
+
+    def test_new_release_does_not_require_publisher_ci_environment(self):
+        for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REPOSITORY"):
+            self.env.pop(key, None)
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--target", (self.store / "create-args").read_text())
+        self.assertEqual(set(self.read_registry()),
+                         {"schema", "stage", "upstream", "identity", "artifacts"})
+
+    def test_publisher_metadata_changes_do_not_rewrite_committed_registry(self):
+        self.assertEqual(self.publish().returncode, 0)
+        registry = self.store / self.release / "registry-clang.json"
+        committed = registry.read_bytes()
+        creation = (self.store / "create-args").read_bytes()
+        self.env.update({"GITHUB_SHA": "untrusted publisher string; --target other",
+                         "GITHUB_RUN_ID": "999999", "GITHUB_RUN_ATTEMPT": "3",
+                         "GITHUB_REPOSITORY": "different/publisher"})
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registry.read_bytes(), committed)
+        self.assertEqual((self.store / "create-args").read_bytes(), creation)
+        calls = [json.loads(line) for line in (self.store / "calls").read_text().splitlines()]
+        self.assertEqual(sum(call[1] == "create" for call in calls), 1)
+        self.assert_no_temporary_payloads()
 
 
 if __name__ == "__main__":
