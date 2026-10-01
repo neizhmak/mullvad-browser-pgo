@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "preparation_only": true,
+  "publication_enabled": false,
+  "platform": "windows-x86_64",
+  "channel": "alpha",
+  "upstream_tag": "mb-16.0a9-build1",
+  "automatic_updates": true,
+  "update_strategy": "upstream-signed",
+  "update_url_base": "https://cdn.mullvad.net/browser/update_responses/update_1/",
+  "mar_signature_verification": true,
+  "mar_channel_id": "mullvadbrowser-mullvad-alpha",
+  "accepted_mar_channel_ids": [
+    "mullvadbrowser-mullvad-alpha"
+  ],
+  "mar_certificate": {
+    "source": "upstream",
+    "sha256": null
+  },
+  "complete_mar_required": true,
+  "partial_updates": false,
+  "acknowledge_pgo_replacement": true,
+  "authenticode_required": false
+}

@@ -6,7 +6,15 @@ on:
         description: Build and verify the durable profiler Rust checkpoint only
         type: boolean
         default: false
+      finish_pipeline:
+        description: Build optimized Firefox, installer and portable, then validate on Windows
+        type: boolean
+        default: true
   workflow_call:
+    inputs:
+      finish_pipeline:
+        type: boolean
+        default: false
     outputs:
       profile_release:
         description: Immutable cross-language profile prerelease
@@ -16,6 +24,7 @@ on:
         value: ${{ jobs.pgo-merge.outputs.identity }}
 permissions:
   contents: write
+  actions: read
 env:
   RBM_NO_DEBUG: "1"
 concurrency:
@@ -255,3 +264,11 @@ jobs:
           name: pgo-merge-logs
           path: ${{ runner.temp }}/profile/
           if-no-files-found: warn
+  pgo-finish:
+    needs: pgo-merge
+    if: ${{ inputs.finish_pipeline && !inputs.toolchain_only }}
+    uses: ./.github/workflows/windows-pgo.yml
+    with:
+      profile_release: ${{ needs.pgo-merge.outputs.release }}
+      profile_identity: ${{ needs.pgo-merge.outputs.identity }}
+    secrets: inherit

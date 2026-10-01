@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Mullvad offline runtime check</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<style>html,body{margin:0;background:white;color:black;color-scheme:light}#work{position:absolute;left:600px;top:20px;width:400px}#pixels{position:absolute;left:8px;top:8px}#caption{position:absolute;left:8px;top:650px;font:20px sans-serif}#work div{display:block;box-sizing:border-box}</style>
+<div id="work"></div><div id="pixels"></div><div id="caption">Offline JavaScript and layout check</div>
+<script>
+"use strict";
+// Python replaces this token in a private copy. No browser preference is changed.
+const config = __RUNTIME_CONFIG__;
+const suite = "mb-offline-js-dom-v1";
+const area = document.getElementById("work");
+const rows = [];
+for (let i=0;i<120;i++) {
+  const node=document.createElement("div");
+  node.textContent="Mullvad offline layout "+i;
+  node.style.height="20px";
+  node.style.width="360px";
+  area.appendChild(node); rows.push(node);
+}
+const records=[];
+for(let i=0;i<160;i++) records.push({id:i,text:("private local record "+i+" ").repeat(4),values:Array.from({length:16},(_,j)=>i*j+7)});
+const source=JSON.stringify(records);
+const units={
+  "integer-array":()=>{
+    const a=new Uint32Array(4096);
+    for(let i=0;i<a.length;i++) a[i]=(Math.imul(i+1,2654435761)^0x12345678)>>>0;
+    for(let pass=0;pass<8;pass++) for(let i=0;i<a.length;i++) {
+      const x=a[i]; a[i]=(Math.imul((x^(x>>>13))>>>0,2246822519)+a[(i+37)%a.length])>>>0;
+    }
+    let total=0; for(let i=0;i<a.length;i++) total=(total^a[i])>>>0; return total;
+  },
+  "json-roundtrip":()=>{
+    const data=JSON.parse(source);
+    for(const r of data) { r.text=r.text.slice(2)+"!"; r.values=r.values.map(x=>(x*3+11)%65521); }
+    const copy=JSON.parse(JSON.stringify(data));
+    let total=0; for(const r of copy) total=(total+r.id+r.text.length+r.values[7])>>>0; return total;
+  },
+  "dom-layout":()=>{
+    let total=0;
+    for(let pass=0;pass<4;pass++) {
+      for(let i=0;i<rows.length;i++) {
+        rows[i].style.width=(300+((i+pass)%57))+"px";
+        rows[i].style.height=(18+((i+pass)%9))+"px";
+      }
+      // Force style and layout. No external resources or canvas readout.
+      for(const row of rows) total=(total+row.offsetWidth+row.offsetHeight)>>>0;
+    }
+    return total;
+  }
+};
+function measure(unit,n,expected) {
+  let digest=0;
+  const start=performance.now();
+  for(let i=0;i<n;i++) {
+    const value=unit();
+    if(value!==expected) throw new Error("workload correctness mismatch");
+    digest=(digest+Math.imul(value,i+1))>>>0;
+  }
+  const elapsed=performance.now()-start;
+  return {iterations:n,elapsed_ms:elapsed,unit_checksum:expected,digest:digest};
+}
+function encode(report) {
+  // ASCII JSON is carried by solid DOM pixels, not a downloadable file or a
+  // network request. The native PNG reader checks the magic, checksum and nonce.
+  const text=JSON.stringify(report), bytes=Array.from(text,c=>c.charCodeAt(0));
+  if(bytes.some(x=>x>127)||bytes.length>2048) throw new Error("report too large");
+  let hash=2166136261;
+  for(const b of bytes) hash=Math.imul(hash^b,16777619)>>>0;
+  const packet=[77,66,80,71,79,49];
+  for(const n of [bytes.length,hash]) for(let j=0;j<4;j++) packet.push((n>>>(8*j))&255);
+  packet.push(...bytes);
+  const box=document.getElementById("pixels"), frag=document.createDocumentFragment();
+  for(let bit=0;bit<packet.length*8;bit++) if((packet[bit>>>3]>>>(bit%8))&1) {
+    const pixel=document.createElement("span");
+    pixel.style.cssText="position:absolute;width:4px;height:4px;background:#000;left:"+((bit%128)*4)+"px;top:"+(Math.floor(bit/128)*4)+"px";
+    frag.appendChild(pixel);
+  }
+  box.appendChild(frag);
+}
+try {
+  const result={schema:1,suite:suite,nonce:config.nonce,mode:config.mode,workloads:{}};
+  for(const [name,unit] of Object.entries(units)) {
+    const expected=unit(); for(let i=0;i<4;i++) if(unit()!==expected) throw new Error("unstable unit");
+    if(config.mode==="calibrate") {
+      let n=1, sample;
+      do { sample=measure(unit,n,expected); if(sample.elapsed_ms>=config.target_ms) break; n*=2; }
+      while(n<=65536);
+      if(sample.elapsed_ms<config.target_ms) throw new Error("timer calibration failed");
+      result.workloads[name]=sample;
+    } else result.workloads[name]=measure(unit,config.iterations[name],expected);
+  }
+  area.remove(); encode(result);
+  document.getElementById("caption").textContent="PASS: offline JavaScript, JSON and native layout";
+} catch(error) {
+  area.remove(); encode({schema:1,suite:suite,nonce:config.nonce,error:String(error)});
+  document.getElementById("caption").textContent="FAIL: "+String(error);
+}
+</script></html>
