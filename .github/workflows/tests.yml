@@ -3,8 +3,14 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      baseline_smoke:
+        description: Verify the offline harness against the authenticated same-lock native baseline
+        type: boolean
+        default: true
 permissions:
   contents: read
+  actions: read
 jobs:
   test:
     runs-on: ubuntu-24.04
@@ -43,4 +49,32 @@ jobs:
           }
       - name: Test native Windows process isolation and package contracts
         shell: pwsh
-        run: python tests/test_windows_runtime.py -v
+        run: |
+          python tests/test_windows_runtime.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_baseline_harness.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  baseline-smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.baseline_smoke }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Restore authenticated same-lock baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: python scripts/windows-runtime-check.py prepare-baseline --output-directory "$env:RUNNER_TEMP/baseline-smoke" --repository "$env:GITHUB_REPOSITORY"
+      - name: Validate offline harness on the real stock Windows browser
+        shell: pwsh
+        run: python scripts/check-baseline-harness.py --baseline-directory "$env:RUNNER_TEMP/baseline-smoke" --output-directory "$env:RUNNER_TEMP/baseline-harness"
+      - name: Preserve actual baseline screenshots, raw results and native logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-offline-harness-report
+          path: ${{ runner.temp }}/baseline-harness/
+          if-no-files-found: warn

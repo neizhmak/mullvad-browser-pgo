@@ -215,3 +215,8 @@ native recipe-rendering tests and PowerShell to execute its optional training
 wrapper tests. CI provisions these requirements. A separate Windows job tests
 native process isolation and parses all PowerShell entry points. Tests use
 local fixtures and fake tool commands, not heavy browser builds.
+
+To test the offline harness against the actual authenticated stock baseline
+before waiting for Firefox PGO compilation, manually dispatch
+`tests.yml -f baseline_smoke=true`. Its baseline-only report never claims a
+validated PGO pipeline. The smoke job does not run on ordinary pushes or PRs.

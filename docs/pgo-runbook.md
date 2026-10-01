@@ -56,6 +56,14 @@ build, not its proof alone. Technical release checkpoints remain durable.
 
 ## Native runtime and baseline
 
+For an early real-browser check of the measurement harness, dispatch
+`gh workflow run tests.yml --ref YOUR_BRANCH -f baseline_smoke=true`.
+The optional Windows job authenticates the existing control artifact, silently
+installs the stock browser, runs native offline calibration and a measured
+PNG/JavaScript smoke, then uninstalls it. Its report explicitly says
+`baseline_only=true` and `validated_pipeline=false`. This does not replace the
+final PGO installer/portable comparison. Ordinary push/PR checks use fixtures.
+
 The known control is successful baseline run `31777871357`, artifact
 `mullvad-browser-alpha-windows-x86_64-baseline`. `prepare-baseline` requests run
 metadata, its original Actions archive, and `upstream.lock.json` at that run's
