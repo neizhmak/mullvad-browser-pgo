@@ -4,7 +4,8 @@ import argparse
 import hashlib
 import json
 import pathlib
-import subprocess
+
+from rbm_network import showconf
 
 
 WINDOWS_TARGET = "x86_64-pc-windows-gnullvm"
@@ -20,10 +21,8 @@ def sha(path):
 
 
 def show(upstream, project, key, pgo=True):
-    command = [str(upstream / "rbm/rbm"), "showconf", project, key]
-    for target in TARGETS + (["pgo-generate"] if pgo else []):
-        command += ["--target", target]
-    return subprocess.check_output(command, cwd=upstream, text=True).strip()
+    targets = TARGETS + (["pgo-generate"] if pgo else [])
+    return showconf(upstream, project, key, targets)
 
 
 def selected_mingw(upstream):

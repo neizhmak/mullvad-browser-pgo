@@ -36,6 +36,16 @@ returns 0 for verified complete, 1 for absent/incomplete, and 2 for integrity
 or access/transport failure. Only 1 permits rebuilding. Do not delete a
 checkpoint merely to hide a failed integrity check.
 
+RBM `showconf` may fetch nested Git sources while computing an output filename.
+For the pinned GNU `wasi-config` source, `rbm_network.py` allows at most three
+attempts only when both Git and RBM report a transient clone failure for
+`https://git.savannah.gnu.org/git/config.git`: HTTP 500/502/503/504 or a transport
+timeout/reset/low-speed error. Retries wait 10 then 30 seconds and record their
+diagnostics on stderr. The URL, commit, arguments, targets, and environment stay
+unchanged. Authentication, certificate, missing-ref, hash, and signature failures
+stop immediately. A fetch failure never counts as cache absence and never
+permits a compiler rebuild.
+
 ## Re-run boundaries
 
 1. Dispatch `pgo-stage4a.yml -f toolchain_only=true` to test Rust alone. The

@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+from rbm_network import showconf
+
 
 def output(*arguments, cwd=None):
     return subprocess.check_output(arguments, cwd=cwd, text=True).strip()
@@ -16,9 +18,9 @@ def main():
     root = Path(__file__).resolve().parents[1]
     upstream = Path(os.environ["UPSTREAM"]).resolve()
     temporary = Path(os.environ["RUNNER_TEMP"])
-    common = ["--target", "alpha", "--target", "mullvadbrowser-windows-x86_64", "--target", "pgo-generate"]
+    targets = ["alpha", "mullvadbrowser-windows-x86_64", "pgo-generate"]
     def show(key):
-        return output(str(upstream / "rbm/rbm"), "showconf", "firefox", key, *common, cwd=upstream)
+        return showconf(upstream, "firefox", key, targets)
     repository, ref, revision = show("git_url"), show("git_hash"), show("var/git_commit")
     executable = show("var/exe_name")
     if executable != "mullvadbrowser":

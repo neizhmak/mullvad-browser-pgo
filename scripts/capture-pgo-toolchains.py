@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import subprocess
 
+from rbm_network import showconf
+
 
 def sha(path):
     result = hashlib.sha256()
@@ -30,14 +32,14 @@ def main():
         raise SystemExit("Rust/source upstream provenance mismatch")
     if identity["overlay"]["sha256"] != provenance["pgo_overlay_sha256"]:
         raise SystemExit("Rust/source overlay provenance mismatch")
-    common = ["--target", "alpha", "--target", "mullvadbrowser-windows-x86_64", "--target", "pgo-generate"]
+    targets = ["alpha", "mullvadbrowser-windows-x86_64", "pgo-generate"]
     toolchains = {}
     entries = [
         ("clang", "mingw-w64-clang", args.tools / "mingw/mingw-w64-clang/bin/clang"),
         ("rust", "rust", args.tools / "rust/rust/bin/rustc"),
     ]
     for name, project, executable in entries:
-        filename = subprocess.check_output([str(upstream / "rbm/rbm"), "showconf", project, "filename", *common], cwd=upstream, text=True).strip()
+        filename = showconf(upstream, project, "filename", targets)
         if not filename or Path(filename).name != filename:
             raise SystemExit("unsafe exact compiler output filename")
         archive = upstream / "out" / project / filename
