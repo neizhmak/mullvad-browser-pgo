@@ -1243,7 +1243,8 @@ class ResourcePolicyMechanicsTests(PolicyMechanicsFixture, unittest.TestCase):
         self.case_mutation = fail
         report = self.failure("native_nonzero")
         self.assertNotIn("private-native-secret", json.dumps(report))
-        self.assertEqual([path.name for path in self.diagnostic.iterdir()], ["validation.json"])
+        self.assertEqual(sorted(path.name for path in self.diagnostic.iterdir()),
+                         ["progress.json", "validation.json"])
 
     def test_final_policy_write_failure_never_leaves_policy_or_native_temporary_assets(self):
         original_atomic = self.policy.atomic_json
@@ -1598,6 +1599,53 @@ class ResourceCaseBindingTests(PolicyInputFixture, unittest.TestCase):
                 self.names = bad
                 self.rejected("invalid_named_inputs")
         self.names = original
+
+
+    def test_case_progress_labels_keep_each_fresh_resolver_scope_named_query_and_operational_render(self):
+        for count in (4, 2, 1):
+            with self.subTest(count=count):
+                self.count = count
+                self.cpus = [8, 11, 16, 19][:count]
+                self.metadata["num_procs"] = count
+                self.metadata["affinity"] = self.cpus
+                self.mozconfig, self.build = operational_mozconfig(count), operational_build(count)
+                case = self.base / ("case-progress-" + str(count))
+                case.mkdir()
+                deadline = self.policy.Deadline(5)
+                progress_path = self.base / "progress.json"
+                trace = self.policy.ProgressTrace(progress_path, deadline)
+                def transport(command, *, cwd, environment, deadline, seconds):
+                    deadline.remaining()
+                    return 0, b"private-mock-query-marker", b""
+                def noted_offline(command, cpus, upstream, environment, deadline, namespace):
+                    self.policy.run_native(["mocked-native-only"], cwd=upstream, environment=environment,
+                                           deadline=deadline)
+                    return self.offline(command, cpus, upstream, environment, deadline, namespace)
+                def noted_showconf(upstream, project, key, targets, cpus, environment, deadline, namespace):
+                    self.policy.run_native(["mocked-native-only"], cwd=upstream, environment=environment,
+                                           deadline=deadline)
+                    return self.showconf(upstream, project, key, targets, cpus, environment, deadline, namespace)
+                label = {4: "baseline", 2: "selected-two", 1: "one-metadata-only"}[count]
+                with patch.object(self.policy.NATIVE, "run_native", side_effect=transport), \
+                     patch.object(self.policy, "offline", side_effect=noted_offline), \
+                     patch.object(self.policy, "showconf", side_effect=noted_showconf):
+                    with trace.phase("case_native", label):
+                        result = self.policy.execute_case(self.args, self.cpus, count, self.inputs,
+                                                           self.environment, deadline, "net:[1]", case)
+                trace.finish("finished")
+                self.assertEqual(result["metadata"], self.metadata)
+                rows = json.loads(progress_path.read_text())["native_operations"]
+                self.assertEqual([row["label"] for row in rows],
+                                 ["rust_identity", "node_identity", "filename_firefox", "filename_rust_profiler",
+                                  "filename_rust_official", "filename_mingw", "filename_node", "firefox_repository",
+                                  "firefox_ref", "firefox_commit", "firefox_executable", "named_inputs", "renderer"])
+                self.assertEqual([row["operation_ordinal"] for row in rows], list(range(1, 14)))
+                self.assertTrue(all(row["case"] == label and row["outcome"] == "completed" for row in rows))
+                self.assertEqual(result["filenames"]["selected_inputs"], self.selected_inputs)
+                self.assertEqual(result["normalized"]["mozconfig"],
+                                 self.policy.normalize_rendered(operational_mozconfig(count), count, "mozconfig"))
+                self.assertNotIn(b"private-mock-query-marker", progress_path.read_bytes())
+                self.assertFalse(self.output.exists(), "a case trace must never create execution policy")
 
 
 class ResourceNativeGitAuthorityTests(unittest.TestCase):
@@ -1977,6 +2025,29 @@ class ResourceSourceGuardFixtureTests(PolicyInputFixture, unittest.TestCase):
         self.configure(native_failure=True)
         self.rejected("native_nonzero")
         self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+
+
+    def test_full_fake_source_guard_keeps_thirtyfive_real_git_calls_and_fixed_progress_ordinals(self):
+        deadline = self.policy.Deadline(10)
+        progress_path = self.base / "progress.json"
+        trace = self.policy.ProgressTrace(progress_path, deadline)
+        with trace.phase("source_before"):
+            records = self.policy.source_records(self.upstream, self.inputs, self.environment, deadline)
+        trace.finish("finished")
+        self.assertEqual(records["profileserver.py"], digest(self.workload))
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertEqual(len(calls), 35)
+        progress = json.loads(progress_path.read_text())
+        rows = progress["native_operations"]
+        self.assertEqual(len(rows), 35)
+        self.assertEqual([row["operation_ordinal"] for row in rows], list(range(1, 36)))
+        self.assertTrue(all(row["label"] == "source_git" and row["case"] == "gate"
+                            and row["outcome"] == "completed" for row in rows))
+        self.assertEqual(progress["phases"][0]["counters"]["native_calls"], 35)
+        self.assertEqual(len(progress["phases"]), 1)
+        self.assertLessEqual(progress_path.stat().st_size, 65536)
+        self.assertNotIn(str(self.base).encode(), progress_path.read_bytes())
+        self.assertNotIn(self.workload, progress_path.read_bytes())
 
 
 class ResourcePolicyCliTests(PolicyMechanicsFixture, unittest.TestCase):
@@ -3325,6 +3396,896 @@ class ResourceResolverOwnedSessionTests(unittest.TestCase):
         self.assertNotIn(b'B' * 1024, stdout + stderr)
         self.assertIn(b'native_output_limit', stderr)
         self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+
+
+class ResourceArchiveBoundaryTests(PolicyInputFixture, unittest.TestCase):
+    """Tiny raw payloads test boundary freshness, not a warm-cache timing result."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pgo-resource-archive-boundary-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.make_inputs()
+        self.policy = load_validator()
+        for name, value in (("EXPECTED_RUST_SHA", self.rust_sha), ("EXPECTED_NODE_SHA", self.node_sha)):
+            patcher = patch.object(self.policy, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.inputs = self.policy.load_inputs(self.args)
+        self.registries = self.policy.registry_records(self.environment, self.inputs)
+        self.deadline = self.policy.Deadline(5)
+
+    def boundary(self):
+        return self.policy.archive_boundary_records(self.upstream, self.inputs, self.registries, self.deadline)
+
+    def test_required_subset_and_complete_union_use_one_raw_pass_then_independent_fresh_pass(self):
+        required = set(self.inputs["archives"])
+        union = required | set(self.registries["archives"])
+        self.assertGreater(len(union), len(required), "fixture must include non-selected restored archives")
+        calls, passes = [], []
+        original = self.policy.sha_file
+        def hashed(path, deadline):
+            self.assertIs(deadline, self.deadline)
+            record = original(path, deadline)
+            calls.append((path.relative_to(self.upstream).as_posix(), record))
+            return record
+        with patch.object(self.policy, "sha_file", side_effect=hashed):
+            for _ in range(2):
+                start = len(calls)
+                result = self.boundary()
+                current = calls[start:]
+                self.assertEqual(set(result), {"required", "restored"})
+                self.assertEqual([name for name, record in current], sorted(union))
+                self.assertEqual(result["restored"], dict(current))
+                self.assertEqual(result["required"], {name: dict(current)[name] for name in required})
+                for name in required:
+                    self.assertIs(result["required"][name], result["restored"][name],
+                                  "required values must come from the same completed union pass")
+                passes.append(current)
+        self.assertEqual(len(calls), 2 * len(union))
+        for before, after in zip(passes[0], passes[1]):
+            self.assertIsNot(before[1], after[1], "after must use freshly computed raw-byte records")
+
+    def test_required_registry_descriptor_conflict_rejects_before_any_raw_hash(self):
+        name = next(iter(self.inputs["archives"]))
+        self.registries["archives"][name] = {**self.inputs["archives"][name], "sha256": "0" * 64}
+        with patch.object(self.policy, "sha_file") as raw_hash:
+            with self.assertRaisesRegex(self.policy.GateError, "conflicting_restored_archive_binding"):
+                self.boundary()
+        raw_hash.assert_not_called()
+
+    def test_identical_duplicate_registry_descriptors_still_hash_each_unique_member_once(self):
+        directory = Path(self.environment["RUNNER_TEMP"]) / "rbm-registry"
+        duplicate = copy.deepcopy(self.general_registries["mingw-w64-clang"])
+        duplicate["stage"] = "duplicate"
+        write_json(directory / "registry-duplicate.json", duplicate)
+        self.registries = self.policy.registry_records(self.environment, self.inputs)
+        original = self.policy.sha_file
+        with patch.object(self.policy, "sha_file", wraps=original) as raw_hash:
+            result = self.boundary()
+        names = [call.args[0].relative_to(self.upstream).as_posix() for call in raw_hash.call_args_list]
+        self.assertEqual(names, sorted(result["restored"]))
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_fresh_after_pass_rejects_same_size_same_mtime_nonselected_archive_mutation(self):
+        before = self.boundary()
+        name = next(iter(self.general_archive_bytes))
+        self.assertNotIn(name, before["required"])
+        path = self.upstream / name
+        info = path.stat()
+        path.write_bytes(b"X" * info.st_size)
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+        self.assertEqual(path.stat().st_size, info.st_size)
+        self.assertEqual(path.stat().st_mtime_ns, info.st_mtime_ns)
+        with self.assertRaisesRegex(self.policy.GateError, "restored_archive_bytes_mismatch"):
+            self.boundary()
+
+    def test_boundary_archive_regular_link_path_and_owner_checks_are_not_deduplicated_away(self):
+        name = next(iter(self.general_archive_bytes))
+        path = self.upstream / name
+        original = path.read_bytes()
+        for kind in ("missing", "empty", "symlink", "hardlink", "parent-symlink", "owner"):
+            with self.subTest(kind=kind):
+                helper = self.base / "archive-link-helper"
+                moved = path.parent.with_name(path.parent.name + "-moved")
+                if kind == "owner":
+                    with patch.object(self.policy.os, "getuid", return_value=os.getuid() + 1):
+                        with self.assertRaises(self.policy.GateError):
+                            self.boundary()
+                    continue
+                path.unlink()
+                if kind == "empty":
+                    path.write_bytes(b"")
+                elif kind in ("symlink", "hardlink"):
+                    helper.write_bytes(original)
+                    if kind == "symlink":
+                        path.symlink_to(helper)
+                    else:
+                        os.link(helper, path)
+                elif kind == "parent-symlink":
+                    path.parent.rename(moved)
+                    path.parent.symlink_to(moved, target_is_directory=True)
+                    (moved / path.name).write_bytes(original)
+                try:
+                    with self.assertRaises(self.policy.GateError):
+                        self.boundary()
+                finally:
+                    if kind == "parent-symlink":
+                        path.parent.unlink()
+                        moved.rename(path.parent)
+                    if os.path.lexists(path):
+                        path.unlink()
+                    path.write_bytes(original)
+                    if helper.exists():
+                        helper.unlink()
+
+
+class ResourceArchiveBoundaryPolicyTests(PolicyMechanicsFixture, unittest.TestCase):
+    """Full-policy mocks retain all source/inventory/selected checkpoints."""
+    def test_full_policy_two_union_passes_and_four_selected_raw_checks_keep_five_full_guards(self):
+        original_hash = self.policy.sha_file
+        original_boundary = self.policy.archive_boundary_records
+        original_selected = self.policy.validate_selected_inputs
+        original_inventory = self.policy.immutable_inventory
+        raw_calls, boundaries, selections, checkpoints = [], [], [], []
+        stage = [None]
+        def hashed(path, deadline):
+            raw_calls.append((stage[0], path.relative_to(self.upstream).as_posix(), deadline))
+            return original_hash(path, deadline)
+        def boundary(upstream, inputs, registries, deadline):
+            index = len(boundaries)
+            boundaries.append((set(inputs["archives"]) | set(registries["archives"]), deadline))
+            stage[0] = ("boundary", index)
+            try:
+                return original_boundary(upstream, inputs, registries, deadline)
+            finally:
+                stage[0] = None
+        def selected(upstream, records, inputs, registries, deadline):
+            index = len(selections)
+            selections.append(deadline)
+            stage[0] = ("selected", index)
+            try:
+                return original_selected(upstream, records, inputs, registries, deadline)
+            finally:
+                stage[0] = None
+        def inventory(upstream, deadline):
+            checkpoints.append(("inventory", len(self.seen_cases), deadline))
+            return original_inventory(upstream, deadline)
+        def sources(upstream, inputs, environment, deadline):
+            checkpoints.append(("source", len(self.seen_cases), deadline))
+            return self.sources
+        with patch.object(self.policy, "sha_file", side_effect=hashed), \
+             patch.object(self.policy, "archive_boundary_records", side_effect=boundary), \
+             patch.object(self.policy, "validate_selected_inputs", side_effect=selected), \
+             patch.object(self.policy, "immutable_inventory", side_effect=inventory), \
+             patch.object(self.policy, "source_records", side_effect=sources):
+            self.assertTrue(self.validate()["verified"])
+        self.assertEqual(len(boundaries), 2)
+        self.assertEqual(len(selections), 4)
+        deadline = boundaries[0][1]
+        self.assertTrue(all(item[1] is deadline for item in boundaries))
+        self.assertTrue(all(item is deadline for item in selections))
+        self.assertTrue(all(item[2] is deadline for item in checkpoints))
+        for index, (union, _) in enumerate(boundaries):
+            names = [name for marker, name, _ in raw_calls if marker == ("boundary", index)]
+            self.assertEqual(names, sorted(union))
+        for index in range(4):
+            names = [name for marker, name, _ in raw_calls if marker == ("selected", index)]
+            self.assertEqual(names, sorted(self.archive_bytes))
+        self.assertTrue(all(marker is not None for marker, _, _ in raw_calls))
+        for kind in ("source", "inventory"):
+            self.assertEqual([case for label, case, _ in checkpoints if label == kind], [0, 1, 2, 3, 3])
+
+    def test_late_after_boundary_mutation_of_nonselected_archive_is_fatal_without_stat_change(self):
+        name = next(iter(self.general_archive_bytes))
+        path = self.upstream / name
+        original = self.policy.archive_boundary_records
+        calls = []
+        def boundary(upstream, inputs, registries, deadline):
+            calls.append(deadline)
+            if len(calls) == 2:
+                info = path.stat()
+                path.write_bytes(b"X" * info.st_size)
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+            return original(upstream, inputs, registries, deadline)
+        with patch.object(self.policy, "archive_boundary_records", side_effect=boundary):
+            report = self.failure("restored_archive_bytes_mismatch")
+        self.assertEqual([row["case"] for row in report["cases"]],
+                         ["baseline", "selected-two", "one-metadata-only"])
+        self.assertEqual(len(calls), 2)
+
+    def test_conflicting_required_general_binding_fails_before_hash_or_native_metadata(self):
+        directory = Path(self.environment["RUNNER_TEMP"]) / "rbm-registry"
+        changed = copy.deepcopy(self.general_registries["mingw-w64-clang"])
+        changed["artifacts"][0]["sha256"] = "0" * 64
+        write_json(directory / "registry-mingw-w64-clang.json", changed)
+        with patch.object(self.policy, "sha_file") as raw_hash:
+            self.failure("conflicting_restored_archive_binding")
+        raw_hash.assert_not_called()
+        self.assertFalse(self.seen_cases)
+
+    def test_all_clone_reflogs_are_content_bound_despite_restored_size_and_mtime(self):
+        relative_names = ("git_clones/firefox/.git/logs/HEAD",
+                          "git_clones/firefox/.git/logs/refs/heads/main",
+                          "git_clones/rbm/.git/logs/refs/remotes/origin/main")
+        for name in relative_names:
+            path = self.upstream / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"old exact reflog bytes\n")
+        original_inventory = self.policy.immutable_inventory(self.upstream)
+        for index, name in enumerate(relative_names):
+            with self.subTest(name=name):
+                path = self.upstream / name
+                data, info = path.read_bytes(), path.stat()
+                path.write_bytes(b"X" * len(data))
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+                self.assertNotEqual(self.policy.immutable_inventory(self.upstream), original_inventory)
+                path.write_bytes(data)
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+                self.assertEqual(self.policy.immutable_inventory(self.upstream), original_inventory)
+        def mutate(count, record):
+            if count == 1:
+                path = self.upstream / relative_names[-1]
+                info = path.stat()
+                path.write_bytes(b"X" * info.st_size)
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+        self.case_mutation = mutate
+        self.failure("unexpected_runtime_mutation")
+
+    def test_raw_manifest_support_provenance_and_general_registry_rereads_remain_fatal(self):
+        paths = [self.rust_file, self.support / "node-identity.json",
+                 self.support / "node-support.json", self.support / "registry/registry-node.json",
+                 self.provenance_file,
+                 Path(self.environment["RUNNER_TEMP"]) / "rbm-registry/registry-clang.json"]
+        for path in paths:
+            with self.subTest(asset=path.name):
+                raw = path.read_bytes()
+                if self.diagnostic.exists():
+                    shutil.rmtree(self.diagnostic)
+                self.seen_cases.clear()
+                def mutate(count, record):
+                    if count == 1:
+                        path.write_bytes(raw + b" \n")
+                self.case_mutation = mutate
+                try:
+                    self.failure()
+                    self.assertEqual([row["count"] for row in self.seen_cases], [4, 2, 1])
+                finally:
+                    path.write_bytes(raw)
+
+
+PROGRESS_PHASE_FIELDS = {"ordinal", "label", "case", "outcome", "started_ms", "elapsed_ms", "counters"}
+PROGRESS_NATIVE_FIELDS = {"ordinal", "phase_ordinal", "operation_ordinal", "label", "case", "outcome",
+                          "started_ms", "elapsed_ms", "requested_cap_ms", "scheduled_remaining_ms",
+                          "effective_cap_ms", "limiter"}
+PROGRESS_PHASE_LABELS = {"preflight", "inputs_before", "source_before", "registries_before", "archives_before",
+                         "inventory_before", "case_native", "case_selected_inputs", "case_inventory", "case_source",
+                         "case_comparison", "archives_after", "inputs_after", "registries_after", "source_after",
+                         "selected_inputs_after", "inventory_after", "parent_after", "final_report"}
+PROGRESS_OPERATION_LABELS = {"native", "source_git", "rust_identity", "node_identity", "filename_firefox",
+                             "filename_rust_profiler", "filename_rust_official", "filename_mingw", "filename_node",
+                             "firefox_repository", "firefox_ref", "firefox_commit", "firefox_executable",
+                             "named_inputs", "renderer"}
+PROGRESS_CASES = {"gate", "baseline", "selected-two", "one-metadata-only"}
+PROGRESS_COUNTERS = {"native_calls", "inventory_entries", "git_metadata_bytes", "archive_count", "archive_bytes",
+                     "selected_archive_count", "selected_archive_bytes"}
+
+
+class ProgressAssertions:
+    def read_progress(self, path=None):
+        path = path or self.diagnostic / "progress.json"
+        raw = path.read_bytes()
+        self.assertLessEqual(len(raw), 65536)
+        result = json.loads(raw)
+        self.assertEqual(set(result), {"schema", "scope", "status", "elapsed_ms", "active_phase",
+                                      "last_completed_phase", "phases", "native_operations"})
+        self.assertEqual(result["schema"], 1)
+        self.assertEqual(result["scope"],
+                         "bounded metadata gate progress only; not completed-case, final-gate or execution-policy proof")
+        self.assertIn(result["status"], ("running", "finished", "failed"))
+        self.assert_public_integer(result["elapsed_ms"], 86400000)
+        self.assertLessEqual(len(result["phases"]), 32)
+        self.assertLessEqual(len(result["native_operations"]), 64)
+        for record in result["phases"] + [result[key] for key in ("active_phase", "last_completed_phase")
+                                           if result[key] is not None]:
+            self.assertEqual(set(record), PROGRESS_PHASE_FIELDS)
+            self.assertIn(record["label"], PROGRESS_PHASE_LABELS)
+            self.assertIn(record["case"], PROGRESS_CASES)
+            self.assertIn(record["outcome"], ("started", "completed", "failed"))
+            self.assert_public_integer(record["ordinal"], 1000000)
+            self.assert_public_integer(record["started_ms"], 86400000)
+            self.assert_public_integer(record["elapsed_ms"], 86400000)
+            self.assertLessEqual(set(record["counters"]), PROGRESS_COUNTERS)
+            for count in record["counters"].values():
+                self.assert_public_integer(count, (1 << 63) - 1)
+        for record in result["native_operations"]:
+            self.assertEqual(set(record), PROGRESS_NATIVE_FIELDS)
+            self.assertIn(record["label"], PROGRESS_OPERATION_LABELS)
+            self.assertIn(record["case"], PROGRESS_CASES)
+            self.assertIn(record["outcome"], ("started", "completed", "nonzero", "failed"))
+            for field in ("ordinal", "phase_ordinal", "operation_ordinal"):
+                self.assert_public_integer(record[field], 1000000)
+            for field in ("started_ms", "elapsed_ms", "requested_cap_ms"):
+                self.assert_public_integer(record[field], 86400000)
+            for field in ("scheduled_remaining_ms", "effective_cap_ms"):
+                if record[field] is not None:
+                    self.assert_public_integer(record[field], 86400000)
+            self.assertIn(record["limiter"], (None, "per_call", "global_remaining"))
+        return result
+
+    def assert_public_integer(self, value, maximum):
+        self.assertIs(type(value), int)
+        self.assertGreaterEqual(value, 0)
+        self.assertLessEqual(value, maximum)
+
+
+class ResourceProgressTraceTests(ProgressAssertions, unittest.TestCase):
+    """Synthetic clocks/short interpreters prove mechanics only, never runtime capacity."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pgo-resource-progress-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.diagnostic = self.base
+        self.path = self.base / "progress.json"
+        self.policy = load_validator()
+        self.environment = native_environment()
+
+    def trace(self, total=5):
+        self.deadline = self.policy.Deadline(total)
+        return self.policy.ProgressTrace(self.path, self.deadline)
+
+    def native(self, source, seconds=1):
+        return self.policy.run_native([sys.executable, "-c", source], cwd=self.base,
+                                     environment=self.environment, deadline=self.deadline, seconds=seconds)
+
+    def test_frozen_limits_and_protected_runner_resolvers_keep_exact_source_bytes(self):
+        self.assertEqual((self.policy.TOTAL_SECONDS, self.policy.CALL_SECONDS), (300, 45))
+        expected = {"probe-rbm-resource-control.py": "4f400b95ff51f110ce43b03cabdaa244555e43c998bbe0aa86341faa3ec2a1b1",
+                    "resolve-pgo-rust-identity.py": "88d302c2e0bddb9108a25394d01b727020234f06dc39b779da926f47921f6b7c",
+                    "resolve-pgo-support-identity.py": "8bace4103f28bcf9aaf1604ac4c045f9a4fc630cd4e65c44f1d5b7c996905937"}
+        for name, sha in expected.items():
+            with self.subTest(protected=name):
+                self.assertEqual(digest((ROOT / "scripts" / name).read_bytes()), sha)
+        self.assertIn("expires = time.monotonic() + 40", self.policy.RESOLVER_CODE)
+
+    def test_observed_deadline_forwards_one_exact_original_float_without_io_or_clock_reads(self):
+        value = 12.3456789012345
+        delegate = unittest.mock.Mock()
+        delegate.remaining.return_value = value
+        record = {"scheduled_remaining_ms": None, "effective_cap_ms": None, "limiter": None}
+        observed = self.policy.ObservedDeadline(delegate, 45, object(), record)
+        with patch.object(self.policy, "atomic_json", side_effect=AssertionError("proxy attempted IO")), \
+             patch.object(self.policy.time, "monotonic", side_effect=AssertionError("proxy read clock")), \
+             patch.object(self.policy.NATIVE.subprocess, "Popen", side_effect=AssertionError("proxy launched native")):
+            self.assertIs(observed.remaining(), value)
+        delegate.remaining.assert_called_once_with()
+        self.assertIs(observed.observed_remaining, value)
+        self.assertIs(observed.effective_cap, value)
+        self.assertEqual(record, {"scheduled_remaining_ms": 12345, "effective_cap_ms": 12345,
+                                  "limiter": "global_remaining"})
+
+    def test_actual_protected_scheduling_per_call_global_tie_and_rounding_persist_only_after_return(self):
+        protected = self.policy.NATIVE.run_native
+        for remaining, requested, effective, limiter in (
+                (60.0, 45, 45000, "per_call"), (12.345678, 45, 12345, "global_remaining"),
+                (45.0, 45, 45000, "per_call"), (44.999999, 45, 44999, "global_remaining"),
+                (45.000001, 45, 45000, "per_call")):
+            with self.subTest(remaining=remaining):
+                delegate = unittest.mock.Mock()
+                delegate.remaining.return_value = remaining
+                trace = self.policy.ProgressTrace(self.path, delegate)
+                observed_calls = []
+                def spawn(*args, **kwargs):
+                    row = self.read_progress()["native_operations"][-1]
+                    self.assertEqual(row["outcome"], "started")
+                    self.assertIsNone(row["scheduled_remaining_ms"])
+                    self.assertIsNone(row["effective_cap_ms"])
+                    self.assertIsNone(row["limiter"], "protected scheduling must not write its observation")
+                    raise OSError("private-spawn-error")
+                def invoke(*args, **kwargs):
+                    self.assertEqual(kwargs["seconds"], requested)
+                    proxy = kwargs["deadline"]
+                    original_remaining = proxy.remaining
+                    def sampled():
+                        before = delegate.remaining.call_count
+                        value = original_remaining()
+                        self.assertEqual(delegate.remaining.call_count - before, 1)
+                        self.assertIs(value, remaining)
+                        observed_calls.append(value)
+                        return value
+                    with patch.object(proxy, "remaining", side_effect=sampled):
+                        return protected(*args, **kwargs)
+                with patch.object(self.policy.NATIVE, "run_native", side_effect=invoke), \
+                     patch.object(self.policy.NATIVE.subprocess, "Popen", side_effect=spawn):
+                    with self.assertRaisesRegex(self.policy.GateError, "native_start_failed"):
+                        with trace.phase("case_native", "selected-two"), trace.operation("renderer"):
+                            self.policy.run_native(["private-program"], cwd=self.base, environment=self.environment,
+                                                   deadline=delegate, seconds=requested)
+                self.assertEqual(observed_calls, [remaining])
+                row = self.read_progress()["native_operations"][-1]
+                self.assertEqual((row["requested_cap_ms"], row["effective_cap_ms"], row["limiter"]),
+                                 (requested * 1000, effective, limiter))
+                self.assertEqual(row["scheduled_remaining_ms"], int(remaining * 1000))
+                self.assertEqual((row["label"], row["case"], row["outcome"]), ("renderer", "selected-two", "failed"))
+                self.assertNotIn(b"private-spawn-error", self.path.read_bytes())
+
+    def test_expired_actual_runner_sample_stays_null_and_does_not_spawn(self):
+        trace = self.trace()
+        with self.assertRaisesRegex(self.policy.GateError, "global_deadline"):
+            with trace.phase("case_native", "baseline"):
+                self.deadline.end = time.monotonic() - 1
+                with patch.object(self.policy.NATIVE.subprocess, "Popen") as spawn:
+                    self.native("raise SystemExit(0)")
+        spawn.assert_not_called()
+        row = self.read_progress()["native_operations"][-1]
+        self.assertEqual(row["outcome"], "failed")
+        self.assertIsNone(row["scheduled_remaining_ms"])
+        self.assertIsNone(row["effective_cap_ms"])
+        self.assertIsNone(row["limiter"])
+
+    def test_start_write_overhead_consumes_original_budget_and_exact_late_schedule_is_retained(self):
+        clock = [0.0]
+        atomic = self.policy.atomic_json
+        def write(path, data, *args, **kwargs):
+            result = atomic(path, data, *args, **kwargs)
+            clock[0] += 95
+            return result
+        with patch.object(self.policy.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(self.policy, "atomic_json", side_effect=write), \
+             patch.object(self.policy.NATIVE.subprocess, "Popen", side_effect=OSError("private-error")):
+            trace = self.trace(300)
+            original_end = self.deadline.end
+            with self.assertRaisesRegex(self.policy.GateError, "native_start_failed"):
+                with trace.phase("case_native", "selected-two"):
+                    self.native("raise SystemExit(0)", seconds=45)
+            self.assertEqual(self.deadline.end, original_end)
+        row = self.read_progress()["native_operations"][-1]
+        self.assertEqual((row["scheduled_remaining_ms"], row["effective_cap_ms"], row["limiter"]),
+                         (15000, 15000, "global_remaining"))
+        self.assertGreater(clock[0], original_end, "post-failure persistence must work after expiry without resetting budget")
+
+    def test_phase_start_is_persisted_before_failure_and_last_complete_phase_is_distinct(self):
+        trace = self.trace()
+        with trace.phase("inputs_before"):
+            pass
+        with self.assertRaisesRegex(self.policy.GateError, "native_nonzero"):
+            with trace.phase("case_native", "selected-two"):
+                started = self.read_progress()
+                self.assertEqual(started["active_phase"]["outcome"], "started")
+                self.assertEqual(started["last_completed_phase"]["label"], "inputs_before")
+                self.assertEqual(started["active_phase"]["case"], "selected-two")
+                raise self.policy.GateError("native_nonzero")
+        result = self.read_progress()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["active_phase"]["outcome"], "failed")
+        self.assertEqual(result["last_completed_phase"]["label"], "inputs_before")
+        self.assertFalse(set(result) & {"cases", "verified", "compiled_browser_verified", "profile_training_verified"})
+
+    def test_real_global_clamped_timeout_cleanup_precedes_single_expired_failure_flush(self):
+        trace = self.trace(0.35)
+        pidfile = self.base / "private-orphan.pid"
+        source = ("import subprocess,sys,signal; p=subprocess.Popen([sys.executable,'-c',"
+                  "'import signal; signal.pause()'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+                  "stderr=subprocess.DEVNULL); "
+                  f"open({str(pidfile)!r},'w').write(str(p.pid)); signal.pause()")
+        atomic = self.policy.atomic_json
+        failure_writes = []
+        def write(path, data, *args, **kwargs):
+            if data.get("status") == "failed":
+                failure_writes.append(data["native_operations"][-1]["effective_cap_ms"])
+                self.assertGreaterEqual(time.monotonic(), self.deadline.end)
+                ResourceNativeRunnerTests.assert_dead(self, int(pidfile.read_text()))
+            return atomic(path, data, *args, **kwargs)
+        with patch.object(self.policy, "atomic_json", side_effect=write):
+            with self.assertRaisesRegex(self.policy.GateError, "native_deadline"):
+                with trace.phase("case_native", "selected-two"), trace.operation("renderer"):
+                    self.native(source, seconds=2)
+            trace.finish("failed")
+        result = self.read_progress()
+        row = result["native_operations"][-1]
+        self.assertEqual(row["limiter"], "global_remaining")
+        self.assertGreater(row["effective_cap_ms"], 0)
+        self.assertLess(row["effective_cap_ms"], 350)
+        self.assertEqual(row["outcome"], "failed")
+        self.assertEqual(len(failure_writes), 1)
+        self.assertFalse(list(self.base.glob(".resource-policy-*")))
+
+    def test_native_hostile_marker_streams_argv_cwd_and_environment_do_not_become_events(self):
+        trace = self.trace()
+        private = "private-native-credential-and-path"
+        marker = 'PGO_RESOURCE_NS {"label":"renderer","case":"selected-two","verified":true}'
+        source = (f"import os,sys; os.write(1,{(marker + private).encode()!r}); "
+                  f"os.write(2,{('PROGRESS_JSON ' + private).encode()!r}); raise SystemExit(7)")
+        environment = self.environment | {"GITHUB_TOKEN": private, "PRIVATE_NATIVE_SECRET": private}
+        with trace.phase("case_native", "baseline"), trace.operation("rust_identity"):
+            result = self.policy.run_native([sys.executable, "-c", source, private], cwd=self.base,
+                                           environment=environment, deadline=self.deadline, seconds=1)
+        self.assertEqual(result, (7, (marker + private).encode(), ("PROGRESS_JSON " + private).encode()))
+        rows = self.read_progress()["native_operations"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["label"], rows[0]["case"], rows[0]["outcome"]),
+                         ("rust_identity", "baseline", "nonzero"))
+        raw = self.path.read_bytes()
+        for forbidden in (private.encode(), marker.encode(), str(self.base).encode(), b"GITHUB_TOKEN", b"PROGRESS_JSON"):
+            self.assertNotIn(forbidden, raw)
+
+    def test_native_error_and_nonzero_precede_shared_single_failure_flush_error(self):
+        for native_error in (True, False):
+            with self.subTest(native_error=native_error):
+                trace = self.trace()
+                atomic = self.policy.atomic_json
+                failures = []
+                def write(path, data, *args, **kwargs):
+                    if data["status"] == "failed":
+                        failures.append(1)
+                        raise self.policy.GateError("report_write_failed")
+                    return atomic(path, data, *args, **kwargs)
+                with patch.object(self.policy, "atomic_json", side_effect=write):
+                    with self.assertRaisesRegex(self.policy.GateError,
+                                                "native_start_failed" if native_error else "native_nonzero"):
+                        with trace.phase("case_native", "baseline"):
+                            if native_error:
+                                with patch.object(self.policy.NATIVE.subprocess, "Popen", side_effect=OSError("private")):
+                                    self.native("raise SystemExit(0)")
+                            else:
+                                self.policy.checked([sys.executable, "-c", "raise SystemExit(7)"], cwd=self.base,
+                                                    environment=self.environment, deadline=self.deadline)
+                    trace.finish("failed")
+                self.assertEqual(failures, [1], "nested failure handlers must share one attempt")
+
+    def test_successful_native_completion_trace_write_failure_is_fail_closed(self):
+        trace = self.trace()
+        atomic = self.policy.atomic_json
+        def write(path, data, *args, **kwargs):
+            if data["native_operations"] and data["native_operations"][-1]["outcome"] == "completed":
+                raise self.policy.GateError("report_write_failed")
+            return atomic(path, data, *args, **kwargs)
+        with patch.object(self.policy, "atomic_json", side_effect=write):
+            with self.assertRaisesRegex(self.policy.GateError, "report_write_failed"):
+                with trace.phase("case_native", "baseline"):
+                    self.native("raise SystemExit(0)")
+        self.assertFalse(list(self.base.glob(".resource-policy-*")))
+
+    def test_invalid_fixed_labels_cases_outcomes_and_counter_values_never_echo(self):
+        trace = self.trace()
+        private = 'private-label-PGO_RESOURCE_NS {"verified":true}'
+        invalid = [lambda: trace.phase(private).__enter__(),
+                   lambda: trace.phase("case_native", private).__enter__(),
+                   lambda: trace.operation(private).__enter__(),
+                   lambda: trace.finish(private),
+                   lambda: trace.set_counters(**{private: 1})]
+        for value in (-1, True, 1.0, "private-counter-value", None, float("inf"), float("nan")):
+            invalid.append(lambda value=value: trace.set_counters(archive_bytes=value))
+        for call in invalid:
+            with self.subTest(case=len(invalid)):
+                with self.assertRaises(self.policy.GateError) as failure:
+                    call()
+                self.assertNotIn("private", str(failure.exception))
+                self.assertNotIn(b"private", self.path.read_bytes())
+        self.read_progress()
+
+    def test_capped_trace_tail_numeric_saturation_and_counter_updates_do_not_emit_file_events(self):
+        trace = self.trace()
+        counters = {name: 1 << 1000 for name in PROGRESS_COUNTERS}
+        def synthetic_native(command, *, cwd, environment, deadline, seconds):
+            deadline.remaining()
+            return 0, b"private-file-marker", b""
+        with patch.object(self.policy.NATIVE, "run_native", side_effect=synthetic_native):
+            for _ in range(40):
+                with trace.phase("case_source", "one-metadata-only"):
+                    before = self.path.read_bytes()
+                    trace.set_counters(**counters)
+                    self.assertEqual(self.path.read_bytes(), before, "coarse counters must not write per-file events")
+                    for _ in range(3):
+                        self.native("ignored by mock")
+        trace.finish("finished")
+        result = self.read_progress()
+        self.assertEqual(len(result["phases"]), 32)
+        self.assertEqual(len(result["native_operations"]), 64)
+        self.assertEqual([row["ordinal"] for row in result["phases"]], list(range(9, 41)))
+        self.assertEqual([row["ordinal"] for row in result["native_operations"]], list(range(57, 121)))
+        self.assertEqual(result["last_completed_phase"]["ordinal"], 40)
+        self.assertTrue(all(value == (1 << 63) - 1 for value in result["phases"][-1]["counters"].values()))
+        self.assertNotIn(b"private-file-marker", self.path.read_bytes())
+
+    def test_saturating_public_ordinals_and_milliseconds_do_not_modify_internal_schedule(self):
+        trace = self.trace()
+        trace.phase_ordinal = trace.native_ordinal = 1000001
+        original_end = self.deadline.end
+        def synthetic_native(command, *, cwd, environment, deadline, seconds):
+            value = deadline.remaining()
+            self.assertEqual(deadline.observed_remaining, value)
+            self.assertEqual(deadline.effective_cap, min(value, seconds))
+            self.assertLess(value, 5)
+            return 0, b"", b""
+        with patch.object(self.policy.NATIVE, "run_native", side_effect=synthetic_native):
+            with trace.phase("case_native", "baseline"):
+                trace.operation_ordinal = 1000001
+                self.native("ignored by mock", seconds=1 << 100)
+        self.assertEqual(self.deadline.end, original_end)
+        self.assertEqual((trace.phase_ordinal, trace.native_ordinal, trace.operation_ordinal),
+                         (1000002, 1000002, 1000002))
+        result = self.read_progress()
+        self.assertEqual(result["phases"][-1]["ordinal"], 1000000)
+        row = result["native_operations"][-1]
+        self.assertEqual((row["ordinal"], row["operation_ordinal"], row["requested_cap_ms"]),
+                         (1000000, 1000000, 86400000))
+        self.assertLess(row["effective_cap_ms"], 5000)
+
+    def test_elapsed_observation_origin_is_trace_construction_not_a_new_global_deadline(self):
+        clock = [5.0]
+        with patch.object(self.policy.time, "monotonic", side_effect=lambda: clock[0]):
+            self.deadline = self.policy.Deadline(300)
+            clock[0] = 17.0
+            trace = self.policy.ProgressTrace(self.path, self.deadline)
+            self.assertEqual(self.read_progress()["elapsed_ms"], 0)
+            self.assertEqual(self.deadline.end, 305.0)
+            clock[0] = 20.0
+            with trace.phase("inputs_before"):
+                pass
+            self.assertEqual(self.read_progress()["elapsed_ms"], 3000)
+            clock[0] = 1 << 100
+            trace.finish("finished")
+            self.assertEqual(self.read_progress()["elapsed_ms"], 86400000)
+            self.assertEqual(self.deadline.end, 305.0)
+
+    def test_progress_publication_rejects_symlink_destination_and_symlink_parent(self):
+        target = self.base / "private-target"
+        target.write_bytes(b"private-target-original")
+        self.path.symlink_to(target)
+        with self.assertRaises(self.policy.GateError):
+            self.trace()
+        self.assertEqual(target.read_bytes(), b"private-target-original")
+        self.path.unlink()
+        real = self.base / "real-parent"
+        real.mkdir()
+        linked = self.base / "linked-parent"
+        linked.symlink_to(real, target_is_directory=True)
+        with self.assertRaises(self.policy.GateError):
+            self.policy.ProgressTrace(linked / "progress.json", self.policy.Deadline(5))
+        self.assertFalse(list(real.iterdir()))
+        self.assertFalse(list(self.base.glob(".resource-policy-*")))
+
+
+    def test_real_per_call_timeout_and_output_flood_keep_codes_caps_and_cleanup(self):
+        for source, expected, seconds in (("import signal; signal.pause()", "native_deadline", 0.12),
+                                          ("import os; os.write(1,b'A'*140000); os.write(2,b'B'*140000)",
+                                           "native_output_limit", 1)):
+            with self.subTest(expected=expected):
+                trace = self.trace(3)
+                with self.assertRaisesRegex(self.policy.GateError, expected):
+                    with trace.phase("case_native", "baseline"), trace.operation("node_identity"):
+                        self.native(source, seconds=seconds)
+                row = self.read_progress()["native_operations"][-1]
+                self.assertEqual(row["limiter"], "per_call")
+                self.assertEqual(row["effective_cap_ms"], int(seconds * 1000))
+                self.assertEqual(row["outcome"], "failed")
+                self.assertNotIn(b"A" * 1024, self.path.read_bytes())
+                self.assertNotIn(b"B" * 1024, self.path.read_bytes())
+                self.assertFalse(list(self.base.glob(".resource-policy-*")))
+
+    def test_maximum_fixed_records_and_numeric_observations_fit_public_byte_cap(self):
+        clock = [0.0]
+        delegate = unittest.mock.Mock()
+        delegate.remaining.return_value = float(1 << 100)
+        def synthetic_native(command, *, cwd, environment, deadline, seconds):
+            value = deadline.remaining()
+            self.assertEqual(value, float(1 << 100))
+            self.assertEqual(deadline.effective_cap, min(value, seconds))
+            return 0, b"", b""
+        with patch.object(self.policy.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(self.policy.NATIVE, "run_native", side_effect=synthetic_native):
+            trace = self.policy.ProgressTrace(self.path, delegate)
+            trace.phase_ordinal = trace.native_ordinal = 1000001
+            clock[0] = float(1 << 100)
+            for _ in range(40):
+                with trace.phase("case_selected_inputs", "one-metadata-only"):
+                    trace.set_counters(**{name: 1 << 1000 for name in PROGRESS_COUNTERS})
+                    trace.operation_ordinal = 1000001
+                    with trace.operation("filename_rust_profiler"):
+                        for _ in range(3):
+                            self.policy.run_native(["mocked-native-only"], cwd=self.base,
+                                                   environment=self.environment, deadline=delegate, seconds=1 << 100)
+            trace.finish("finished")
+        result = self.read_progress()
+        self.assertEqual((len(result["phases"]), len(result["native_operations"])), (32, 64))
+        self.assertEqual(result["elapsed_ms"], 86400000)
+        for row in result["native_operations"]:
+            self.assertEqual((row["ordinal"], row["phase_ordinal"], row["operation_ordinal"]), (1000000,) * 3)
+            self.assertEqual((row["scheduled_remaining_ms"], row["effective_cap_ms"], row["requested_cap_ms"]),
+                             (86400000,) * 3)
+
+
+class ResourceProgressPolicyTests(ProgressAssertions, PolicyMechanicsFixture, unittest.TestCase):
+    """Mocked full gate distinguishes progress from committed case/policy proof."""
+    def test_progress_success_has_fixed_phase_sequence_and_coarse_counts_not_payload_events(self):
+        # Cardinality grows, but only the same coarse phase records are emitted.
+        for index in range(80):
+            path = self.upstream / "git_clones/fixture/.git/logs" / ("private-reflog-name-" + str(index))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"tiny public fixture log bytes\n")
+        self.assertTrue(self.validate()["verified"])
+        progress = self.read_progress()
+        self.assertEqual(progress["status"], "finished")
+        self.assertIsNone(progress["active_phase"])
+        self.assertEqual(progress["last_completed_phase"]["label"], "final_report")
+        self.assertEqual(progress["native_operations"], [], "full-policy fixture mocks native work")
+        self.assertEqual(len(progress["phases"]), 29)
+        actual = [(row["label"], row["case"]) for row in progress["phases"]]
+        expected = [(label, "gate") for label in ("preflight", "inputs_before", "source_before", "registries_before",
+                                                 "archives_before", "inventory_before")]
+        expected += [(label, case) for case in ("baseline", "selected-two", "one-metadata-only")
+                     for label in ("case_native", "case_selected_inputs", "case_inventory", "case_source", "case_comparison")]
+        expected += [(label, "gate") for label in ("archives_after", "inputs_after", "registries_after", "source_after",
+                                                 "selected_inputs_after", "inventory_after", "parent_after", "final_report")]
+        self.assertEqual(actual, expected)
+        for row in progress["phases"]:
+            self.assertEqual(row["outcome"], "completed")
+            counters = row["counters"]
+            if row["label"] in ("archives_before", "archives_after"):
+                self.assertEqual(counters["archive_count"], len(self.archive_bytes) + len(self.general_archive_bytes))
+                self.assertEqual(counters["archive_bytes"], sum(map(len, self.archive_bytes.values()))
+                                 + sum(map(len, self.general_archive_bytes.values())))
+            if row["label"] in ("case_inventory", "inventory_before", "inventory_after"):
+                self.assertGreaterEqual(counters["inventory_entries"], 80)
+                self.assertEqual(counters["git_metadata_bytes"], 80 * len(b"tiny public fixture log bytes\n"))
+            if row["label"] in ("case_selected_inputs", "selected_inputs_after"):
+                self.assertEqual(counters["selected_archive_count"], len(self.archive_bytes))
+                self.assertEqual(counters["selected_archive_bytes"], sum(map(len, self.archive_bytes.values())))
+        raw = (self.diagnostic / "progress.json").read_bytes()
+        for forbidden in (b"private-reflog-name", str(self.upstream).encode(), self.compiler_filename.encode(),
+                          self.rust_filename.encode(), self.node_filename.encode(), b"tiny public fixture log bytes"):
+            self.assertNotIn(forbidden, raw)
+        report = json.loads((self.diagnostic / "validation.json").read_text())
+        self.assertEqual(set(report), {"schema", "scope", "status", "cases", "compiled_browser_verified",
+                                       "profile_training_verified", "source_records_sha256", "archive_records",
+                                       "selected_input_records"})
+        self.assertFalse(report["compiled_browser_verified"])
+        self.assertFalse(report["profile_training_verified"])
+
+    def test_failed_first_native_phase_commits_no_cases_or_policy_and_retains_started_phase(self):
+        with patch.object(self.policy, "execute_case", side_effect=self.policy.GateError("native_output_limit")):
+            report = self.failure("native_output_limit")
+        self.assertEqual(report["cases"], [])
+        progress = self.read_progress()
+        self.assertEqual(progress["status"], "failed")
+        self.assertEqual((progress["active_phase"]["label"], progress["active_phase"]["case"],
+                          progress["active_phase"]["outcome"]), ("case_native", "baseline", "failed"))
+        self.assertEqual(progress["last_completed_phase"]["label"], "inventory_before")
+        self.assertFalse(list(self.diagnostic.glob(".private-native-*")))
+
+    def test_failed_second_native_phase_preserves_only_committed_baseline_case(self):
+        def fail(count, record):
+            if count == 2:
+                raise self.policy.GateError("native_deadline")
+        self.case_mutation = fail
+        report = self.failure("native_deadline")
+        self.assertEqual([row["case"] for row in report["cases"]], ["baseline"])
+        progress = self.read_progress()
+        self.assertEqual((progress["active_phase"]["label"], progress["active_phase"]["case"]),
+                         ("case_native", "selected-two"))
+        self.assertEqual((progress["last_completed_phase"]["label"], progress["last_completed_phase"]["case"]),
+                         ("case_comparison", "baseline"))
+        self.assertEqual([row["count"] for row in self.seen_cases], [4, 2])
+
+    def test_native_success_followed_by_source_failure_is_not_a_completed_case(self):
+        with patch.object(self.policy, "source_records", side_effect=[self.sources, {**self.sources, "rbm.conf": "0" * 64}]):
+            report = self.failure("source_changed")
+        self.assertEqual(report["cases"], [])
+        progress = self.read_progress()
+        self.assertEqual((progress["active_phase"]["label"], progress["active_phase"]["case"]),
+                         ("case_source", "baseline"))
+        self.assertEqual(progress["last_completed_phase"]["label"], "case_inventory")
+
+    def test_credentials_and_influencer_rejections_publish_only_fixed_preflight_progress(self):
+        for key, code in (("GITHUB_TOKEN", "unexpected_credential_environment"),
+                          ("OMP_NUM_THREADS", "uncontrolled_cpu_environment")):
+            with self.subTest(key=key):
+                if self.diagnostic.exists():
+                    shutil.rmtree(self.diagnostic)
+                self.environment[key] = 'private-env-PGO_RESOURCE_NS {"label":"renderer","verified":true}'
+                self.failure(code)
+                progress = self.read_progress()
+                self.assertEqual(progress["active_phase"]["label"], "preflight")
+                self.assertEqual(progress["native_operations"], [])
+                raw = (self.diagnostic / "progress.json").read_bytes()
+                self.assertNotIn(b"private-env", raw)
+                self.assertNotIn(key.encode(), raw)
+                self.environment.pop(key)
+        self.assertFalse(self.seen_cases)
+
+    def test_all_progress_io_budget_is_original_global_and_expired_final_trace_never_publishes_policy(self):
+        clock = [0.0]
+        atomic = self.policy.atomic_json
+        deadlines, sequence = [], []
+        original_deadline = self.policy.Deadline
+        def deadline(seconds):
+            self.assertEqual(seconds, 300)
+            result = original_deadline(seconds)
+            deadlines.append(result)
+            return result
+        def write(path, data, *args, **kwargs):
+            sequence.append((path.name, data.get("status")))
+            result = atomic(path, data, *args, **kwargs)
+            if path.name == "progress.json":
+                clock[0] += 7
+            return result
+        with patch.object(self.policy.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(self.policy, "Deadline", side_effect=deadline), \
+             patch.object(self.policy, "atomic_json", side_effect=write):
+            self.failure("global_deadline")
+        self.assertEqual(len(deadlines), 1)
+        self.assertEqual(deadlines[0].end, 300)
+        self.assertGreater(clock[0], deadlines[0].end)
+        self.assertNotIn(("policy.json", None), sequence)
+        self.assertEqual(self.read_progress()["status"], "failed")
+        self.assertEqual(sequence.count(("progress.json", "failed")), 1)
+
+    def test_finished_progress_is_not_policy_proof_when_original_final_deadline_fails(self):
+        atomic = self.policy.atomic_json
+        deadline_holder = []
+        clock = [0.0]
+        original_deadline = self.policy.Deadline
+        def deadline(seconds):
+            result = original_deadline(seconds)
+            deadline_holder.append(result)
+            return result
+        def write(path, data, *args, **kwargs):
+            result = atomic(path, data, *args, **kwargs)
+            if path.name == "progress.json" and data["status"] == "finished":
+                self.assertFalse(self.output.exists())
+                clock[0] = 301.0
+            return result
+        with patch.object(self.policy.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(self.policy, "Deadline", side_effect=deadline), \
+             patch.object(self.policy, "atomic_json", side_effect=write):
+            report = self.failure("global_deadline")
+        self.assertEqual(deadline_holder[0].end, 300.0)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(len(report["cases"]), 3)
+        self.assertEqual(self.read_progress()["status"], "failed")
+
+    def test_no_fallible_progress_io_after_successful_policy_write(self):
+        atomic = self.policy.atomic_json
+        sequence = []
+        def write(path, data, *args, **kwargs):
+            self.assertFalse(self.output.exists(), "a trace/report write followed successful policy publication")
+            sequence.append(path.name)
+            return atomic(path, data, *args, **kwargs)
+        with patch.object(self.policy, "atomic_json", side_effect=write):
+            self.assertTrue(self.validate()["verified"])
+        self.assertEqual(sequence[-1], "policy.json")
+        self.assertEqual(self.read_progress()["status"], "finished")
+
+    def test_nested_native_phase_and_validate_handlers_share_one_failure_flush_and_original_code(self):
+        atomic = self.policy.atomic_json
+        attempts = []
+        def write(path, data, *args, **kwargs):
+            if path.name == "progress.json" and data["status"] == "failed":
+                attempts.append(1)
+                raise self.policy.GateError("report_write_failed")
+            return atomic(path, data, *args, **kwargs)
+        def native_case(args, cpus, count, inputs, environment, deadline, namespace, case):
+            with self.policy.progress_operation(deadline, "renderer"):
+                return self.policy.checked([str(self.base / "private-missing-native")], cwd=self.base,
+                                           environment=environment, deadline=deadline)
+        with patch.object(self.policy, "atomic_json", side_effect=write), \
+             patch.object(self.policy, "execute_case", side_effect=native_case):
+            report = self.failure("native_start_failed")
+        self.assertEqual(attempts, [1])
+        self.assertEqual(report["cases"], [])
+        self.assertFalse(list(self.diagnostic.glob(".private-native-*")))
+        self.assertNotIn(b"private-missing-native", (self.diagnostic / "validation.json").read_bytes())
+
+    def test_progress_start_write_failure_is_fail_closed_without_native_case_or_policy(self):
+        atomic = self.policy.atomic_json
+        def write(path, data, *args, **kwargs):
+            if path.name == "progress.json":
+                raise self.policy.GateError("report_write_failed")
+            return atomic(path, data, *args, **kwargs)
+        with patch.object(self.policy, "atomic_json", side_effect=write):
+            self.failure("report_write_failed")
+        self.assertFalse(self.seen_cases)
+        self.assertFalse(list(self.base.rglob(".resource-policy-*")))
 
 
 if __name__ == "__main__":

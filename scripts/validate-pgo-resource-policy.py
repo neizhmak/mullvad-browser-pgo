@@ -5,6 +5,7 @@ This validates metadata and restored inputs. It does not compile a browser,
 measure compiler jobs/RSS, or establish native profile/training success.
 """
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -16,6 +17,7 @@ import signal
 import stat
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = {"repository": "https://gitlab.torproject.org/tpo/applications/tor-browser-build.git",
@@ -155,13 +157,235 @@ def atomic_json(path, data, limit=64 * 1024):
         raise GateError("report_write_failed") from None
 
 
+PROGRESS_BYTES = 64 * 1024
+PROGRESS_PHASES = 32
+PROGRESS_NATIVE = 64
+PROGRESS_ORDINAL_MAX = 1000000
+PROGRESS_COUNTER_MAX = (1 << 63) - 1
+PROGRESS_MS_MAX = 86400000
+PROGRESS_SCOPE = "bounded metadata gate progress only; not completed-case, final-gate or execution-policy proof"
+PROGRESS_CASES = ("gate", "baseline", "selected-two", "one-metadata-only")
+PROGRESS_PHASE_LABELS = (
+    "preflight", "inputs_before", "source_before", "registries_before", "archives_before",
+    "inventory_before", "case_native", "case_selected_inputs", "case_inventory", "case_source",
+    "case_comparison", "archives_after", "inputs_after", "registries_after", "source_after",
+    "selected_inputs_after", "inventory_after", "parent_after", "final_report")
+PROGRESS_OPERATION_LABELS = (
+    "native", "source_git", "rust_identity", "node_identity", "filename_firefox",
+    "filename_rust_profiler", "filename_rust_official", "filename_mingw", "filename_node",
+    "firefox_repository", "firefox_ref", "firefox_commit", "firefox_executable", "named_inputs", "renderer")
+PROGRESS_COUNTER_NAMES = ("native_calls", "inventory_entries", "git_metadata_bytes", "archive_count",
+                          "archive_bytes", "selected_archive_count", "selected_archive_bytes")
+
+
+def progress_milliseconds(seconds):
+    """Saturate public observations only, never a deadline or scheduling input."""
+    if type(seconds) not in (int, float) or seconds != seconds or seconds <= 0:
+        return 0
+    if seconds >= PROGRESS_MS_MAX / 1000:
+        return PROGRESS_MS_MAX
+    return int(seconds * 1000)
+
+
+class ProgressTrace:
+    """Bounded fixed-vocabulary progress, separate from all gate proof records."""
+
+    def __init__(self, path, deadline):
+        self.path, self.deadline = path, deadline
+        self.started = time.monotonic()
+        self.failure_flushed = False
+        self.phase_started = self.started
+        self.phase_ordinal = self.native_ordinal = self.operation_ordinal = 0
+        self.operation_label = "native"
+        self.native_started = self.started
+        self.data = {"schema": 1, "scope": PROGRESS_SCOPE, "status": "running", "elapsed_ms": 0,
+                     "active_phase": None, "last_completed_phase": None, "phases": [], "native_operations": []}
+        deadline.progress = self
+        self._write()
+
+    def _elapsed(self, started):
+        return progress_milliseconds(time.monotonic() - started)
+
+    def _write(self, *, failure_flush=False):
+        self.data["elapsed_ms"] = self._elapsed(self.started)
+        if self.failure_flushed and not failure_flush:
+            return
+        atomic_json(self.path, self.data, limit=PROGRESS_BYTES)
+
+    def _write_preserving_failure(self):
+        # Share one bounded failure flush across native/phase/validate unwind.
+        # Expiry permits diagnostic cleanup, never metadata/native work or retry.
+        self.data["status"] = "failed"
+        current = self.data["active_phase"]
+        if current is not None:
+            current["outcome"] = "failed"
+            current["elapsed_ms"] = self._elapsed(self.phase_started)
+        if self.failure_flushed:
+            return
+        self.failure_flushed = True
+        try:
+            self._write(failure_flush=True)
+        except Exception:
+            pass
+
+    @contextmanager
+    def phase(self, label, case="gate"):
+        require(isinstance(label, str) and label in PROGRESS_PHASE_LABELS
+                and isinstance(case, str) and case in PROGRESS_CASES, "invalid_progress_label")
+        self.phase_ordinal += 1
+        self.operation_ordinal = 0
+        started = time.monotonic()
+        self.phase_started = started
+        record = {"ordinal": min(self.phase_ordinal, PROGRESS_ORDINAL_MAX), "label": label, "case": case,
+                  "outcome": "started", "started_ms": self._elapsed(self.started), "elapsed_ms": 0, "counters": {}}
+        previous = self.data["active_phase"]
+        self.data["active_phase"] = record
+        self.data["phases"].append(record)
+        del self.data["phases"][:-PROGRESS_PHASES]
+        self._write()
+        try:
+            yield
+        except BaseException:
+            try:
+                record["outcome"] = "failed"
+                record["elapsed_ms"] = self._elapsed(started)
+                self._write_preserving_failure()
+            except Exception:
+                pass
+            raise
+        else:
+            record["outcome"] = "completed"
+            record["elapsed_ms"] = self._elapsed(started)
+            self.data["last_completed_phase"] = record
+            self.data["active_phase"] = previous
+            self._write()
+
+    @contextmanager
+    def operation(self, label):
+        require(isinstance(label, str) and label in PROGRESS_OPERATION_LABELS, "invalid_progress_label")
+        previous, self.operation_label = self.operation_label, label
+        try:
+            yield
+        finally:
+            self.operation_label = previous
+
+    def set_counters(self, **counts):
+        require(all(key in PROGRESS_COUNTER_NAMES and type(value) is int and value >= 0
+                    for key, value in counts.items()), "invalid_progress_counter")
+        current = self.data["active_phase"]
+        if current is not None:
+            current["counters"].update({key: min(value, PROGRESS_COUNTER_MAX) for key, value in counts.items()})
+
+    def start_native(self, seconds):
+        self.native_ordinal += 1
+        self.operation_ordinal += 1
+        self.native_started = time.monotonic()
+        current = self.data["active_phase"]
+        record = {"ordinal": min(self.native_ordinal, PROGRESS_ORDINAL_MAX),
+                  "phase_ordinal": current["ordinal"] if current is not None else 0,
+                  "operation_ordinal": min(self.operation_ordinal, PROGRESS_ORDINAL_MAX),
+                  "label": self.operation_label, "case": current["case"] if current is not None else "gate",
+                  "outcome": "started", "started_ms": self._elapsed(self.started), "elapsed_ms": 0,
+                  "requested_cap_ms": progress_milliseconds(seconds), "scheduled_remaining_ms": None,
+                  "effective_cap_ms": None, "limiter": None}
+        self.data["native_operations"].append(record)
+        del self.data["native_operations"][:-PROGRESS_NATIVE]
+        if current is not None:
+            calls = current["counters"].get("native_calls", 0) + 1
+            self.set_counters(native_calls=calls)
+        # Schedule fields stay null until the actual protected runner sample.
+        self._write()
+        return record
+
+    def end_native(self, record, outcome, *, preserve_failure=False):
+        require(outcome in ("completed", "nonzero", "failed"), "invalid_progress_outcome")
+        record["outcome"] = outcome
+        record["elapsed_ms"] = self._elapsed(self.native_started)
+        if preserve_failure:
+            self._write_preserving_failure()
+        else:
+            self._write()
+
+    def finish(self, outcome):
+        require(outcome in ("finished", "failed"), "invalid_progress_outcome")
+        self.data["status"] = outcome
+        if outcome == "failed":
+            self._write_preserving_failure()
+        else:
+            self._write()
+
+
+class ObservedDeadline:
+    """Observe only the exact sample used by the protected scheduling expression."""
+
+    def __init__(self, delegate, seconds, progress, record):
+        self.delegate, self.seconds, self.progress, self.record = delegate, seconds, progress, record
+        self.observed_remaining = self.effective_cap = self.limiter = None
+
+    def remaining(self):
+        remaining = self.delegate.remaining()
+        self.observed_remaining = remaining
+        self.effective_cap = min(self.seconds, remaining)
+        self.limiter = "per_call" if self.seconds <= remaining else "global_remaining"
+        self.record["scheduled_remaining_ms"] = progress_milliseconds(remaining)
+        self.record["effective_cap_ms"] = progress_milliseconds(self.effective_cap)
+        self.record["limiter"] = self.limiter
+        # No IO, clock read, or extra delegate query is allowed here.
+        return remaining
+
+
+@contextmanager
+def progress_phase(deadline, label, case="gate"):
+    progress = getattr(deadline, "progress", None)
+    if progress is None:
+        yield
+    else:
+        with progress.phase(label, case):
+            yield
+
+
+@contextmanager
+def progress_operation(deadline, label):
+    progress = getattr(deadline, "progress", None)
+    if progress is None:
+        yield
+    else:
+        with progress.operation(label):
+            yield
+
+
+def progress_counters(deadline, **counts):
+    progress = getattr(deadline, "progress", None)
+    if progress is not None:
+        progress.set_counters(**counts)
+
+
 def run_native(command, *, cwd, environment, deadline, seconds=CALL_SECONDS):
+    progress = getattr(deadline, "progress", None)
+    record = progress.start_native(seconds) if progress is not None else None
+    observed = ObservedDeadline(deadline, seconds, progress, record) if progress is not None else deadline
     try:
-        return NATIVE.run_native(command, cwd=cwd, environment=environment,
-                                 deadline=deadline, seconds=seconds)
-    except NATIVE.ProbeError as error:
-        # Only the fixed codes emitted by the trusted bounded runner are used.
-        raise GateError(str(error)) from None
+        result = NATIVE.run_native(command, cwd=cwd, environment=environment,
+                                  deadline=observed, seconds=seconds)
+    except BaseException as error:
+        if progress is not None:
+            try:
+                progress.end_native(record, "failed", preserve_failure=True)
+            except Exception:
+                pass
+        if isinstance(error, NATIVE.ProbeError):
+            # Only the fixed codes emitted by the trusted bounded runner are used.
+            raise GateError(str(error)) from None
+        raise
+    if progress is not None:
+        if result[0] == 0:
+            progress.end_native(record, "completed")
+        else:
+            try:
+                progress.end_native(record, "nonzero", preserve_failure=True)
+            except Exception:
+                pass
+    return result
 
 
 def checked(command, *, cwd, environment, deadline):
@@ -176,9 +400,10 @@ def git(upstream, arguments, environment, deadline):
                        "GIT_NAMESPACE", "GIT_REPLACE_REF_BASE", "GIT_GRAFT_FILE"}
     require(not any(key in authority_names or key.startswith("GIT_CONFIG") for key in environment)
             and environment.get("GIT_NO_REPLACE_OBJECTS", "1") == "1", "uncontrolled_git_authority_environment")
-    raw = checked(["git", "--no-replace-objects", "--no-pager", "-c", "core.fsmonitor=false",
-                   "-c", "core.hooksPath=/dev/null", "-C", str(upstream), *arguments],
-                  cwd=upstream, environment=environment, deadline=deadline)
+    with progress_operation(deadline, "source_git"):
+        raw = checked(["git", "--no-replace-objects", "--no-pager", "-c", "core.fsmonitor=false",
+                       "-c", "core.hooksPath=/dev/null", "-C", str(upstream), *arguments],
+                      cwd=upstream, environment=environment, deadline=deadline)
     return raw
 
 
@@ -311,6 +536,7 @@ def immutable_inventory(upstream, deadline=None):
     digest = hashlib.sha256()
     entries = []
     count = 0
+    metadata_bytes = 0
     for top in ("out", "git_clones", "hg_clones"):
         directory = upstream / top
         require(not directory.is_symlink(), "unsafe_runtime_tree")
@@ -341,6 +567,7 @@ def immutable_inventory(upstream, deadline=None):
                             data = stream.read(1024 * 1024)
                             if not data: break
                             metadata_hash.update(data)
+                            metadata_bytes += len(data)
                     value = (relative, info.st_size, metadata_hash.hexdigest())
                 else:
                     value = (relative, info.st_size, info.st_ino, info.st_mtime_ns, info.st_nlink)
@@ -352,6 +579,7 @@ def immutable_inventory(upstream, deadline=None):
                 raise GateError("unsafe_runtime_tree")
     for _relative, item in sorted(entries):
         digest.update(item)
+    progress_counters(deadline, inventory_entries=count, git_metadata_bytes=metadata_bytes)
     return digest.hexdigest()
 
 
@@ -443,7 +671,19 @@ def load_inputs(args):
 def archive_records(upstream, inputs, deadline):
     records = {name: sha_file(upstream / name, deadline) for name in sorted(inputs["archives"])}
     require(records == inputs["archives"], "restored_archive_bytes_mismatch")
+    progress_counters(deadline, archive_count=len(records), archive_bytes=sum(item["size"] for item in records.values()))
     return records
+
+
+def archive_boundary_records(upstream, inputs, registries, deadline):
+    """One fresh raw union pass; derive the required subset at this same boundary."""
+    for path in set(registries["archives"]) & set(inputs["archives"]):
+        require(registries["archives"][path] == inputs["archives"][path], "conflicting_restored_archive_binding")
+    union = {**registries["archives"], **inputs["archives"]}
+    restored = archive_records(upstream, {**inputs, "archives": union}, deadline)
+    required = {path: restored[path] for path in sorted(inputs["archives"])}
+    require(required == inputs["archives"], "restored_archive_bytes_mismatch")
+    return {"required": required, "restored": restored}
 
 
 def relative_name(value):
@@ -546,6 +786,8 @@ def validate_selected_inputs(upstream, selected, inputs, registries, deadline):
             require(value == expected, "selected_checksum_mismatch")
         records.append({"path": relative, "kind": item["kind"], "project": item["project"], **actual})
     require(all(path in seen for path in inputs["archives"]), "selected_required_archive_missing")
+    progress_counters(deadline, selected_archive_count=len(records),
+                      selected_archive_bytes=sum(item["size"] for item in records))
     return records
 
 
@@ -620,25 +862,32 @@ def showconf(upstream, project, key, targets, cpus, environment, deadline, names
 
 def filename_records(upstream, cpus, inputs, environment, deadline, namespace):
     result = {}
-    for label, project, targets in (("firefox", "firefox", TARGETS), ("rust-profiler", "rust", TARGETS),
-                                    ("rust-official", "rust", TARGETS[:2]), ("mingw", "mingw-w64-clang", TARGETS),
-                                    ("node", "node", TARGETS[:2])):
-        name = showconf(upstream, project, "filename", targets, cpus, environment, deadline, namespace)
+    for label, project, targets, operation in (
+            ("firefox", "firefox", TARGETS, "filename_firefox"),
+            ("rust-profiler", "rust", TARGETS, "filename_rust_profiler"),
+            ("rust-official", "rust", TARGETS[:2], "filename_rust_official"),
+            ("mingw", "mingw-w64-clang", TARGETS, "filename_mingw"),
+            ("node", "node", TARGETS[:2], "filename_node")):
+        with progress_operation(deadline, operation):
+            name = showconf(upstream, project, "filename", targets, cpus, environment, deadline, namespace)
         require(bool(SAFE_NAME.fullmatch(name)), "invalid_selected_filename")
         result[label] = name
     require(result["rust-profiler"] == inputs["rust"]["rust"]["output_filename"]
             and result["rust-official"] == inputs["rust"]["rust"]["official_output_filename"]
             and result["mingw"] == Path(inputs["rust"]["mingw_w64_clang"][0]["path"]).name
             and result["node"] == inputs["node"]["output_filename"], "selected_identity_filename_mismatch")
-    for key, expected in (("git_url", inputs["provenance"]["firefox"]["repository"]),
-                          ("git_hash", inputs["provenance"]["firefox"]["ref"]),
-                          ("var/git_commit", inputs["provenance"]["firefox"]["revision"]),
-                          ("var/exe_name", "mullvadbrowser")):
-        require(showconf(upstream, "firefox", key, TARGETS, cpus, environment, deadline, namespace) == expected,
-                "selected_source_scope_mismatch")
+    for key, expected, operation in (
+            ("git_url", inputs["provenance"]["firefox"]["repository"], "firefox_repository"),
+            ("git_hash", inputs["provenance"]["firefox"]["ref"], "firefox_ref"),
+            ("var/git_commit", inputs["provenance"]["firefox"]["revision"], "firefox_commit"),
+            ("var/exe_name", "mullvadbrowser", "firefox_executable")):
+        with progress_operation(deadline, operation):
+            require(showconf(upstream, "firefox", key, TARGETS, cpus, environment, deadline, namespace) == expected,
+                    "selected_source_scope_mismatch")
     # Every named input is selected by the actual RBM metadata API, never a static list.
-    raw = offline(perl_command(upstream, "firefox", "", TARGETS, "named"),
-                  cpus, upstream, environment, deadline, namespace)
+    with progress_operation(deadline, "named_inputs"):
+        raw = offline(perl_command(upstream, "firefox", "", TARGETS, "named"),
+                      cpus, upstream, environment, deadline, namespace)
     selected = strict_json(raw)
     require(isinstance(selected, dict) and set(selected) == {"named", "selected_inputs"}, "invalid_named_inputs")
     named = selected["named"]
@@ -848,20 +1097,23 @@ def execute_case(args, cpus, count, inputs, environment, deadline, namespace, ca
     directory = case / "native"
     directory.mkdir()
     rust_path, node_path = directory / "rust.json", directory / "node.json"
-    offline([sys.executable, "-c", RESOLVER_CODE, str(Path(__file__).resolve()),
-             str(ROOT / "scripts/resolve-pgo-rust-identity.py"), "--upstream", str(args.upstream),
-             "--output", str(rust_path)], cpus, args.upstream, environment, deadline, namespace)
+    with progress_operation(deadline, "rust_identity"):
+        offline([sys.executable, "-c", RESOLVER_CODE, str(Path(__file__).resolve()),
+                 str(ROOT / "scripts/resolve-pgo-rust-identity.py"), "--upstream", str(args.upstream),
+                 "--output", str(rust_path)], cpus, args.upstream, environment, deadline, namespace)
     rust_raw = read_regular(rust_path)
     require(rust_raw == inputs["rust_raw"] and strict_json(rust_raw) == inputs["rust"], "regenerated_rust_identity_mismatch")
-    offline([sys.executable, "-c", RESOLVER_CODE, str(Path(__file__).resolve()),
-             str(ROOT / "scripts/resolve-pgo-support-identity.py"), "--upstream", str(args.upstream),
-             "--output", str(node_path)], cpus, args.upstream, environment, deadline, namespace)
+    with progress_operation(deadline, "node_identity"):
+        offline([sys.executable, "-c", RESOLVER_CODE, str(Path(__file__).resolve()),
+                 str(ROOT / "scripts/resolve-pgo-support-identity.py"), "--upstream", str(args.upstream),
+                 "--output", str(node_path)], cpus, args.upstream, environment, deadline, namespace)
     node = strict_json(read_regular(node_path))
     require(node == inputs["node"] and canonical_sha(node) == EXPECTED_NODE_SHA, "regenerated_node_identity_mismatch")
     filenames = filename_records(args.upstream, cpus, inputs, environment, deadline, namespace)
     render = directory / "render"
-    offline(["perl", str(ROOT / "scripts/render-pgo-resource-metadata.pl"), "--upstream", str(args.upstream),
-             "--output-directory", str(render)], cpus, args.upstream, environment, deadline, namespace)
+    with progress_operation(deadline, "renderer"):
+        offline(["perl", str(ROOT / "scripts/render-pgo-resource-metadata.pl"), "--upstream", str(args.upstream),
+                 "--output-directory", str(render)], cpus, args.upstream, environment, deadline, namespace)
     metadata = strict_json(read_regular(render / "metadata.json"))
     require(isinstance(metadata, dict) and set(metadata) == {"schema", "num_procs", "logical_cpu_count", "affinity",
             "path_tiny_version", "path_tiny_source_sha256", "atomic_spew_hardlink_verified"} and type(metadata["schema"]) is int and metadata["schema"] == 1
@@ -923,76 +1175,96 @@ def validate(args, *, environment=None):
     original_presence = {key: key in environment for key in INFLUENCERS}
     policy = None
     try:
-        require(len(parent) == 4 and all(type(cpu) is int for cpu in parent), "expected_four_cpu_parent")
-        require(not any(original_presence.values()), "uncontrolled_cpu_environment")
-        require(not any(key in environment for key in ("PGO_TELEMETRY_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")),
-                "unexpected_credential_environment")
-        current_binding = binding(environment, args.upstream)
-        inputs = load_inputs(args)
-        before_sources = source_records(args.upstream, inputs, environment, deadline)
-        before_archives = archive_records(args.upstream, inputs, deadline)
-        before_registries = registry_records(environment, inputs)
-        require({"registry-clang.json", "registry-mingw-w64-clang.json", "registry-rust.json",
-                 "registry-rust-pgo.json"} <= set(before_registries["bytes"]), "missing_restored_compiler_registry")
-        for path in set(before_registries["archives"]) & set(inputs["archives"]):
-            require(before_registries["archives"][path] == inputs["archives"][path],
-                    "conflicting_restored_archive_binding")
-        restored_inputs = {**inputs, "archives": {**before_registries["archives"], **inputs["archives"]}}
-        before_restored = archive_records(args.upstream, restored_inputs, deadline)
-        before_inventory = immutable_inventory(args.upstream, deadline)
+        progress = ProgressTrace(args.diagnostic_directory / "progress.json", deadline)
+        with progress_phase(deadline, "preflight"):
+            require(len(parent) == 4 and all(type(cpu) is int for cpu in parent), "expected_four_cpu_parent")
+            require(not any(original_presence.values()), "uncontrolled_cpu_environment")
+            require(not any(key in environment for key in ("PGO_TELEMETRY_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")),
+                    "unexpected_credential_environment")
+            current_binding = binding(environment, args.upstream)
+        with progress_phase(deadline, "inputs_before"):
+            inputs = load_inputs(args)
+        with progress_phase(deadline, "source_before"):
+            before_sources = source_records(args.upstream, inputs, environment, deadline)
+        with progress_phase(deadline, "registries_before"):
+            before_registries = registry_records(environment, inputs)
+            require({"registry-clang.json", "registry-mingw-w64-clang.json", "registry-rust.json",
+                     "registry-rust-pgo.json"} <= set(before_registries["bytes"]), "missing_restored_compiler_registry")
+        with progress_phase(deadline, "archives_before"):
+            before_boundary = archive_boundary_records(args.upstream, inputs, before_registries, deadline)
+            before_archives, before_restored = before_boundary["required"], before_boundary["restored"]
+        with progress_phase(deadline, "inventory_before"):
+            before_inventory = immutable_inventory(args.upstream, deadline)
         namespace = os.readlink("/proc/self/ns/net")
         baseline = None
         before_selected = None
         with tempfile.TemporaryDirectory(prefix=".private-native-", dir=args.diagnostic_directory) as private:
             for label, cpus in (("baseline", parent), ("selected-two", parent[:2]), ("one-metadata-only", parent[:1])):
-                deadline.remaining()
-                case = Path(private) / label
-                case.mkdir()
-                record = execute_case(args, cpus, len(cpus), inputs, environment, deadline, namespace, case)
-                selected = validate_selected_inputs(args.upstream, record["filenames"].get("selected_inputs"),
-                                                    inputs, before_registries, deadline)
-                if before_selected is None:
-                    before_selected = selected
-                else:
-                    require(selected == before_selected, "selected_input_bytes_changed")
-                require(immutable_inventory(args.upstream, deadline) == before_inventory, "unexpected_runtime_mutation")
-                require(source_records(args.upstream, inputs, environment, deadline) == before_sources, "source_changed")
-                if baseline is None:
-                    baseline = record
-                else:
-                    require(record["normalized"] == baseline["normalized"], "non_resource_render_change")
-                    require(record["filenames"] == baseline["filenames"], "selected_filename_change")
-                    require(record["metadata"]["logical_cpu_count"] == baseline["metadata"]["logical_cpu_count"]
-                            and record["metadata"]["path_tiny_version"] == baseline["metadata"]["path_tiny_version"]
-                            and record["metadata"]["path_tiny_source_sha256"] == baseline["metadata"]["path_tiny_source_sha256"],
-                            "host_metadata_change")
-                generated = args.upstream / "out/firefox/mozconfig"
-                if os.path.lexists(generated):
-                    require(read_regular(generated, MAX_RENDER).decode("utf-8") == baseline["mozconfig"],
-                            "unexpected_generated_mozconfig")
-                diagnostic["cases"].append({"case": label, "metadata": record["metadata"],
-                     "filenames": record["filenames"], "render_sha256": {
-                     key: hashlib.sha256(record[key].encode()).hexdigest() for key in ("mozconfig", "build")}})
-                atomic_json(report_path, diagnostic)
-        require(archive_records(args.upstream, inputs, deadline) == before_archives
-                and archive_records(args.upstream, restored_inputs, deadline) == before_restored, "archive_changed")
-        require(load_inputs(args) == inputs and registry_records(environment, inputs) == before_registries
-                and source_records(args.upstream, inputs, environment, deadline) == before_sources,
-                "source_or_identity_changed")
-        require(validate_selected_inputs(args.upstream, baseline["filenames"].get("selected_inputs"), inputs,
-                                         before_registries, deadline) == before_selected, "selected_input_bytes_changed")
-        require(immutable_inventory(args.upstream, deadline) == before_inventory, "unexpected_runtime_mutation")
-        require(sorted(os.sched_getaffinity(0)) == parent and {key: key in environment for key in INFLUENCERS}
-                == original_presence, "parent_policy_changed")
-        policy = {"schema": 1, "kind": "pgo-generation-resource-policy", "verified": True, "target": "pgo-generate",
-                  "binding": current_binding, "upstream_lock": LOCK, "rbm_commit": RBM_COMMIT,
-                  "parent_affinity": parent, "selected_affinity": parent[:2], "expected_num_procs": 2,
-                  "rust_identity_sha256": EXPECTED_RUST_SHA, "node_identity_sha256": EXPECTED_NODE_SHA}
-        diagnostic["status"] = "verified-metadata-only"
-        diagnostic["source_records_sha256"] = canonical_sha(before_sources)
-        diagnostic["archive_records"] = before_restored
-        diagnostic["selected_input_records"] = before_selected
-        atomic_json(report_path, diagnostic)
+                with progress_phase(deadline, "case_native", label):
+                    deadline.remaining()
+                    case = Path(private) / label
+                    case.mkdir()
+                    record = execute_case(args, cpus, len(cpus), inputs, environment, deadline, namespace, case)
+                with progress_phase(deadline, "case_selected_inputs", label):
+                    selected = validate_selected_inputs(args.upstream, record["filenames"].get("selected_inputs"),
+                                                        inputs, before_registries, deadline)
+                    if before_selected is None:
+                        before_selected = selected
+                    else:
+                        require(selected == before_selected, "selected_input_bytes_changed")
+                with progress_phase(deadline, "case_inventory", label):
+                    require(immutable_inventory(args.upstream, deadline) == before_inventory, "unexpected_runtime_mutation")
+                with progress_phase(deadline, "case_source", label):
+                    require(source_records(args.upstream, inputs, environment, deadline) == before_sources, "source_changed")
+                with progress_phase(deadline, "case_comparison", label):
+                    if baseline is None:
+                        baseline = record
+                    else:
+                        require(record["normalized"] == baseline["normalized"], "non_resource_render_change")
+                        require(record["filenames"] == baseline["filenames"], "selected_filename_change")
+                        require(record["metadata"]["logical_cpu_count"] == baseline["metadata"]["logical_cpu_count"]
+                                and record["metadata"]["path_tiny_version"] == baseline["metadata"]["path_tiny_version"]
+                                and record["metadata"]["path_tiny_source_sha256"] == baseline["metadata"]["path_tiny_source_sha256"],
+                                "host_metadata_change")
+                    generated = args.upstream / "out/firefox/mozconfig"
+                    if os.path.lexists(generated):
+                        require(read_regular(generated, MAX_RENDER).decode("utf-8") == baseline["mozconfig"],
+                                "unexpected_generated_mozconfig")
+                    diagnostic["cases"].append({"case": label, "metadata": record["metadata"],
+                         "filenames": record["filenames"], "render_sha256": {
+                         key: hashlib.sha256(record[key].encode()).hexdigest() for key in ("mozconfig", "build")}})
+                    atomic_json(report_path, diagnostic)
+        with progress_phase(deadline, "archives_after"):
+            after_boundary = archive_boundary_records(args.upstream, inputs, before_registries, deadline)
+            require(after_boundary["required"] == before_archives
+                    and after_boundary["restored"] == before_restored, "archive_changed")
+        with progress_phase(deadline, "inputs_after"):
+            require(load_inputs(args) == inputs, "source_or_identity_changed")
+        with progress_phase(deadline, "registries_after"):
+            require(registry_records(environment, inputs) == before_registries, "source_or_identity_changed")
+        with progress_phase(deadline, "source_after"):
+            require(source_records(args.upstream, inputs, environment, deadline) == before_sources, "source_or_identity_changed")
+        with progress_phase(deadline, "selected_inputs_after"):
+            require(validate_selected_inputs(args.upstream, baseline["filenames"].get("selected_inputs"), inputs,
+                                             before_registries, deadline) == before_selected, "selected_input_bytes_changed")
+        with progress_phase(deadline, "inventory_after"):
+            require(immutable_inventory(args.upstream, deadline) == before_inventory, "unexpected_runtime_mutation")
+        with progress_phase(deadline, "parent_after"):
+            require(sorted(os.sched_getaffinity(0)) == parent and {key: key in environment for key in INFLUENCERS}
+                    == original_presence, "parent_policy_changed")
+        with progress_phase(deadline, "final_report"):
+            policy = {"schema": 1, "kind": "pgo-generation-resource-policy", "verified": True, "target": "pgo-generate",
+                      "binding": current_binding, "upstream_lock": LOCK, "rbm_commit": RBM_COMMIT,
+                      "parent_affinity": parent, "selected_affinity": parent[:2], "expected_num_procs": 2,
+                      "rust_identity_sha256": EXPECTED_RUST_SHA, "node_identity_sha256": EXPECTED_NODE_SHA}
+            diagnostic["status"] = "verified-metadata-only"
+            diagnostic["source_records_sha256"] = canonical_sha(before_sources)
+            diagnostic["archive_records"] = before_restored
+            diagnostic["selected_input_records"] = before_selected
+            atomic_json(report_path, diagnostic)
+        # This status is progress only. Keep all trace IO before the original
+        # final global-deadline check and fail-closed atomic policy publication.
+        progress.finish("finished")
         deadline.remaining()
         require(not os.path.lexists(args.output), "existing_policy")
         atomic_json(args.output, policy)
@@ -1001,6 +1273,12 @@ def validate(args, *, environment=None):
         code = str(error) if isinstance(error, (GateError, NATIVE.ProbeError)) else "validation_system_error"
         diagnostic["status"] = "failed"
         diagnostic["error"] = {"code": code}
+        progress = getattr(deadline, "progress", None)
+        if progress is not None:
+            try:
+                progress.finish("failed")
+            except Exception:
+                pass
         atomic_json(report_path, diagnostic)
         raise GateError(code) from None
 

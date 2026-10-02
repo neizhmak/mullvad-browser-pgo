@@ -187,8 +187,31 @@ diagnostic publisher remain unrestricted. An observer's own affinity is not a
 measurement of every compiler's thread count or RSS.
 
 The fixed `pgo-generation-resource-validation` artifact retains the policy and
-bounded public metadata diagnostics, including precompile failures. Real native
-C++ and Rust generation flags and a completed browser archive remain mandatory.
+bounded public metadata diagnostics, including precompile failures. A separate
+`progress.json` sidecar records fixed phase and native-operation labels, bounded
+counts and elapsed times. It records the actual scheduled native cap and limiter
+without changing the native deadline calculation. It does not contain command
+arguments, environment values, paths, or native output. Phase progress is not a
+completed case, verified gate, or execution policy. Normal diagnostic writes count
+against the original 300-second global budget. One bounded failure-context write
+may follow the existing error/cleanup path after expiry; it starts no new native
+work and grants no extra time. The native 45-second and resolver 40-second limits
+stay unchanged.
+
+Required compiler/support archives and all already-restored archive members are
+hashed once per unique path at each before/after boundary. The required subset is
+derived from that same full raw-byte pass. The after pass is fresh, not a cached
+before result. All per-case selected-input byte checks, complete identities,
+source checks, strict warm-tree inventories (including reflogs), and operational
+render/Tiny checks remain mandatory.
+
+Run `37036435522` stopped at `native_deadline` after 300 seconds. It retained only
+a completed four-CPU baseline; the two/one cases and final gate did not complete.
+Publisher start and Firefox compilation were skipped. The saved report does not
+identify the timed-out operation. Diagnostic and hash-deduplication changes alone
+do not prove that the full gate fits its deadline or that compilation will finish.
+Real native C++ and Rust generation flags and a completed browser archive remain
+mandatory.
 Look for actual mach/Make/Cargo and `NUM_JOBS=2` evidence; metadata success is not
 native training or positive two-language profile proof. The 285-minute Firefox
 step and 360-minute job limits remain unchanged. One large Rust/LLVM/linker can
