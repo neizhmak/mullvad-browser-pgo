@@ -1,8 +1,9 @@
 """Bounded retries for RBM's official Savannah config.git transport failure.
 
-The two-line error signature was observed in both October 1, 2026 hosted
-resolve-pgo-rust-identity failures. No other URL, integrity failure, source
-selection, compiler build, or showconf error is retried.
+The unable-to-access signature was observed on October 1, 2026; the paired
+HTTP/RPC + expected-packfile signature was observed on October 2. No other
+URL, integrity failure, source selection, compiler build, or showconf error
+is retried.
 """
 from pathlib import Path
 import re
@@ -15,6 +16,10 @@ _CONFIG_URL = "https://git.savannah.gnu.org/git/config.git"
 _FATAL = re.compile(r"fatal: unable to access '" + re.escape(_CONFIG_URL)
                     + r"/?': (?P<reason>.+)\Z")
 _CLONE = re.compile(r"Error: Error cloning " + re.escape(_CONFIG_URL) + r"/?\Z")
+_RPC = re.compile(r"error: RPC failed; HTTP (?P<code>500|502|503|504) curl 22 "
+                  r"The requested URL returned error: (?P=code)\Z")
+_REDIRECT = re.compile(r"warning: redirecting to "
+                       r"https://https\.git\.savannah\.gnu\.org/git/config\.git/?\Z")
 _TRANSIENT = re.compile(
     r"(?:The requested URL returned error: (?:500|502|503|504)"
     r"|(?:Operation|Connection) timed out(?: after \d+ (?:milliseconds|ms)"
@@ -38,6 +43,7 @@ _OTHER_FAILURE = re.compile(
 
 def _retryable(stderr, stdout):
     fatal = clone = False
+    rpc = packfile = 0
     for line in (stderr + "\n" + stdout).splitlines():
         line = line.strip()
         match = _FATAL.fullmatch(line)
@@ -47,9 +53,19 @@ def _retryable(stderr, stdout):
             fatal = True
         elif _CLONE.fullmatch(line):
             clone = True
-        elif _OTHER_FAILURE.search(line):
+        elif _RPC.fullmatch(line):
+            rpc += 1
+        elif line == "fatal: expected 'packfile'":
+            packfile += 1
+        elif _REDIRECT.fullmatch(line):
+            pass  # Observed server warning only; never rewrite the source URL.
+        elif (_OTHER_FAILURE.search(line) or "rpc failed" in line.lower()
+              or line.lower().startswith("warning: redirecting")):
             return False
-    return fatal and clone
+    # The packfile message alone is not a transport error. Permit it only
+    # as the single companion to one positive HTTP/curl22 RPC failure.
+    return clone and ((fatal and rpc == packfile == 0)
+                      or (not fatal and rpc == packfile == 1))
 
 
 def showconf(upstream, project, key, targets, *, pause=None) -> str:

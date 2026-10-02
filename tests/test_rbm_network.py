@@ -25,6 +25,16 @@ URL = "https://git.savannah.gnu.org/git/config.git"
 TARGETS = ["alpha", "mullvadbrowser-windows-x86_64", "pgo-generate"]
 
 
+# Exact five-line native payload from full CI 36949688677 (October 2, 2026).
+OBSERVED_RPC_FAILURE = (
+    "Cloning into 'wasi-config'...\n"
+    "warning: redirecting to https://https.git.savannah.gnu.org/git/config.git/\n"
+    "error: RPC failed; HTTP 500 curl 22 The requested URL returned error: 500\n"
+    "fatal: expected 'packfile'\n"
+    "Error: Error cloning https://git.savannah.gnu.org/git/config.git\n"
+)
+
+
 def failure(reason="The requested URL returned error: 500", *, url=URL, clone_url=URL):
     return ("Cloning into 'wasi-config'...\n"
             f"fatal: unable to access '{url}/': {reason}\n"
@@ -220,6 +230,97 @@ class RetryUnitTests(unittest.TestCase):
                     self.assert_immediate_failure(guard if stream == "stdout" else "failed identity",
                         failure() + (guard + "\n" if stream == "stderr" else ""))
 
+    def test_observed_rpc_transient_codes_and_both_streams_retry_same_command(self):
+        for status in (500, 502, 503, 504):
+            diagnostic = OBSERVED_RPC_FAILURE.replace("HTTP 500", f"HTTP {status}").replace(
+                "returned error: 500", f"returned error: {status}")
+            for stream in ("stderr", "stdout", "split"):
+                with self.subTest(status=status, stream=stream):
+                    if stream == "stderr":
+                        stderr, stdout = diagnostic, "benign partial RBM output\n"
+                    elif stream == "stdout":
+                        stderr, stdout = "", diagnostic
+                    else:
+                        stderr, stdout = diagnostic.rsplit("Error: Error cloning", 1)
+                        stdout = "Error: Error cloning" + stdout
+                    result = self.invoke([outcome(1, stdout, stderr), outcome()])
+                    self.assert_native_calls(result, 2)
+                    self.assertEqual(result["pauses"], [10])
+                    self.assertEqual(result["value"], "selected-profiler.tar.xz")
+                    self.assertIsNone(result["error"])
+                    self.assertIn(stderr, result["stderr"])
+                    self.assertIn(stdout, result["stderr"])
+
+    def test_rpc_requires_exactly_one_packfile_companion_and_one_rpc_error(self):
+        rpc_line = "error: RPC failed; HTTP 500 curl 22 The requested URL returned error: 500\n"
+        packfile = "fatal: expected 'packfile'\n"
+        clone = f"Error: Error cloning {URL}\n"
+        candidates = [
+            packfile, packfile + clone, rpc_line + clone, rpc_line + packfile,
+            OBSERVED_RPC_FAILURE + packfile, OBSERVED_RPC_FAILURE + rpc_line,
+            OBSERVED_RPC_FAILURE.replace(packfile, "fatal: expected packfile\n"),
+            OBSERVED_RPC_FAILURE.replace(packfile, "fatal: expected 'packfile' (corrupt data)\n"),
+            failure() + OBSERVED_RPC_FAILURE,
+        ]
+        for diagnostic in candidates:
+            for stream in ("stderr", "stdout"):
+                with self.subTest(diagnostic=diagnostic, stream=stream):
+                    self.assert_immediate_failure(diagnostic if stream == "stdout" else "",
+                                                  diagnostic if stream == "stderr" else "")
+
+    def test_rpc_http_code_curl_code_and_full_message_are_strictly_consistent(self):
+        candidates = [
+            OBSERVED_RPC_FAILURE.replace("HTTP 500", "HTTP 503"),
+            OBSERVED_RPC_FAILURE.replace("returned error: 500", "returned error: 503"),
+            OBSERVED_RPC_FAILURE.replace("HTTP 500 curl 22", "HTTP 500 curl 56"),
+            OBSERVED_RPC_FAILURE.replace("HTTP 500 curl 22 ", "curl 22 "),
+            OBSERVED_RPC_FAILURE.replace("HTTP 500", "HTTP unknown"),
+            OBSERVED_RPC_FAILURE.replace("returned error: 500", "returned error: 500; Authentication failed"),
+            OBSERVED_RPC_FAILURE.replace("returned error: 500", "returned error: 5000"),
+        ]
+        for status in (403, 404, 429, 501, 505):
+            candidates.append(OBSERVED_RPC_FAILURE.replace("HTTP 500", f"HTTP {status}").replace(
+                "returned error: 500", f"returned error: {status}"))
+        for diagnostic in candidates:
+            with self.subTest(diagnostic=diagnostic):
+                self.assert_immediate_failure("not an identity", diagnostic)
+
+    def test_rpc_allows_only_official_clone_url_and_literal_advertised_redirect(self):
+        warning = "warning: redirecting to https://https.git.savannah.gnu.org/git/config.git/\n"
+        for diagnostic in (OBSERVED_RPC_FAILURE, OBSERVED_RPC_FAILURE.replace(warning, ""),
+                           OBSERVED_RPC_FAILURE.replace(warning, warning.rstrip("\n").rstrip("/") + "\n")):
+            with self.subTest(valid_redirect=diagnostic):
+                result = self.invoke([outcome(1, "", diagnostic), outcome()])
+                self.assert_native_calls(result, 2)
+                self.assertEqual(result["pauses"], [10])
+        invalid = [
+            OBSERVED_RPC_FAILURE.replace("Error: Error cloning " + URL,
+                                         "Error: Error cloning https://example.test/other.git"),
+            OBSERVED_RPC_FAILURE.replace("Error: Error cloning " + URL,
+                                         "Error: Error cloning https://https.git.savannah.gnu.org/git/config.git"),
+            OBSERVED_RPC_FAILURE.replace(warning, warning.replace("https://", "http://", 1)),
+            OBSERVED_RPC_FAILURE.replace(warning, warning.replace("https.git.savannah.gnu.org", "mirror.example.test")),
+            OBSERVED_RPC_FAILURE.replace(warning, warning.replace("config.git/", "other.git/")),
+            OBSERVED_RPC_FAILURE.replace(warning, warning.replace("config.git/", "config.git/?mirror=1")),
+            OBSERVED_RPC_FAILURE + "error: other repository HTTP 500\n",
+        ]
+        for diagnostic in invalid:
+            with self.subTest(diagnostic=diagnostic):
+                self.assert_immediate_failure("", diagnostic)
+
+    def test_rpc_mixed_integrity_auth_ref_or_other_fatal_errors_fail_closed(self):
+        guards = ["Error: SHA256 checksum mismatch for compiler.tar.xz",
+                  "BAD signature from source signer", "certificate verification failed",
+                  "Authentication failed for source repository", "missing commit deadbeef",
+                  "couldn't find remote ref missing-tag", "invalid Firefox revision",
+                  "fatal: corrupt packfile", "fatal: index-pack failed",
+                  "fatal: unable to access 'https://example.test/other.git/': The requested URL returned error: 503"]
+        for guard in guards:
+            for stream in ("stderr", "stdout"):
+                with self.subTest(guard=guard, stream=stream):
+                    self.assert_immediate_failure(guard if stream == "stdout" else "",
+                        OBSERVED_RPC_FAILURE + (guard + "\n" if stream == "stderr" else ""))
+
     def test_native_signal_exit_and_executable_failure_do_not_retry(self):
         result = self.assert_immediate_failure("", "terminated by native signal\n", status=-15)
         self.assertEqual(result["error"].returncode, -15)
@@ -302,6 +403,38 @@ class NativeProcessTests(unittest.TestCase):
         self.assertEqual(records, [expected] * count)
         delays = [int(line) for line in self.pauses.read_text().splitlines()] if self.pauses.exists() else []
         self.assertEqual(delays, [10, 30][:count - 1])
+
+    def test_actual_old_then_rpc_failures_recover_on_third_identical_attempt(self):
+        result = self.run_fixture([outcome(1, "partial first RBM output\n", failure()),
+                                   outcome(1, "partial second RBM output\n", OBSERVED_RPC_FAILURE),
+                                   outcome(0, " exact-profiler-after-rpc.tar.xz\n")])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "exact-profiler-after-rpc.tar.xz\n")
+        self.assert_attempts(3)
+        self.assertIn(failure(), result.stderr)
+        self.assertIn(OBSERVED_RPC_FAILURE, result.stderr)
+        self.assertIn("attempt 2/3", result.stderr)
+        self.assertIn("retrying identical command in 30s", result.stderr)
+        self.assertFalse(self.error.exists())
+
+    def test_actual_rpc_exhaustion_stops_at_three_preserving_last_streams(self):
+        rpc_head, clone_tail = OBSERVED_RPC_FAILURE.rsplit("Error: Error cloning", 1)
+        last_stdout = "last partial RBM output\nError: Error cloning" + clone_tail
+        result = self.run_fixture([outcome(1, "", OBSERVED_RPC_FAILURE),
+                                   outcome(2, OBSERVED_RPC_FAILURE, ""),
+                                   outcome(27, last_stdout, rpc_head)])
+        self.assertEqual(result.returncode, 27, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assert_attempts(3)
+        error = json.loads(self.error.read_text())
+        self.assertEqual(error["returncode"], 27)
+        self.assertEqual(error["output"], last_stdout)
+        self.assertEqual(error["stderr"], rpc_head)
+        self.assertEqual(error["cmd"], [str(self.upstream / "rbm/rbm"), "showconf", "rust", "filename",
+                         *[arg for target in TARGETS for arg in ("--target", target)]])
+        self.assertEqual(result.stderr.count("error: RPC failed; HTTP 500 curl 22"), 3)
+        self.assertIn("attempt 3/3", result.stderr)
+        self.assertIn("retry limit reached", result.stderr)
 
     def test_actual_fixture_processes_retry_with_clean_success_stdout(self):
         result = self.run_fixture([outcome(1, "failed selected filename one\n", failure()),
