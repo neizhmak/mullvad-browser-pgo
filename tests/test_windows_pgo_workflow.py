@@ -9,6 +9,8 @@ GEN = (ROOT / ".github/workflows/pgo-stage4a.yml").read_text()
 USE = (ROOT / ".github/workflows/windows-pgo.yml").read_text()
 RUST = (ROOT / ".github/workflows/pgo-toolchain.yml").read_text()
 UNIT = (ROOT / ".github/workflows/tests.yml").read_text()
+SUPPORT_PATH = ROOT / ".github/workflows/pgo-support.yml"
+SUPPORT = SUPPORT_PATH.read_text()
 
 
 def job(text, name):
@@ -20,7 +22,7 @@ def job(text, name):
 
 class WindowsPGOWorkflowTests(unittest.TestCase):
     def test_all_execution_jobs_use_standard_hosted_runners_and_six_hour_limit(self):
-        for text in (GEN, USE, RUST, UNIT):
+        for text in (GEN, USE, RUST, SUPPORT, UNIT):
             runners = re.findall(r"(?m)^    runs-on: (.+)$", text)
             self.assertTrue(runners)
             self.assertTrue(set(runners) <= {"ubuntu-24.04", "windows-2025"})
@@ -96,6 +98,43 @@ class WindowsPGOWorkflowTests(unittest.TestCase):
         self.assertIn("--stage rust-pgo --project rust", publish)
         cache = job(RUST, "rust-build")
         self.assertIn('test "$status" -eq 1', cache)
+
+    def test_generation_waits_for_independent_rust_and_node_checkpoints(self):
+        support = job(GEN, "pgo-support")
+        generation = job(GEN, "pgo-generate")
+        self.assertIn("!inputs.toolchain_only", support)
+        self.assertIn("uses: ./.github/workflows/pgo-support.yml", support)
+        self.assertIn("needs: [pgo-rust, pgo-support]", generation)
+        self.assertIn("needs.pgo-support.outputs.release", generation)
+        self.assertIn("needs.pgo-support.outputs.identity_sha256", generation)
+        self.assertIn('--expected-release "$PGO_SUPPORT_RELEASE"', generation)
+        self.assertIn('--expected-identity "$PGO_SUPPORT_IDENTITY"', generation)
+        self.assertLess(generation.index("./scripts/restore-pgo-support.py"),
+                        generation.index("Build only instrumented Firefox"))
+
+    def test_final_node_bytes_are_recomputed_before_profile_restore(self):
+        for name in ("pgo-firefox", "pgo-package"):
+            contents = job(USE, name)
+            support = contents.index("./scripts/restore-pgo-support.py")
+            self.assertLess(contents.index("./scripts/capture-pgo-toolchains.py"), support)
+            self.assertLess(support, contents.index("./scripts/profile-artifacts.py restore"))
+            self.assertIn('--pgo-target pgo-generate', contents)
+            self.assertIn('--pgo-target pgo-use', contents)
+            self.assertIn('--provenance "$PGO_EXPECTED_PROVENANCE"', contents)
+            self.assertLess(contents.index("./scripts/prepare-pgo-use.sh"),
+                            contents.index("--pgo-target pgo-use"))
+            self.assertNotIn("rbm build node", contents)
+
+    def test_observer_records_resources_before_separate_upload_steps(self):
+        generate = (ROOT / "scripts/run-pgo-generate.sh").read_text()
+        use = (ROOT / "scripts/run-pgo-use.sh").read_text()
+        for contents in (generate, use):
+            self.assertIn("observe-rbm-build.py", contents)
+            self.assertIn("--resource-log", contents)
+            self.assertIn("-- ./rbm/rbm build firefox", contents)
+        self.assertIn("pgo-generate-resources.jsonl", GEN)
+        self.assertIn("*resources.jsonl", USE)
+        self.assertIn("if: always()", job(GEN, "pgo-generate"))
 
     def test_native_windows_lightweight_checks_cover_entrypoints(self):
         native = job(UNIT, "windows-native")

@@ -34,8 +34,14 @@ jobs:
   pgo-rust:
     uses: ./.github/workflows/pgo-toolchain.yml
     secrets: inherit
+  pgo-support:
+    if: ${{ !inputs.toolchain_only }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/pgo-support.yml
+    secrets: inherit
   pgo-generate:
-    needs: pgo-rust
+    needs: [pgo-rust, pgo-support]
     if: ${{ !inputs.toolchain_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -123,6 +129,13 @@ jobs:
         run: |
           ./scripts/resolve-pgo-provenance.sh
           ./scripts/capture-pgo-toolchains.py --upstream "$UPSTREAM" --provenance "$RUNNER_TEMP/provenance/build.json" --rust-identity "$RUNNER_TEMP/pgo-rust-identity.json" --tools "$RUNNER_TEMP/pgo-rust-preflight-tools"
+      - name: Restore exact pinned Node support and bind archive bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PGO_SUPPORT_RELEASE: ${{ needs.pgo-support.outputs.release }}
+          PGO_SUPPORT_IDENTITY: ${{ needs.pgo-support.outputs.identity_sha256 }}
+        run: |
+          ./scripts/restore-pgo-support.py --upstream "$UPSTREAM" --pgo-target pgo-generate --output-directory "$RUNNER_TEMP/pgo-support" --expected-release "$PGO_SUPPORT_RELEASE" --expected-identity "$PGO_SUPPORT_IDENTITY" --provenance "$RUNNER_TEMP/provenance/build.json"
       - name: Prepare verified Binutils input
         run: ./scripts/prepare-binutils-input.sh
       - name: Build only instrumented Firefox
@@ -152,6 +165,8 @@ jobs:
           name: pgo-generation-logs
           path: |
             ${{ runner.temp }}/pgo-generate-build.log
+            ${{ runner.temp }}/pgo-generate-resources.jsonl
+            ${{ runner.temp }}/pgo-support/
             ${{ runner.temp }}/tor-browser-build/logs/
             ${{ runner.temp }}/provenance/
           if-no-files-found: warn

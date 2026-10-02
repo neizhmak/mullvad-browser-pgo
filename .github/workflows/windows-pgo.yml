@@ -124,6 +124,11 @@ jobs:
           ./scripts/resolve-pgo-provenance.sh
           ./scripts/capture-pgo-toolchains.py --upstream "$UPSTREAM" --provenance "$RUNNER_TEMP/provenance/build.json" --rust-identity "$RUNNER_TEMP/pgo-rust-identity.json" --tools "$RUNNER_TEMP/pgo-rust-preflight-tools"
           echo "PGO_EXPECTED_PROVENANCE=$RUNNER_TEMP/provenance/build.json" >> "$GITHUB_ENV"
+      - name: Restore exact pinned Node support and recompute expected archive bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/restore-pgo-support.py --upstream "$UPSTREAM" --pgo-target pgo-generate --output-directory "$RUNNER_TEMP/pgo-support" --provenance "$PGO_EXPECTED_PROVENANCE"
       - name: Strictly restore identity-bound C++ and Rust profile
         env:
           GH_TOKEN: ${{ github.token }}
@@ -133,6 +138,11 @@ jobs:
           echo "PGO_PROFILE_DIR=$RUNNER_TEMP/restored-profile" >> "$GITHUB_ENV"
       - name: Prepare verified profile-use inputs without changing normal targets
         run: ./scripts/prepare-pgo-use.sh
+      - name: Confirm profile-use selects the same pinned Node support
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/restore-pgo-support.py --upstream "$UPSTREAM" --pgo-target pgo-use --output-directory "$RUNNER_TEMP/pgo-support" --provenance "$PGO_EXPECTED_PROVENANCE"
       - name: Prepare verified Binutils input
         run: ./scripts/prepare-binutils-input.sh
       - name: Build only optimized Firefox with C++ and Rust profile use
@@ -158,6 +168,8 @@ jobs:
             ${{ runner.temp }}/pgo-use/*.rendered
             ${{ runner.temp }}/pgo-use/*.env
             ${{ runner.temp }}/pgo-use/*.sha256
+            ${{ runner.temp }}/pgo-use/*resources.jsonl
+            ${{ runner.temp }}/pgo-support/
             ${{ runner.temp }}/provenance/
             ${{ runner.temp }}/tor-browser-build/logs/
           if-no-files-found: warn
@@ -244,6 +256,11 @@ jobs:
           ./scripts/resolve-pgo-provenance.sh
           ./scripts/capture-pgo-toolchains.py --upstream "$UPSTREAM" --provenance "$RUNNER_TEMP/provenance/build.json" --rust-identity "$RUNNER_TEMP/pgo-rust-identity.json" --tools "$RUNNER_TEMP/pgo-rust-preflight-tools"
           echo "PGO_EXPECTED_PROVENANCE=$RUNNER_TEMP/provenance/build.json" >> "$GITHUB_ENV"
+      - name: Restore exact pinned Node support and recompute expected archive bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/restore-pgo-support.py --upstream "$UPSTREAM" --pgo-target pgo-generate --output-directory "$RUNNER_TEMP/pgo-support" --provenance "$PGO_EXPECTED_PROVENANCE"
       - name: Strictly restore identity-bound C++ and Rust profile
         env:
           GH_TOKEN: ${{ github.token }}
@@ -253,6 +270,11 @@ jobs:
           echo "PGO_PROFILE_DIR=$RUNNER_TEMP/restored-profile" >> "$GITHUB_ENV"
       - name: Prepare verified profile-use inputs without changing normal targets
         run: ./scripts/prepare-pgo-use.sh
+      - name: Confirm profile-use selects the same pinned Node support
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/restore-pgo-support.py --upstream "$UPSTREAM" --pgo-target pgo-use --output-directory "$RUNNER_TEMP/pgo-support" --provenance "$PGO_EXPECTED_PROVENANCE"
       - name: Prepare verified Binutils input
         run: ./scripts/prepare-binutils-input.sh
       - uses: actions/download-artifact@v4
@@ -282,6 +304,8 @@ jobs:
             ${{ runner.temp }}/pgo-use/*.rendered
             ${{ runner.temp }}/pgo-use/*.env
             ${{ runner.temp }}/pgo-use/*.sha256
+            ${{ runner.temp }}/pgo-use/*resources.jsonl
+            ${{ runner.temp }}/pgo-support/
             ${{ runner.temp }}/provenance/
             ${{ runner.temp }}/tor-browser-build/logs/
           if-no-files-found: warn

@@ -93,11 +93,39 @@ def nonempty(data, key):
     require(isinstance(data.get(key), str) and bool(data[key].strip()), f"missing {key}")
 
 
+def validate_build_support(data):
+    # Support compilers are optional for older bundles, but a declared archive
+    # must carry the exact immutable Node identity and restored payload bytes.
+    require(isinstance(data, dict) and set(data) == {"node"},
+            "build_support must bind exactly the node project")
+    node = data["node"]
+    require(isinstance(node, dict)
+            and set(node) == {"identity_sha256", "archive_filename", "sha256", "size"},
+            "invalid node build support descriptor")
+    require(isinstance(node["identity_sha256"], str)
+            and HEX64.fullmatch(node["identity_sha256"]), "invalid node build support identity SHA-256")
+    require(isinstance(node["archive_filename"], str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", node["archive_filename"]),
+            "unsafe node build support archive filename")
+    valid_descriptor({key: node[key] for key in ("sha256", "size")}, "node build support archive")
+
+
+def match_build_support(actual, expected, context):
+    # An absent legacy field is valid only when it is absent on BOTH sides.
+    # Otherwise a consumer could silently drop a compiler support identity.
+    if "build_support" in actual or "build_support" in expected:
+        require("build_support" in actual and "build_support" in expected
+                and actual["build_support"] == expected["build_support"],
+                f"{context}: build_support missing or mismatched")
+
+
 def validate_build(data, require_package=True):
     require(isinstance(data, dict) and type(data.get("schema")) is int
             and data["schema"] in (1, 2), "unsupported build provenance schema")
     for key in SOURCE_BINDINGS:
         require(key in data, f"missing build provenance field: {key}")
+    if "build_support" in data:
+        validate_build_support(data["build_support"])
     lock = data["upstream_lock"]
     firefox = data["firefox"]
     server = data["profileserver"]
@@ -198,6 +226,7 @@ def validate_registry(data, expected_identity=None):
             and training.get("browser_executable") == provenance["browser_executable"]
             and training.get("profileserver_sha256") == provenance["profileserver"]["sha256"],
             "training source/package is not bound to profile provenance")
+    match_build_support(training, provenance, "training/profile provenance")
     require(training.get("jarlog") == assets["jarlog"], "training jarlog is not bound to published payload")
     raw = training.get("raw_profiles")
     require(isinstance(raw, list) and raw, "missing raw profile provenance")
@@ -229,6 +258,7 @@ def validate_bundle(directory, expected=None, expected_identity=None):
     require(provenance == registry["provenance"], "payload and registry provenance differ")
     if expected is not None:
         validate_build(expected, require_package=False)
+        match_build_support(provenance, expected, "unexpected profile build provenance")
         for key, value in expected.items():
             require(key in provenance and provenance[key] == value,
                     f"unexpected profile build provenance: {key}")
@@ -280,6 +310,8 @@ def record_training(directory, build_path, source_directory, package):
                 "raw_profiles": [{"name": path.relative_to(directory).as_posix(), **describe(path)}
                                  for path in raw],
                 "jarlog": describe(directory / "jarlog")}
+    if "build_support" in build:
+        manifest["build_support"] = build["build_support"]
     write_json(directory / TRAINING_NAME, manifest)
     return manifest
 
@@ -299,6 +331,7 @@ def validate_training(directory, build_path):
             and manifest.get("browser_executable") == build["browser_executable"]
             and manifest.get("profileserver_sha256") == build["profileserver"]["sha256"],
             "training source/package provenance mismatch")
+    match_build_support(manifest, build, "training/build provenance")
     records = manifest.get("raw_profiles")
     require(isinstance(records, list) and records, "no raw profile records")
     actual = {path.relative_to(directory).as_posix(): path for path in training_files(directory)}

@@ -21,6 +21,12 @@ Do not mark a PR ready because only fixture tests or the Rust checkpoint pass.
   binds the overlay, exact recipes/source inputs, target scope, selected
   MinGW archive bytes, and output filename. Publish only after Linux
   compile/link and native Windows profile emission succeed.
+- Native Node support: `pgo-support-<locked-tag>-<full-support-identity>`.
+  Build the unchanged pinned Node recipe in a separate standard Ubuntu job.
+  The Windows target uses the pinned native build container, not the profiler
+  Rust compiler. Consumers recompute the identity, verify the registry and
+  archive bytes, and require Firefox generation/use to select the same filename.
+  Profile provenance binds those verified Node bytes in `build_support`.
 - Trained profile: `pgo-profile-<locked-tag>-<full-profile-identity>`. Schema 2
   binds exact source/workload, compiler bytes/versions, raw profile inventory,
   jarlog, instrumented package, checked counters, and merged payload.
@@ -51,6 +57,9 @@ permits a compiler rebuild.
 1. Dispatch `pgo-stage4a.yml -f toolchain_only=true` to test Rust alone. The
    full flow restores its immutable verified release rather than rebuilding.
 2. Dispatch Stage 4A normally for native training and the complete pipeline.
+   Rust and native Node checkpoint jobs can run in parallel. Firefox generation
+   starts only after both succeed. Optimized Firefox restores the same Node
+   checkpoint; packaging does not recursively compile Firefox.
    Use `finish_pipeline=false` only to stop at the technical profile release.
 3. If final compilation/packaging fails after profile publication, dispatch
    `windows-pgo.yml` with its exact `profile_release` and full
@@ -140,16 +149,25 @@ use diagnostic timings as performance evidence. A timeout still fails the gate.
 - Training: `pgo-training-logs` preserves failed browser output/minidumps and
   raw profiles. A nonzero native command status or crash is never turned into
   a successful manifest.
-- Generation/use: inspect the Firefox project log, not only RBM stdout. Require
-  actual C++ and Rust compiler instrumentation/profile-use evidence.
+- Generation/use: `observe-rbm-build.py` streams bounded Firefox/Node project
+  log tails and resource snapshots to the Actions console during compilation.
+  It keeps child output and JSONL snapshots on disk. SIGINT/SIGTERM diagnostics
+  run before bounded child-group cleanup; the native failure remains fatal.
+  A VM loss or SIGKILL cannot be trapped. The observer does not retry builds or
+  change source, compiler flags, parallelism, workloads, or preferences.
+  Run `36932177204` ended with 143 and skipped even `always()`/checkout-post
+  steps, which is consistent with runner shutdown. It is not OOM proof and
+  neither the 285-minute step nor 360-minute job deadline was reached.
+  Inspect the Firefox project log, not only RBM stdout. Require actual C++ and
+  Rust compiler instrumentation/profile-use evidence.
 - Merge: use restored matching LLVM, not a runner's unrelated `llvm-profdata`.
   LLVM 21 does not support the removed `--summary-only` usage.
 - Toolchains: official Linux-host executables were built in the upstream
   container. If Ubuntu cannot load them because of GLIBC/libstdc++/library
   requirements, use the matching verified upstream container; never replace
   compiler bytes or weaken preflight. Record ELF/library evidence first.
-- Job limits: preserve separate Rust, instrumented Firefox, training, merge,
-  optimized Firefox, package, and Windows validation jobs. Every job remains
+- Job limits: preserve separate Rust, native Node, instrumented Firefox,
+  training, merge, optimized Firefox, package, and Windows validation jobs. Every job remains
   within GitHub's six-hour hosted-runner limit.
 
 Official Firefox/browser packaging re-zips and edits `omni.ja` to retain

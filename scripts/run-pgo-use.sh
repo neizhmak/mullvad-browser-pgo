@@ -31,7 +31,9 @@ if [[ "$stage" == firefox ]]; then
   build_log="$(get firefox build_log)"
   [[ "$build_log" == /* ]] || build_log="$UPSTREAM/$build_log"
   if [[ "$existed" == false ]]; then rm -f "$build_log"; fi
-  (cd "$UPSTREAM" && ./rbm/rbm build firefox "${args[@]}") 2>&1 | tee "$work/firefox-rbm.log"
+  python3 "$root/scripts/observe-rbm-build.py" --upstream "$UPSTREAM" \
+    --log "$work/firefox-rbm.log" --resource-log "$work/firefox-resources.jsonl" \
+    -- ./rbm/rbm build firefox "${args[@]}"
   if [[ "$existed" == false ]]; then
     [[ -s "$build_log" ]] || { echo 'Firefox project log is missing' >&2; exit 1; }
     cp "$build_log" "$work/firefox-project.log"

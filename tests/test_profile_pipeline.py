@@ -217,6 +217,220 @@ class ProfilePipelineTests(unittest.TestCase):
                              '--binary',self.binary,'--output-directory',self.training,
                              '--build-provenance',self.build_path)
 
+    def enable_node_support(self):
+        self.build['build_support']={'node':{'identity_sha256':'1'*64,
+                                             'archive_filename':'node-pinned-24.12.0.tar.zst',
+                                             'sha256':'2'*64,'size':12345}}
+        put_json(self.build_path,self.build)
+
+    def rewrite_bundle_provenance(self, provenance):
+        # Mutate through native-file interfaces, not project imports. Rebind
+        # the hashes so tests exercise support validation, not stale digests.
+        put_json(self.output/'provenance.json',provenance)
+        registry=json.loads((self.output/'profile-registry.json').read_text())
+        identity=hashlib.sha256(json.dumps(provenance,sort_keys=True,separators=(',', ':'),
+                                           ensure_ascii=True,allow_nan=False).encode()).hexdigest()
+        registry['provenance']=provenance
+        registry['identity_sha256']=identity
+        registry['release_tag']='pgo-profile-'+provenance['upstream_lock']['tag']+'-'+identity
+        registry['assets']['provenance.json']={'sha256':digest(self.output/'provenance.json'),
+                                               'size':(self.output/'provenance.json').stat().st_size}
+        put_json(self.output/'profile-registry.json',registry)
+        self.registry=registry
+        self.tag=registry['release_tag']
+
+    def test_optional_node_support_is_bound_through_training_bundle_and_restore(self):
+        self.enable_node_support()
+        registry=self.bundle()
+        manifest=json.loads((self.training/'training-manifest.json').read_text())
+        self.assertEqual(manifest['build_support'],self.build['build_support'])
+        self.assertEqual(registry['provenance']['build_support'],self.build['build_support'])
+        self.assertEqual(registry['provenance']['training']['build_support'],self.build['build_support'])
+        self.good(self.restore())
+        restored=json.loads((self.base/'restored/provenance.json').read_text())
+        self.assertEqual(restored['build_support'],self.build['build_support'])
+
+    def test_legacy_absent_support_on_both_sides_stays_valid(self):
+        self.bundle()
+        self.assertNotIn('build_support',self.registry['provenance'])
+        self.assertNotIn('build_support',self.registry['provenance']['training'])
+        self.good(self.restore())
+
+    def test_schema_one_build_without_support_stays_valid(self):
+        self.build['schema']=1
+        put_json(self.build_path,self.build)
+        self.bundle()
+        self.good(self.restore())
+
+    def test_node_support_requires_a_dict(self):
+        self.build['build_support']=[]
+        put_json(self.build_path,self.build)
+        result=self.train()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('build_support must bind exactly the node project',result.stderr)
+        self.assertFalse((self.training/'mach-calls.jsonl').exists())
+
+    def test_node_support_missing_node_project_rejected(self):
+        self.build['build_support']={}
+        put_json(self.build_path,self.build)
+        self.assertIn('build_support must bind exactly the node project',self.train().stderr)
+
+    def test_node_support_unknown_project_rejected(self):
+        self.enable_node_support()
+        self.build['build_support']['other']=dict(self.build['build_support']['node'])
+        put_json(self.build_path,self.build)
+        self.assertIn('build_support must bind exactly the node project',self.train().stderr)
+
+    def test_node_support_descriptor_requires_exact_shape(self):
+        self.enable_node_support()
+        original=dict(self.build['build_support']['node'])
+        for mutation in ('missing-size','extra-field','non-dict'):
+            with self.subTest(mutation=mutation):
+                self.build['build_support']['node']=dict(original)
+                if mutation=='missing-size':del self.build['build_support']['node']['size']
+                elif mutation=='extra-field':self.build['build_support']['node']['unbound']='value'
+                else:self.build['build_support']['node']='archive'
+                put_json(self.build_path,self.build)
+                result=self.train()
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('invalid node build support descriptor',result.stderr)
+
+    def test_node_support_unsafe_link_or_path_filename_rejected(self):
+        self.enable_node_support()
+        for filename in ('../node.tar.zst','node/subdir.tar.zst',r'node\payload.tar.zst',
+                         '/tmp/node-link.tar.zst',r'C:\node-link.tar.zst','..','',None):
+            with self.subTest(filename=filename):
+                self.build['build_support']['node']['archive_filename']=filename
+                put_json(self.build_path,self.build)
+                result=self.train()
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('unsafe node build support archive filename',result.stderr)
+                self.assertFalse((self.training/'mach-calls.jsonl').exists())
+
+    def test_node_support_size_requires_positive_integer_not_boolean(self):
+        self.enable_node_support()
+        for size in (True,False,0,-1,1.5,'12345',None):
+            with self.subTest(size=size):
+                self.build['build_support']['node']['size']=size
+                put_json(self.build_path,self.build)
+                result=self.train()
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('invalid asset size: node build support archive',result.stderr)
+
+    def test_node_support_identity_requires_lowercase_sha256(self):
+        self.enable_node_support()
+        for identity in ('A'*64,'g'*64,'1'*63,'1'*65,'',True,None):
+            with self.subTest(identity=identity):
+                self.build['build_support']['node']['identity_sha256']=identity
+                put_json(self.build_path,self.build)
+                result=self.train()
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('invalid node build support identity SHA-256',result.stderr)
+
+    def test_node_support_archive_digest_requires_lowercase_sha256(self):
+        self.enable_node_support()
+        for digest_value in ('A'*64,'g'*64,'2'*63,'',False,None):
+            with self.subTest(digest_value=digest_value):
+                self.build['build_support']['node']['sha256']=digest_value
+                put_json(self.build_path,self.build)
+                result=self.train()
+                self.assertNotEqual(result.returncode,0)
+                self.assertIn('invalid asset SHA-256: node build support archive',result.stderr)
+
+    def test_restore_node_support_expected_archive_bytes_mismatch_rejected(self):
+        self.enable_node_support()
+        self.bundle()
+        self.build['build_support']['node']['sha256']='3'*64
+        put_json(self.build_path,self.build)
+        result=self.restore()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('build_support missing or mismatched',result.stderr)
+        self.assertFalse((self.base/'restored').exists())
+
+    def test_restore_node_support_expected_identity_mismatch_rejected(self):
+        self.enable_node_support()
+        self.bundle()
+        self.build['build_support']['node']['identity_sha256']='3'*64
+        put_json(self.build_path,self.build)
+        result=self.restore()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('build_support missing or mismatched',result.stderr)
+
+    def test_restore_node_support_expected_size_mismatch_rejected(self):
+        self.enable_node_support()
+        self.bundle()
+        self.build['build_support']['node']['size']+=1
+        put_json(self.build_path,self.build)
+        self.assertIn('build_support missing or mismatched',self.restore().stderr)
+
+    def test_restore_support_actual_only_rejected_symmetrically(self):
+        self.enable_node_support()
+        self.bundle()
+        del self.build['build_support']
+        put_json(self.build_path,self.build)
+        result=self.restore()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('build_support missing or mismatched',result.stderr)
+
+    def test_restore_support_expected_only_rejected_symmetrically(self):
+        self.bundle()
+        self.enable_node_support()
+        result=self.restore()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('build_support missing or mismatched',result.stderr)
+
+    def test_merge_rejects_node_support_dropped_from_training_manifest(self):
+        self.enable_node_support()
+        self.training_fixture()
+        path=self.training/'training-manifest.json'
+        manifest=json.loads(path.read_text())
+        del manifest['build_support']
+        put_json(path,manifest)
+        result=self.merge(good=False)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('training/build provenance: build_support missing or mismatched',result.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_merge_rejects_node_support_bytes_mismatched_in_training_manifest(self):
+        self.enable_node_support()
+        self.training_fixture()
+        path=self.training/'training-manifest.json'
+        manifest=json.loads(path.read_text())
+        manifest['build_support']['node']['sha256']='4'*64
+        put_json(path,manifest)
+        self.assertIn('training/build provenance: build_support missing or mismatched',self.merge(good=False).stderr)
+
+    def test_merge_rejects_support_manifest_only(self):
+        self.training_fixture()
+        path=self.training/'training-manifest.json'
+        manifest=json.loads(path.read_text())
+        self.enable_node_support()
+        manifest['build_support']=self.build['build_support']
+        del self.build['build_support']
+        put_json(self.build_path,self.build)
+        put_json(path,manifest)
+        self.assertIn('training/build provenance: build_support missing or mismatched',self.merge(good=False).stderr)
+
+    def test_registry_rejects_node_support_lost_from_profile_provenance(self):
+        self.enable_node_support()
+        self.bundle()
+        provenance=json.loads((self.output/'provenance.json').read_text())
+        del provenance['build_support']
+        self.rewrite_bundle_provenance(provenance)
+        result=self.run_tool('profile-artifacts.py','validate','--directory',self.output)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('training/profile provenance: build_support missing or mismatched',result.stderr)
+
+    def test_registry_rejects_node_support_lost_from_training_provenance(self):
+        self.enable_node_support()
+        self.bundle()
+        provenance=json.loads((self.output/'provenance.json').read_text())
+        del provenance['training']['build_support']
+        self.rewrite_bundle_provenance(provenance)
+        result=self.run_tool('profile-artifacts.py','validate','--directory',self.output)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('training/profile provenance: build_support missing or mismatched',result.stderr)
+
     def test_training_package_selection_is_locked_to_mullvad_executable(self):
         # Keep the native package-selection gate aligned with pinned rbm.conf
         # var/exe_name=mullvadbrowser. Never fall back to Mozilla's executable.

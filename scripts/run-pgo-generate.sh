@@ -2,10 +2,15 @@
 set -euo pipefail
 : "${UPSTREAM:?}"; : "${RUNNER_TEMP:?}"
 log="$RUNNER_TEMP/pgo-generate-build.log"
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$UPSTREAM"
 common=(--target alpha --target mullvadbrowser-windows-x86_64 --target pgo-generate)
 # Build only the pinned Firefox RBM project, not browser/release.
-./rbm/rbm build firefox "${common[@]}" 2>&1 | tee "$log"
+# Stream project/resource evidence before termination; later always() steps can
+# be skipped when the hosted runner shuts down.
+python3 "$root/scripts/observe-rbm-build.py" --upstream "$UPSTREAM" \
+  --log "$log" --resource-log "$RUNNER_TEMP/pgo-generate-resources.jsonl" \
+  -- ./rbm/rbm build firefox "${common[@]}"
 # RBM writes configure output in its project log, not necessarily to stdout.
 project_log="$UPSTREAM/logs/firefox-windows-x86_64.log"
 [[ -s "$project_log" ]] || { echo 'Firefox project build log is missing' >&2; exit 1; }

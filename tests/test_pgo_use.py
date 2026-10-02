@@ -310,7 +310,7 @@ class PGOUseTests(unittest.TestCase):
     def test_browser_stage_never_builds_firefox_and_selects_checksum_bound_input(self):
         self.assertEqual(self.snapshot().returncode, 0)
         project = self.directory / "overlay"
-        for relative in ["scripts/run-pgo-use.sh", "scripts/collect-pgo-packages.py", "patches/firefox-pgo-use.patch", "upstream.lock.json"]:
+        for relative in ["scripts/run-pgo-use.sh", "scripts/collect-pgo-packages.py", "scripts/observe-rbm-build.py", "patches/firefox-pgo-use.patch", "upstream.lock.json"]:
             destination = project / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / relative, destination)
@@ -351,7 +351,7 @@ class PGOUseTests(unittest.TestCase):
     def test_stage_firefox_targets_selected_directory_and_reads_project_log(self):
         # Use repository scripts normally, with external RBM/profile helper stand-ins.
         project = self.directory / "overlay"
-        for relative in ["scripts/run-pgo-use.sh", "scripts/collect-pgo-packages.py", "patches/firefox-pgo-use.patch", "upstream.lock.json"]:
+        for relative in ["scripts/run-pgo-use.sh", "scripts/collect-pgo-packages.py", "scripts/observe-rbm-build.py", "patches/firefox-pgo-use.patch", "upstream.lock.json"]:
             destination = project / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / relative, destination)
