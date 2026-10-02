@@ -60,6 +60,33 @@ unchanged. Actual compiler builds are not retried by this helper. Authentication
 stop immediately. A fetch failure never counts as cache absence and never
 permits a compiler rebuild.
 
+## Durable build diagnostics
+
+A lost hosted runner can leave no downloadable job log, even when the observer
+flushed local files and console output. A separate prebuild publisher therefore
+creates a diagnostic GitHub Check with `checks: write` scoped to the generation
+job. The existing build command, observer, compiler flags, and child environment
+stay unchanged. Its token exists only in the publisher step and detached process.
+
+The check starts completed with a **neutral** conclusion. This means diagnostics
+only, not successful compilation, a valid profile, or a validated browser. The
+heavy build must not start unless GitHub acknowledges check creation. Later
+publishing failures are diagnostic only and do not retry or terminate the build.
+The publisher replaces a bounded resource-only snapshot window. It does not send
+raw logs, paths, arguments, environment variables, or authentication data.
+
+Only server-acknowledged snapshots survive runner loss. The last sample can be
+stale, and a missing final sample does not prove OOM, CPU starvation, or a network
+cause. Host and cgroup counters do not identify the responsible process. This is
+not a cure for runner loss and not a complete immutable telemetry archive.
+
+Before another heavy attempt, run the short `pgo-diagnostics.yml` workflow. It
+must verify real Checks API acknowledgments, kill only the detached publisher,
+and independently retrieve the last acknowledged snapshot. This validates the
+diagnostic channel, not the PGO pipeline. No PAT, signing key, or custom artifact
+SDK is needed. Checks retention follows the repository's GitHub retention rules;
+copy useful evidence promptly.
+
 ## Re-run boundaries
 
 1. Dispatch `pgo-stage4a.yml -f toolchain_only=true` to test Rust alone. The

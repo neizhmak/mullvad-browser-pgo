@@ -156,6 +156,40 @@ class WindowsPGOWorkflowTests(unittest.TestCase):
         self.assertIn('./rbm/rbm build browser "${args[@]}"', optimized)
         self.assertIn('./rbm/rbm build rust', RUST)
 
+    def test_durable_telemetry_is_separate_from_unchanged_native_build(self):
+        generation = job(GEN, "pgo-generate")
+        self.assertIn("checks: write", generation)
+        self.assertIn("contents: write", generation)
+        self.assertIn("actions: read", generation)
+        self.assertIn("persist-credentials: false", generation)
+        self.assertNotIn("checks: write", GEN.split("jobs:", 1)[0])
+        self.assertIn("publish-rbm-telemetry.py", generation)
+        self.assertIn("PGO_TELEMETRY_TOKEN:", generation)
+        self.assertLess(generation.index("publish-rbm-telemetry.py"),
+                        generation.index("Build only instrumented Firefox"))
+        build = generation.split("- name: Build only instrumented Firefox", 1)[1]
+        build = build.split("- name:", 1)[0]
+        self.assertIn("timeout-minutes: 285", build)
+        self.assertIn("run: ./scripts/run-pgo-generate.sh", build)
+        self.assertNotIn("PGO_TELEMETRY_TOKEN", build)
+        self.assertNotIn("env:", build)
+        for name in ("run-pgo-generate.sh", "observe-rbm-build.py"):
+            self.assertNotIn("PGO_TELEMETRY_TOKEN", (ROOT / "scripts" / name).read_text())
+
+    def test_diagnostics_smoke_is_short_and_not_a_browser_build(self):
+        diagnostics = (ROOT / ".github/workflows/pgo-diagnostics.yml").read_text()
+        self.assertIn("workflow_dispatch", diagnostics)
+        self.assertIn("ubuntu-24.04", diagnostics)
+        self.assertIn("checks: write", diagnostics)
+        self.assertIn("persist-credentials: false", diagnostics)
+        self.assertIn("smoke-rbm-telemetry.py", diagnostics)
+        limits = [int(value) for value in re.findall(r"timeout-minutes: ([0-9]+)", diagnostics)]
+        self.assertTrue(limits)
+        self.assertTrue(all(0 < value <= 10 for value in limits))
+        self.assertNotIn("run-pgo-generate.sh", diagnostics)
+        self.assertNotIn("./rbm/rbm build", diagnostics)
+        self.assertNotIn("fetch-upstream.sh", diagnostics)
+
     def test_native_windows_lightweight_checks_cover_entrypoints(self):
         native = job(UNIT, "windows-native")
         self.assertIn("runs-on: windows-2025", native)
