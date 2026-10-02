@@ -104,10 +104,12 @@ class TelemetryWorkflowTests(unittest.TestCase):
         self.assertNotIn("OMP_NUM_THREADS", self.generate)
         self.assertNotIn("MOZ_PGO_RUST", self.generate)
 
-    def test_diagnostics_dispatch_only_standard_free_runner_short_deadline(self):
+    def test_diagnostics_dispatch_or_reusable_only_free_runner_short_deadline(self):
         header = self.smoke.split("jobs:", 1)[0]
-        self.assertIn("on:\n  workflow_dispatch:\n", header)
-        for forbidden in ["workflow_call", "schedule", "pull_request", "push:", "workflow_run"]:
+        self.assertIn("on:\n  workflow_dispatch:\n  workflow_call:\n", header)
+        events = header.split("on:\n", 1)[1].split("permissions:\n", 1)[0]
+        self.assertEqual(events, "  workflow_dispatch:\n  workflow_call:\n")
+        for forbidden in ["schedule", "pull_request", "push:", "workflow_run"]:
             self.assertNotIn(forbidden, header)
         self.assertIn("    runs-on: ubuntu-24.04", self.smoke)
         self.assertIn("    timeout-minutes: 10", self.smoke)
@@ -115,6 +117,29 @@ class TelemetryWorkflowTests(unittest.TestCase):
         self.assertIn("      contents: read", self.smoke)
         for forbidden in ["fetch-upstream", "rbm build", "run-pgo-generate.sh", "train-pgo", "windows-", "sudo apt", "git clone"]:
             self.assertNotIn(forbidden, self.smoke)
+
+    def test_registered_caller_requires_explicit_opt_in_and_grants_only_telemetry_checks_write(self):
+        caller = (ROOT / ".github/workflows/tests.yml").read_text()
+        header = caller.split("jobs:\n", 1)[0]
+        input_block = header.split("      telemetry_smoke:\n", 1)[1].split("permissions:\n", 1)[0]
+        self.assertIn("        type: boolean\n", input_block)
+        self.assertIn("        default: false\n", input_block)
+        telemetry = job(caller, "telemetry-smoke")
+        self.assertIn("    if: ${{ github.event_name == 'workflow_dispatch' && inputs.telemetry_smoke }}\n", telemetry)
+        self.assertIn("    uses: ./.github/workflows/pgo-diagnostics.yml\n", telemetry)
+        self.assertIn("    permissions:\n      contents: read\n      actions: read\n      checks: write\n", telemetry)
+        self.assertNotIn("steps:", telemetry)
+        self.assertNotIn("env:", telemetry)
+        self.assertNotIn("checks:", header)
+        self.assertEqual(caller.count("      checks: write"), 1)
+        baseline = job(caller, "baseline-smoke")
+        self.assertIn("    if: ${{ github.event_name == 'workflow_dispatch' && inputs.baseline_smoke }}\n", baseline)
+        self.assertNotIn("telemetry_smoke", baseline)
+        self.assertNotIn("checks:", baseline)
+        # The dispatch plumbing is metadata only; the short callee has no browser path.
+        self.assertIn("    timeout-minutes: 10\n", self.smoke)
+        for forbidden in ["fetch-upstream", "rbm build", "restore-required", "windows-runtime-check.py", "train-pgo"]:
+            self.assertNotIn(forbidden, telemetry + self.smoke)
 
     def test_smoke_three_phases_have_separate_token_boundaries(self):
         start = step(self.smoke, "Start acknowledged diagnostic-only telemetry")

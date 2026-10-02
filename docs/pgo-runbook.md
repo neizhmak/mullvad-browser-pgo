@@ -80,9 +80,19 @@ stale, and a missing final sample does not prove OOM, CPU starvation, or a netwo
 cause. Host and cgroup counters do not identify the responsible process. This is
 not a cure for runner loss and not a complete immutable telemetry archive.
 
-Before another heavy attempt, run the short `pgo-diagnostics.yml` workflow. It
-must verify real Checks API acknowledgments, kill only the detached publisher,
-and independently retrieve the last acknowledged snapshot. This validates the
+Before another heavy attempt, run the short `pgo-diagnostics.yml` workflow. On a
+feature branch where this new workflow is not yet registered on the default
+branch, use the existing lightweight workflow as its explicit caller:
+
+```sh
+gh workflow run tests.yml --ref codex/complete-windows-alpha-pgo \
+  -f baseline_smoke=false -f telemetry_smoke=true
+```
+
+The diagnostic job must verify real Checks API acknowledgments, kill only the
+detached publisher, and independently retrieve the last acknowledged snapshot.
+The caller does not enable telemetry on pushes or pull requests. The command
+above also disables the separate baseline installation job. This validates the
 diagnostic channel, not the PGO pipeline. No PAT, signing key, or custom artifact
 SDK is needed. Checks retention follows the repository's GitHub retention rules;
 copy useful evidence promptly.

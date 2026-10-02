@@ -12,10 +12,21 @@ on:
         description: Preserve native navigation logs for a baseline-only diagnostic run (not a performance comparison)
         type: boolean
         default: false
+      telemetry_smoke:
+        description: Verify durable resource Checks after publisher death (not a browser build)
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
 jobs:
+  telemetry-smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.telemetry_smoke }}
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+    uses: ./.github/workflows/pgo-diagnostics.yml
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

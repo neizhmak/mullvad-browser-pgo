@@ -190,6 +190,25 @@ class WindowsPGOWorkflowTests(unittest.TestCase):
         self.assertNotIn("./rbm/rbm build", diagnostics)
         self.assertNotIn("fetch-upstream.sh", diagnostics)
 
+    def test_telemetry_dispatch_uses_registered_caller_without_automatic_trigger(self):
+        header = UNIT.split("permissions:", 1)[0]
+        self.assertIn("      telemetry_smoke:\n", header)
+        telemetry_input = header.split("      telemetry_smoke:\n", 1)[1]
+        self.assertIn("type: boolean", telemetry_input)
+        self.assertIn("default: false", telemetry_input)
+        caller = job(UNIT, "telemetry-smoke")
+        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.telemetry_smoke", caller)
+        self.assertIn("uses: ./.github/workflows/pgo-diagnostics.yml", caller)
+        self.assertIn("checks: write", caller)
+        self.assertIn("contents: read", caller)
+        self.assertIn("actions: read", caller)
+        self.assertNotIn("steps:", caller)
+        self.assertNotIn("env:", caller)
+        self.assertNotIn("checks: write", UNIT.split("jobs:", 1)[0])
+        self.assertIn("inputs.baseline_smoke", job(UNIT, "baseline-smoke"))
+        runbook = (ROOT / "docs/pgo-runbook.md").read_text()
+        self.assertIn("-f baseline_smoke=false -f telemetry_smoke=true", runbook)
+
     def test_native_windows_lightweight_checks_cover_entrypoints(self):
         native = job(UNIT, "windows-native")
         self.assertIn("runs-on: windows-2025", native)

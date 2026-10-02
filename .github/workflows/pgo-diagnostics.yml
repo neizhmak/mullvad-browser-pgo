@@ -1,6 +1,7 @@
 name: Smoke-test durable RBM resource telemetry
 on:
   workflow_dispatch:
+  workflow_call:
 permissions:
   contents: read
   actions: read
