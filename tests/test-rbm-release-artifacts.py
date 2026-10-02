@@ -40,9 +40,16 @@ if args[0] == "api":
     sys.exit(1)
 
 command, release = args[1], args[2]
+with (store / "calls").open("a") as calls:
+    calls.write(json.dumps(args) + "\n")
 release_dir = store / release
 if command == "view":
-    if not release_dir.exists(): sys.exit(1)
+    if os.environ.get("FAKE_VIEW_ERROR"):
+        print(os.environ["FAKE_VIEW_ERROR"], file=sys.stderr)
+        sys.exit(4)
+    if not release_dir.exists():
+        print("release not found", file=sys.stderr)
+        sys.exit(1)
     if "--json" in args:
         data = metadata(release_dir)
         print(json.dumps({"assets": [dict(value, name=name) for name, value in data.items()]}))
@@ -65,7 +72,14 @@ elif command == "upload":
         save(release_dir, data)
         if os.environ.get("FAKE_UPLOAD_TIMEOUT") == "1": time.sleep(10)
         sys.exit(4)
+    if source.name.startswith("rbm-"):
+        if os.environ.get("FAKE_REQUIRE_HARDLINK") == "1" and source.stat().st_nlink < 2:
+            sys.exit(8)
+        if os.environ.get("FAKE_REQUIRE_COPY") == "1" and source.stat().st_nlink != 1:
+            sys.exit(9)
     shutil.copyfile(source, destination)
+    if os.environ.get("FAKE_CORRUPT_UPLOAD") == "1" and source.name.startswith("rbm-"):
+        destination.write_bytes(b"x" * source.stat().st_size)
     data[source.name] = {"id": 1000 + len(data), "state": "uploaded", "size": source.stat().st_size}
     save(release_dir, data)
 elif command == "download":
@@ -113,26 +127,43 @@ class PublicationTests(unittest.TestCase):
         commit = json.loads((ROOT / "upstream.lock.json").read_text())["commit"][:12]
         return f"rbm-{commit}--clang--{self.artifact.name}"
 
-    def publish(self):
+    def run_helper(self, command, *extra, wrapper=None):
+        argv = [str(HELPER)] if wrapper is None else ["python3", "-c", wrapper]
         return subprocess.run(
-            [str(HELPER), "publish", "--upstream", str(self.upstream),
-             "--repository", "owner/repo", "--release", self.release,
-             "--registry-dir", str(self.registry_dir), "--before", str(self.before),
-             "--stage", "clang"], env=self.env, text=True, capture_output=True)
-
-    def stage_complete(self, stage="clang"):
-        return subprocess.run(
-            [str(HELPER), "stage-complete", "--upstream", str(self.upstream),
-             "--repository", "owner/repo", "--release", self.release,
-             "--registry-dir", str(self.registry_dir), "--stage", stage],
+            argv + [command, "--upstream", str(self.upstream),
+                    "--repository", "owner/repo", "--release", self.release,
+                    "--registry-dir", str(self.registry_dir), *extra],
             env=self.env, text=True, capture_output=True)
+
+    def publish(self, *extra, wrapper=None):
+        return self.run_helper("publish", "--before", str(self.before), "--stage", "clang",
+                               *extra, wrapper=wrapper)
+
+    def stage_complete(self, stage="clang", *extra):
+        return self.run_helper("stage-complete", "--stage", stage, *extra)
 
     def restore(self):
-        return subprocess.run(
-            [str(HELPER), "restore", "--upstream", str(self.upstream),
-             "--repository", "owner/repo", "--release", self.release,
-             "--registry-dir", str(self.registry_dir)],
-            env=self.env, text=True, capture_output=True)
+        return self.run_helper("restore")
+
+    def read_registry(self):
+        return json.loads((self.store / self.release / "registry-clang.json").read_text())
+
+    def write_registry(self, data):
+        release = self.store / self.release
+        registry = release / "registry-clang.json"
+        registry.write_text(json.dumps(data) + "\n")
+        metadata = json.loads((release / ".assets.json").read_text())
+        metadata[registry.name]["size"] = registry.stat().st_size
+        metadata[registry.name].pop("digest", None)
+        (release / ".assets.json").write_text(json.dumps(metadata))
+
+    def assert_no_temporary_payloads(self):
+        self.assertFalse(list(self.registry_dir.glob("rbm-*")))
+        self.assertFalse(list(self.registry_dir.glob(".uploads-*")))
+        self.assertFalse(list(self.registry_dir.glob(".completion-*")))
+        self.assertFalse(list(self.registry_dir.glob(".restore-*")))
+        self.assertFalse(list(self.registry_dir.glob(".committed-*")))
+        self.assertFalse(list((self.registry_dir / "published").glob("*")))
 
     def restore_required(self, *stages):
         command = [str(HELPER), "restore-required", "--upstream", str(self.upstream),
@@ -160,7 +191,7 @@ class PublicationTests(unittest.TestCase):
     def test_missing_registry_does_not_mark_stage_complete(self):
         self.seed_asset(self.artifact.read_bytes())
         result = self.stage_complete()
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertIn("registry-clang.json is missing or incomplete", result.stdout)
 
     def test_registry_with_incomplete_artifact_does_not_mark_stage_complete(self):
@@ -171,7 +202,7 @@ class PublicationTests(unittest.TestCase):
         assets[self.asset_name]["state"] = "starter"
         metadata.write_text(json.dumps(assets))
         result = self.stage_complete()
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertIn("is missing or incomplete", result.stdout)
 
     def test_existing_identical_asset_is_reused(self):
@@ -223,7 +254,11 @@ class PublicationTests(unittest.TestCase):
         create_args = (self.store / "create-args").read_text()
         self.assertIn("--prerelease", create_args)
         self.assertIn("--latest=false", create_args)
-        self.assertIn("--target 0123456789abcdef0123456789abcdef01234567", create_args)
+        self.assertNotIn("--target", create_args)
+        self.assertNotIn(self.env["GITHUB_SHA"], create_args)
+        self.assertIn("repository default branch", create_args)
+        self.assertIn("not the build source", create_args)
+        self.assertIn("verified stage registries", create_args)
 
     def test_two_gibibyte_asset_is_rejected_before_upload(self):
         with self.artifact.open("wb") as stream:
@@ -296,6 +331,334 @@ class PublicationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("required stage has no artifacts", result.stderr)
         self.assertFalse(self.artifact.exists())
+
+
+    def test_empty_or_missing_artifacts_never_mark_stage_complete(self):
+        self.assertEqual(self.publish().returncode, 0)
+        original = self.read_registry()
+        for value in ([], None, "missing"):
+            with self.subTest(artifacts=value):
+                registry = dict(original)
+                if value == "missing":
+                    registry.pop("artifacts")
+                else:
+                    registry["artifacts"] = value
+                self.write_registry(registry)
+                result = self.stage_complete()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("stage has no artifacts", result.stderr)
+                self.assert_no_temporary_payloads()
+
+    def test_invalid_schema_never_marks_stage_complete(self):
+        self.assertEqual(self.publish().returncode, 0)
+        original = self.read_registry()
+        for schema in (None, 0, 2, "1", True):
+            with self.subTest(schema=schema):
+                registry = dict(original)
+                if schema is None:
+                    registry.pop("schema")
+                else:
+                    registry["schema"] = schema
+                self.write_registry(registry)
+                result = self.stage_complete()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("invalid stage registry", result.stderr)
+
+    def test_stage_completion_checks_bytes_with_or_without_github_digest(self):
+        self.assertEqual(self.publish().returncode, 0)
+        release = self.store / self.release
+        (release / self.asset_name).write_bytes(b"x" * self.artifact.stat().st_size)
+        metadata = release / ".assets.json"
+        for github_digest in (None, "", "sha256:" + self.read_registry()["artifacts"][0]["sha256"]):
+            with self.subTest(digest=github_digest):
+                assets = json.loads(metadata.read_text())
+                assets[self.asset_name]["digest"] = github_digest
+                metadata.write_text(json.dumps(assets))
+                result = self.stage_complete()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("published artifact identity mismatch", result.stderr)
+                self.assert_no_temporary_payloads()
+
+    def test_empty_publish_does_not_create_a_commit_marker(self):
+        self.artifact.unlink()
+        result = self.publish()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stage has no artifacts", result.stderr)
+        self.assertFalse((self.store / self.release).exists())
+        self.assertFalse((self.registry_dir / "registry-clang.json").exists())
+
+    def test_restore_rejects_unsafe_or_invalid_records_before_writing(self):
+        self.assertEqual(self.publish().returncode, 0)
+        original = self.read_registry()
+        self.artifact.unlink()
+        invalid_fields = [
+            ("path", "../escape"), ("path", "/out/clang/escape"),
+            ("path", "out/clang/../../../escape"), ("path", "out//clang/escape"),
+            ("path", "out/clang/./escape"), ("path", "out\\clang\\escape"),
+            ("asset", "../escape"), ("asset", "payload*"),
+            ("asset", "payload[1]"), ("asset", "payload\\escape"),
+            ("asset", "registry-other.json"), ("filename", "different"),
+            ("project", "rust"), ("size", -1), ("size", "17"),
+            ("size", True), ("size", 2 * 1024 * 1024 * 1024),
+            ("sha256", "a" * 63), ("sha256", "z" * 64), ("sha256", []),
+        ]
+        for field, value in invalid_fields:
+            with self.subTest(field=field, value=value):
+                registry = json.loads(json.dumps(original))
+                registry["artifacts"][0][field] = value
+                self.write_registry(registry)
+                result = self.restore()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertFalse(self.artifact.exists())
+                self.assertFalse((self.base / "escape").exists())
+                self.assert_no_temporary_payloads()
+        registry = json.loads(json.dumps(original))
+        registry["artifacts"] = [None]
+        self.write_registry(registry)
+        result = self.restore()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid artifact record", result.stderr)
+
+    def test_restore_rejects_duplicate_paths_and_duplicate_assets(self):
+        self.assertEqual(self.publish().returncode, 0)
+        original = self.read_registry()
+        self.artifact.unlink()
+        for change_path in (False, True):
+            registry = json.loads(json.dumps(original))
+            duplicate = dict(registry["artifacts"][0])
+            if change_path:
+                duplicate["path"] = "out/clang/other.tar.zst"
+                duplicate["filename"] = "other.tar.zst"
+            registry["artifacts"].append(duplicate)
+            self.write_registry(registry)
+            result = self.restore()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("duplicate artifact path or asset", result.stderr)
+            self.assertFalse(self.artifact.exists())
+            self.assertFalse((self.artifact.parent / "other.tar.zst").exists())
+
+    def test_restore_rejects_cross_registry_conflicts_before_writing(self):
+        self.assertEqual(self.publish().returncode, 0)
+        release = self.store / self.release
+        duplicate = dict(self.read_registry(), stage="rust")
+        registry = release / "registry-rust.json"
+        registry.write_text(json.dumps(duplicate))
+        metadata = json.loads((release / ".assets.json").read_text())
+        metadata[registry.name] = {"id": 4000, "state": "uploaded", "size": registry.stat().st_size}
+        (release / ".assets.json").write_text(json.dumps(metadata))
+        self.artifact.unlink()
+        result = self.restore()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("conflicting required output path or asset", result.stderr)
+        self.assertFalse(self.artifact.exists())
+
+    def test_restore_rejects_output_symlinks(self):
+        self.assertEqual(self.publish().returncode, 0)
+        self.artifact.unlink()
+        self.artifact.parent.rmdir()
+        outside = self.base / "outside"
+        outside.mkdir()
+        marker = outside / self.artifact.name
+        marker.write_bytes(b"outside bytes")
+        self.artifact.parent.symlink_to(outside, target_is_directory=True)
+        result = self.restore()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe symlink", result.stderr)
+        self.assertEqual(marker.read_bytes(), b"outside bytes")
+
+    def test_restore_refuses_to_overwrite_conflicting_existing_output(self):
+        self.assertEqual(self.publish().returncode, 0)
+        self.artifact.write_bytes(b"changed local bytes")
+        result = self.restore()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("conflicting existing RBM output", result.stderr)
+        self.assertEqual(self.artifact.read_bytes(), b"changed local bytes")
+        self.assert_no_temporary_payloads()
+
+    def test_restore_verifies_all_payloads_before_restoring_any(self):
+        other = self.artifact.parent / "z-last.tar.zst"
+        other.write_bytes(b"other output")
+        self.assertEqual(self.publish().returncode, 0)
+        registry = self.read_registry()
+        last = registry["artifacts"][-1]
+        (self.store / self.release / last["asset"]).write_bytes(b"x" * last["size"])
+        self.artifact.unlink()
+        other.unlink()
+        result = self.restore()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("published artifact identity mismatch", result.stderr)
+        self.assertFalse(self.artifact.exists())
+        self.assertFalse(other.exists())
+        self.assert_no_temporary_payloads()
+
+    def test_restore_moves_verified_downloads_without_retained_payload_copies(self):
+        original = self.artifact.read_bytes()
+        self.assertEqual(self.publish().returncode, 0)
+        self.artifact.unlink()
+        result = self.restore()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.artifact.read_bytes(), original)
+        self.assertTrue((self.registry_dir / "registry-clang.json").is_file())
+        self.assert_no_temporary_payloads()
+
+    def test_new_upload_is_verified_before_registry_is_published(self):
+        self.env["FAKE_CORRUPT_UPLOAD"] = "1"
+        result = self.publish()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("published artifact identity mismatch", result.stderr)
+        self.assertFalse((self.store / self.release / "registry-clang.json").exists())
+        self.assert_no_temporary_payloads()
+
+    def test_publish_uses_hardlinks_and_cleans_them(self):
+        self.env["FAKE_REQUIRE_HARDLINK"] = "1"
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.artifact.stat().st_nlink, 1)
+        self.assert_no_temporary_payloads()
+        calls = [json.loads(line) for line in (self.store / "calls").read_text().splitlines()]
+        uploads = [Path(call[-1]).name for call in calls if call[1] == "upload"]
+        self.assertEqual(uploads, [self.asset_name, "registry-clang.json"])
+
+    def test_cross_filesystem_copy_fallback_is_cleaned(self):
+        self.env["FAKE_REQUIRE_COPY"] = "1"
+        wrapper = ("import errno, os, runpy; "
+                   "os.link=lambda *a, **kw: (_ for _ in ()).throw(OSError(errno.EXDEV, 'cross-device')); "
+                   f"runpy.run_path({str(HELPER)!r}, run_name='__main__')")
+        result = self.publish(wrapper=wrapper)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_no_temporary_payloads()
+
+    def test_byte_identical_published_rerun_is_a_verified_noop(self):
+        self.assertEqual(self.publish().returncode, 0)
+        release = self.store / self.release
+        committed_bytes = (release / "registry-clang.json").read_bytes()
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Stage already published and fully restored", result.stdout)
+        self.assertEqual((release / "registry-clang.json").read_bytes(), committed_bytes)
+        calls = [json.loads(line) for line in (self.store / "calls").read_text().splitlines()]
+        self.assertEqual(sum(call[1] == "upload" for call in calls), 2)
+        self.assert_no_temporary_payloads()
+
+    def test_published_rerun_verifies_committed_payload_bytes(self):
+        self.assertEqual(self.publish().returncode, 0)
+        release = self.store / self.release
+        (release / self.asset_name).write_bytes(b"x" * self.artifact.stat().st_size)
+        result = self.publish()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("published artifact identity mismatch", result.stderr)
+        self.assert_no_temporary_payloads()
+
+    def test_local_registry_does_not_hide_interrupted_publication(self):
+        self.env["FAKE_UPLOAD_FAILURES"] = "9"
+        failed = self.publish()
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertTrue((self.registry_dir / "registry-clang.json").exists())
+        self.assertFalse((self.store / self.release / "registry-clang.json").exists())
+        prepared_bytes = (self.registry_dir / "registry-clang.json").read_bytes()
+        self.env["FAKE_UPLOAD_FAILURES"] = "0"
+        self.env["GITHUB_SHA"] = "e" * 40
+        self.env["GITHUB_RUN_ID"] = "123456789"
+        self.env["GITHUB_RUN_ATTEMPT"] = "2"
+        resumed = self.publish()
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual((self.store / self.release / "registry-clang.json").read_bytes(),
+                         prepared_bytes)
+        self.assertEqual(self.stage_complete().returncode, 0)
+        self.assert_no_temporary_payloads()
+
+    def test_old_schema_one_registry_without_identity_remains_usable(self):
+        self.assertEqual(self.publish().returncode, 0)
+        registry = self.read_registry()
+        registry.pop("identity")
+        self.write_registry(registry)
+        original_registry_bytes = (self.store / self.release / "registry-clang.json").read_bytes()
+        self.assertEqual(self.stage_complete().returncode, 0)
+        self.artifact.unlink()
+        restored = self.restore_required("clang")
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.before.write_text("out/clang/clang-test.tar.zst\n")
+        rerun = self.publish()
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertEqual((self.store / self.release / "registry-clang.json").read_bytes(),
+                         original_registry_bytes)
+
+    def test_identity_and_project_scoped_pgo_registry_round_trip(self):
+        rust = self.upstream / "out/rust/rust-profiler.tar.zst"
+        rust.parent.mkdir()
+        rust.write_bytes(b"PGO Rust sysroot")
+        identity = {"upstream": json.loads((ROOT / "upstream.lock.json").read_text()),
+                    "kind": "test-profiler-rust", "overlay_sha256": "a" * 64}
+        identity_file = self.base / "identity.json"
+        identity_file.write_text(json.dumps(identity))
+        published = self.run_helper("publish", "--before", str(self.before),
+                                    "--stage", "rust-pgo", "--project", "rust",
+                                    "--identity-file", str(identity_file))
+        self.assertEqual(published.returncode, 0, published.stderr)
+        registry = json.loads((self.store / self.release / "registry-rust-pgo.json").read_text())
+        self.assertEqual(registry["identity"], identity)
+        self.assertEqual([artifact["project"] for artifact in registry["artifacts"]], ["rust"])
+        self.assertFalse((self.store / self.release / self.asset_name).exists())
+        verified = self.stage_complete("rust-pgo", "--identity-file", str(identity_file))
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertNotEqual(self.stage_complete("rust-pgo").returncode, 0)
+        rust.unlink()
+        restored = self.run_helper("restore-required", "--stage", "rust-pgo",
+                                   "--identity-file", str(identity_file))
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertEqual(rust.read_bytes(), b"PGO Rust sysroot")
+        self.assert_no_temporary_payloads()
+
+
+    def test_missing_release_is_incomplete_exit_one(self):
+        result = self.stage_complete()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("dependency Release does not exist", result.stdout)
+
+    def test_inspection_failure_is_not_treated_as_missing_release(self):
+        self.env["FAKE_VIEW_ERROR"] = "authentication failed"
+        result = self.stage_complete()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot inspect dependency Release", result.stderr)
+        self.assertNotIn("does not exist", result.stdout)
+        published = self.publish()
+        self.assertNotEqual(published.returncode, 0)
+        self.assertFalse((self.store / self.release).exists())
+
+    def test_wrong_provenance_is_integrity_exit_two(self):
+        self.assertEqual(self.publish().returncode, 0)
+        registry = self.read_registry()
+        registry["upstream"]["commit"] = "0" * 40
+        self.write_registry(registry)
+        result = self.stage_complete()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("provenance mismatch", result.stderr)
+
+
+    def test_new_release_does_not_require_publisher_ci_environment(self):
+        for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_REPOSITORY"):
+            self.env.pop(key, None)
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--target", (self.store / "create-args").read_text())
+        self.assertEqual(set(self.read_registry()),
+                         {"schema", "stage", "upstream", "identity", "artifacts"})
+
+    def test_publisher_metadata_changes_do_not_rewrite_committed_registry(self):
+        self.assertEqual(self.publish().returncode, 0)
+        registry = self.store / self.release / "registry-clang.json"
+        committed = registry.read_bytes()
+        creation = (self.store / "create-args").read_bytes()
+        self.env.update({"GITHUB_SHA": "untrusted publisher string; --target other",
+                         "GITHUB_RUN_ID": "999999", "GITHUB_RUN_ATTEMPT": "3",
+                         "GITHUB_REPOSITORY": "different/publisher"})
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registry.read_bytes(), committed)
+        self.assertEqual((self.store / "create-args").read_bytes(), creation)
+        calls = [json.loads(line) for line in (self.store / "calls").read_text().splitlines()]
+        self.assertEqual(sum(call[1] == "create" for call in calls), 1)
+        self.assert_no_temporary_payloads()
 
 
 if __name__ == "__main__":

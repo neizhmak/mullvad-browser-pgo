@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Restore and publish immutable RBM outputs using a GitHub Release."""
+"""Restore and publish immutable RBM outputs using a GitHub Release.
+
+stage-complete exit codes: 0 = schema, provenance, metadata and bytes verified;
+1 = Release, registry, or payload is absent/incomplete; 2 = invalid registry,
+provenance/byte conflict, unsafe records, or an inspection/transport failure.
+Callers must not rebuild on exit 2. Other commands fail closed with nonzero.
+"""
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 MAX_RELEASE_ASSET_SIZE = 2 * 1024 * 1024 * 1024
 UPLOAD_TIMEOUT_SECONDS = int(os.environ.get("RBM_UPLOAD_TIMEOUT_SECONDS", 15 * 60))
@@ -36,25 +45,149 @@ def lock(root):
         return json.load(stream)
 
 
+def read_json(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid JSON in {path.name}: {error}")
+
+
+def expected_identity(args, root):
+    identity = read_json(Path(args.identity_file)) if args.identity_file else {"upstream": lock(root)}
+    if not isinstance(identity, dict) or not identity:
+        raise SystemExit("registry identity must be a nonempty JSON object")
+    return identity
+
+
+def registry_identity(data):
+    # Schema 1 official registries predate the explicit identity object.
+    return data.get("identity", {"upstream": data.get("upstream")})
+
+
+def safe_name(name):
+    # Names are passed as exact gh download patterns, not globs or paths.
+    if (not isinstance(name, str) or name in ("", ".", "..")
+            or name.startswith("-") or any(ord(char) < 32 or ord(char) == 127 for char in name)
+            or any(char in name for char in "/\\*?[]#")):
+        raise SystemExit(f"unsafe Release asset or RBM name: {name!r}")
+    return name
+
+
 def safe_output(root, relative):
-    path = Path(relative)
-    if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "out":
+    if not isinstance(relative, str):
+        raise SystemExit(f"unsafe RBM output path in registry: {relative!r}")
+    parts = relative.split("/")
+    if len(parts) < 3 or parts[0] != "out":
         raise SystemExit(f"unsafe RBM output path in registry: {relative}")
-    return root / path
+    output_path = Path(root).resolve()
+    for part in parts:
+        safe_name(part)
+        output_path = output_path / part
+        if output_path.is_symlink():
+            raise SystemExit(f"unsafe symlink in RBM output path: {relative}")
+    return output_path
+
+
+def validate_registry(data, args, root, stage, name, required=False):
+    if (not isinstance(data, dict) or type(data.get("schema")) is not int
+            or data["schema"] != 1 or data.get("stage") != stage):
+        raise SystemExit(f"invalid {'required ' if required else ''}stage registry: {name}")
+    if data.get("upstream") != lock(root) or registry_identity(data) != expected_identity(args, root):
+        raise SystemExit(f"provenance mismatch in {name}")
+    artifacts = data.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise SystemExit(f"{'required ' if required else ''}stage has no artifacts: {name}")
+    paths, assets = set(), set()
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise SystemExit(f"invalid artifact record in {name}")
+        try:
+            output_path = safe_output(args.upstream, artifact["path"])
+            filename = safe_name(artifact["filename"])
+            asset = safe_name(artifact["asset"])
+            size, sha256 = artifact["size"], artifact["sha256"]
+        except KeyError as error:
+            raise SystemExit(f"invalid artifact record in {name}: missing {error}")
+        project = Path(artifact["path"]).parts[1]
+        if output_path.name != filename or artifact.get("project", project) != project:
+            raise SystemExit(f"filename or project mismatch in {name}")
+        if asset.startswith("registry-") and asset.endswith(".json"):
+            raise SystemExit(f"reserved registry asset name in {name}: {asset}")
+        if type(size) is not int or not 0 <= size < MAX_RELEASE_ASSET_SIZE:
+            raise SystemExit(f"invalid artifact size in {name}: {size!r}")
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise SystemExit(f"invalid artifact SHA-256 in {name}")
+        if output_path in paths or asset in assets:
+            raise SystemExit(f"duplicate artifact path or asset in {name}")
+        paths.add(output_path)
+        assets.add(asset)
+    return artifacts
+
+
+def verify_file(path, size, sha256, label):
+    if (path.is_symlink() or not path.is_file() or path.stat().st_size != size
+            or digest(path) != sha256):
+        raise SystemExit(f"{label}: {path.name}")
+
+
+def require_asset(assets, name, size=None, sha256=None):
+    asset = assets.get(name)
+    if not asset or asset.get("state") != "uploaded":
+        raise SystemExit(f"required artifact is missing or incomplete: {name}")
+    actual_size = asset.get("size")
+    if type(actual_size) is not int or actual_size < 0 or (size is not None and actual_size != size):
+        raise SystemExit(f"published artifact identity mismatch (metadata): {name}")
+    github_digest = asset.get("digest")
+    if github_digest not in (None, ""):
+        if (not isinstance(github_digest, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", github_digest)
+                or (sha256 is not None and github_digest != f"sha256:{sha256}")):
+            raise SystemExit(f"published artifact digest mismatch: {name}")
+    return asset
+
+
+def download_registry(args, assets, name, directory):
+    asset = require_asset(assets, name)
+    downloaded = download_asset(args, name, directory)
+    if downloaded.stat().st_size != asset["size"]:
+        raise SystemExit(f"published registry metadata mismatch: {name}")
+    if asset.get("digest") and f"sha256:{digest(downloaded)}" != asset["digest"]:
+        raise SystemExit(f"published registry digest mismatch: {name}")
+    return downloaded, read_json(downloaded)
+
+
+def download_verified(args, assets, artifact, directory):
+    require_asset(assets, artifact["asset"], artifact["size"], artifact["sha256"])
+    downloaded = download_asset(args, artifact["asset"], directory)
+    verify_file(downloaded, artifact["size"], artifact["sha256"],
+                "published artifact identity mismatch")
+    return downloaded
 
 
 def release_exists(repository, release):
-    return subprocess.run(
+    result = subprocess.run(
         ["gh", "release", "view", release, "--repo", repository],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    ).returncode == 0
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    if result.returncode == 0:
+        return True
+    # gh distinguishes its known missing Release message from auth/network errors.
+    if result.returncode == 1 and result.stderr.strip().lower() == "release not found":
+        return False
+    detail = result.stderr.strip() or f"gh exited {result.returncode}"
+    raise SystemExit(f"cannot inspect dependency Release {release}: {detail}")
 
 
 def release_assets(repository, release):
     data = json.loads(output("gh", "release", "view", release, "--repo", repository,
                              "--json", "assets"))
-    return {asset["name"]: {key: asset.get(key) for key in ("name", "id", "state", "size", "digest")}
-            for asset in data["assets"]}
+    assets = {}
+    for asset in data["assets"]:
+        name = safe_name(asset.get("name"))
+        if name in assets:
+            raise SystemExit(f"duplicate Release asset name: {name}")
+        assets[name] = {key: asset.get(key) for key in ("name", "id", "state", "size", "digest")}
+    return assets
 
 
 def delete_incomplete_asset(args, asset):
@@ -66,21 +199,27 @@ def delete_incomplete_asset(args, asset):
         f"repos/{args.repository}/releases/assets/{asset['id']}")
 
 
-def verify_uploaded_asset(args, path, asset):
+def verify_uploaded_asset(args, path, asset, expected=None):
+    size = expected["size"] if expected is not None else path.stat().st_size
+    sha256 = expected["sha256"] if expected is not None else digest(path)
+    verify_file(path, size, sha256, "conflicting existing RBM output")
+    require_asset({asset["name"]: asset}, asset["name"], size, sha256)
     published = download_asset(args, asset["name"], Path(args.registry_dir) / "published")
-    if published.stat().st_size != path.stat().st_size or digest(published) != digest(path):
-        raise SystemExit(f"published artifact identity mismatch: {asset['name']}")
-    print(f"Reusing identical published asset: {asset['name']}")
+    try:
+        verify_file(published, size, sha256, "published artifact identity mismatch")
+    finally:
+        published.unlink(missing_ok=True)
 
 
-def upload_asset(args, path):
-    name = path.name
+def upload_asset(args, path, expected=None):
+    name = safe_name(path.name)
     for attempt in range(1, UPLOAD_ATTEMPTS + 1):
         assets = release_assets(args.repository, args.release)
         existing = assets.get(name)
         if existing:
             if existing["state"] == "uploaded":
-                verify_uploaded_asset(args, path, existing)
+                verify_uploaded_asset(args, path, existing, expected)
+                print(f"Reusing identical published asset: {name}")
                 return existing
             delete_incomplete_asset(args, existing)
         print(f"Uploading {name} (attempt {attempt}/{UPLOAD_ATTEMPTS}, "
@@ -92,6 +231,8 @@ def upload_asset(args, path):
             )
             uploaded = release_assets(args.repository, args.release).get(name)
             if uploaded and uploaded["state"] == "uploaded":
+                verify_uploaded_asset(args, path, uploaded, expected)
+                print(f"Verified published asset: {name}")
                 return uploaded
             reason = "returned without producing an uploaded asset"
         except subprocess.TimeoutExpired:
@@ -104,14 +245,20 @@ def upload_asset(args, path):
 
 
 def download_asset(args, name, directory):
+    safe_name(name)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name
+    if path.is_symlink():
+        raise SystemExit(f"unsafe symlink at Release download path: {path}")
     if path.exists():
+        if not path.is_file():
+            raise SystemExit(f"unsafe Release download destination: {path}")
         path.unlink()
     run("gh", "release", "download", args.release, "--repo", args.repository,
         "--dir", str(directory), "--pattern", name)
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"Release download did not produce a regular file: {name}")
     return path
-
 
 
 def stage_complete(args, root):
@@ -119,133 +266,147 @@ def stage_complete(args, root):
         print(f"Stage {args.stage} is not complete: dependency Release does not exist.")
         return False
     assets = release_assets(args.repository, args.release)
-    registry_name = f"registry-{args.stage}.json"
+    registry_name = f"registry-{safe_name(args.stage)}.json"
     registry_asset = assets.get(registry_name)
     if not registry_asset or registry_asset["state"] != "uploaded":
         print(f"Stage {args.stage} is not complete: {registry_name} is missing or incomplete.")
         return False
-    registry = download_asset(args, registry_name, Path(args.registry_dir) / "completion")
-    data = json.loads(registry.read_text(encoding="utf-8"))
-    if data.get("upstream") != lock(root) or data.get("stage") != args.stage:
-        print(f"Stage {args.stage} is not complete: {registry_name} does not match the locked upstream.")
-        return False
-    for artifact in data.get("artifacts", []):
-        if Path(artifact["path"]).name != artifact["filename"]:
-            print(f"Stage {args.stage} is not complete: filename mismatch in {registry_name}.")
-            return False
-        asset = assets.get(artifact["asset"])
-        if not asset or asset["state"] != "uploaded":
-            print(f"Stage {args.stage} is not complete: {artifact['asset']} is missing or incomplete.")
-            return False
-        if asset["name"] != artifact["asset"] or asset["size"] != artifact["size"]:
-            print(f"Stage {args.stage} is not complete: metadata mismatch for {artifact['asset']}.")
-            return False
-        github_digest = asset.get("digest")
-        if github_digest and github_digest != f"sha256:{artifact['sha256']}":
-            print(f"Stage {args.stage} is not complete: digest mismatch for {artifact['asset']}.")
-            return False
+    directory = Path(args.registry_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".completion-", dir=directory) as temporary:
+        verification_dir = Path(temporary)
+        _, data = download_registry(args, assets, registry_name, verification_dir)
+        artifacts = validate_registry(data, args, root, args.stage, registry_name)
+        for artifact in artifacts:
+            asset = assets.get(artifact["asset"])
+            if not asset or asset["state"] != "uploaded":
+                print(f"Stage {args.stage} is not complete: "
+                      f"{artifact['asset']} is missing or incomplete.")
+                return False
+            # Download even when GitHub supplies a digest: verify committed bytes.
+            downloaded = download_verified(args, assets, artifact, verification_dir)
+            downloaded.unlink()
     print(f"Stage {args.stage} is already complete; skipping RBM build.")
     return True
 
-def restore(args, root):
+
+def restore_registries(args, root, stages=None):
     destination = Path(args.upstream)
     registries = Path(args.registry_dir)
     registries.mkdir(parents=True, exist_ok=True)
     if not release_exists(args.repository, args.release):
+        if stages is not None:
+            raise SystemExit(f"required dependency Release does not exist: {args.release}")
         return
-    for old_registry in registries.glob("registry-*.json"):
-        old_registry.unlink()
-    registry_names = sorted(name for name, asset in release_assets(args.repository, args.release).items()
-                            if name.startswith("registry-") and name.endswith(".json")
-                            and asset["state"] == "uploaded")
-    for name in registry_names:
-        download_asset(args, name, registries)
-    expected_lock = lock(root)
-    for registry in sorted(registries.glob("registry-*.json")):
-        data = json.loads(registry.read_text(encoding="utf-8"))
-        if data.get("upstream") != expected_lock:
-            raise SystemExit(f"provenance mismatch in {registry.name}")
-        for artifact in data.get("artifacts", []):
-            output = safe_output(destination, artifact["path"])
-            asset = download_asset(args, artifact["asset"], registries)
-            if asset.stat().st_size != artifact["size"] or digest(asset) != artifact["sha256"]:
-                raise SystemExit(f"published artifact identity mismatch: {artifact['asset']}")
-            output.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(asset, output)
-            if output.name != artifact["filename"]:
-                raise SystemExit(f"filename mismatch in {registry.name}")
+    assets = release_assets(args.repository, args.release)
+    if stages is None:
+        registry_names = sorted(name for name, asset in assets.items()
+                                if name.startswith("registry-") and name.endswith(".json")
+                                and asset["state"] == "uploaded")
+    else:
+        registry_names = [f"registry-{safe_name(stage)}.json" for stage in stages]
+    records, output_paths, asset_names = [], set(), set()
+    with tempfile.TemporaryDirectory(prefix=".restore-", dir=registries) as temporary:
+        download_dir = Path(temporary)
+        # Validate all records before downloading payloads or changing any out/ path.
+        for registry_name in registry_names:
+            stage = registry_name[len("registry-"):-len(".json")]
+            asset = assets.get(registry_name)
+            if not asset or asset["state"] != "uploaded":
+                raise SystemExit(f"required stage is incomplete: {registry_name}")
+            registry_path = registries / registry_name
+            if registry_path.is_symlink() or (registry_path.exists() and not registry_path.is_file()):
+                raise SystemExit(f"unsafe stage registry destination: {registry_path}")
+            downloaded, data = download_registry(args, assets, registry_name, download_dir)
+            artifacts = validate_registry(data, args, root, stage, registry_name,
+                                          required=stages is not None)
+            records.append((downloaded, artifacts))
+            for artifact in artifacts:
+                output_path = safe_output(destination, artifact["path"])
+                if output_path in output_paths or artifact["asset"] in asset_names:
+                    raise SystemExit(f"conflicting required output path or asset: {artifact['path']}")
+                output_paths.add(output_path)
+                asset_names.add(artifact["asset"])
+                if output_path.exists():
+                    verify_file(output_path, artifact["size"], artifact["sha256"],
+                                "conflicting existing RBM output")
+        planned = []
+        for _, artifacts in records:
+            for artifact in artifacts:
+                downloaded = download_verified(args, assets, artifact, download_dir)
+                output_path = safe_output(destination, artifact["path"])
+                if output_path.exists():
+                    downloaded.unlink()
+                else:
+                    planned.append((downloaded, output_path, artifact))
+        # Do not alter out/ until every registry and payload has passed.
+        for downloaded, output_path, artifact in planned:
+            safe_output(destination, artifact["path"])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if output_path.exists():
+                verify_file(output_path, artifact["size"], artifact["sha256"],
+                            "conflicting existing RBM output")
+                downloaded.unlink()
+                continue
+            shutil.move(downloaded, output_path)
+            print(f"Restored verified RBM output: {output_path}")
+        # Keep commit records for publish's no-op/conflict checks, not payload copies.
+        for downloaded, _ in records:
+            registry = registries / downloaded.name
+            if registry.is_symlink():
+                raise SystemExit(f"unsafe symlink at registry path: {registry}")
+            shutil.move(downloaded, registry)
+    if stages is not None:
+        print("All required RBM stages restored: " + ", ".join(stages))
+    print(f"Removed verified temporary downloads: {download_dir}")
+
+
+def restore(args, root):
+    restore_registries(args, root)
 
 
 def restore_required(args, root):
-    """Atomically validate and restore a caller-supplied set of RBM stages."""
-    destination = Path(args.upstream)
-    registries = Path(args.registry_dir)
-    download_dir = registries / "required"
-    if not release_exists(args.repository, args.release):
-        raise SystemExit(f"required dependency Release does not exist: {args.release}")
-
-    assets = release_assets(args.repository, args.release)
-    expected_lock = lock(root)
-    planned = []
-    output_paths = {}
-    for stage in args.stage:
-        registry_name = f"registry-{stage}.json"
-        registry_asset = assets.get(registry_name)
-        if not registry_asset or registry_asset["state"] != "uploaded":
-            raise SystemExit(f"required stage is incomplete: {registry_name}")
-        registry = download_asset(args, registry_name, download_dir)
-        data = json.loads(registry.read_text(encoding="utf-8"))
-        if data.get("schema") != 1 or data.get("stage") != stage:
-            raise SystemExit(f"invalid required stage registry: {registry_name}")
-        if data.get("upstream") != expected_lock:
-            raise SystemExit(f"provenance mismatch in {registry_name}")
-        artifacts = data.get("artifacts")
-        if not isinstance(artifacts, list) or not artifacts:
-            raise SystemExit(f"required stage has no artifacts: {registry_name}")
-        for artifact in artifacts:
-            try:
-                output_path = safe_output(destination, artifact["path"])
-                filename = artifact["filename"]
-                asset_name = artifact["asset"]
-                size = artifact["size"]
-                sha256 = artifact["sha256"]
-            except (KeyError, TypeError) as error:
-                raise SystemExit(f"invalid artifact record in {registry_name}: {error}")
-            if output_path.name != filename or Path(asset_name).name != asset_name:
-                raise SystemExit(f"filename mismatch in {registry_name}")
-            identity = (asset_name, size, sha256)
-            if output_path in output_paths:
-                raise SystemExit(f"conflicting required output path: {artifact['path']}")
-            output_paths[output_path] = identity
-            release_asset = assets.get(asset_name)
-            if (not release_asset or release_asset["state"] != "uploaded"
-                    or release_asset["size"] != size):
-                raise SystemExit(f"required artifact is missing or incomplete: {asset_name}")
-            downloaded = download_asset(args, asset_name, download_dir)
-            if downloaded.stat().st_size != size or digest(downloaded) != sha256:
-                raise SystemExit(f"published artifact identity mismatch: {asset_name}")
-            if (output_path.exists()
-                    and (output_path.stat().st_size != size or digest(output_path) != sha256)):
-                raise SystemExit(f"conflicting existing RBM output: {output_path}")
-            planned.append((downloaded, output_path, sha256))
-
-    # Do not alter out/ until every required registry and artifact has passed.
-    for downloaded, output_path, sha256 in planned:
-        if output_path.exists():
-            print(f"Already restored verified RBM output: {output_path}")
-            continue
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(downloaded, output_path)
-        print(f"Restored verified RBM output: {output_path}")
-    print("All required RBM stages restored: " + ", ".join(args.stage))
-    shutil.rmtree(download_dir)
-    print(f"Removed verified temporary downloads: {download_dir}")
+    """Validate all required records and bytes before restoring outputs."""
+    restore_registries(args, root, args.stage)
 
 
 def snapshot(args):
     upstream = Path(args.upstream)
-    paths = sorted(str(path.relative_to(upstream)) for path in (upstream / "out").glob("**/*") if path.is_file())
+    paths = sorted(str(path.relative_to(upstream)) for path in (upstream / "out").glob("**/*")
+                   if path.is_file())
+    for relative in paths:
+        safe_output(upstream, relative)
     Path(args.file).write_text("\n".join(paths) + ("\n" if paths else ""), encoding="utf-8")
+
+
+def temporary_upload(source, destination):
+    """Use a temporary hardlink, copying only when the filesystem cannot link."""
+    try:
+        os.link(source, destination)
+    except OSError as error:
+        if error.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES, errno.ENOTSUP):
+            raise
+        shutil.copyfile(source, destination)
+
+
+def verify_committed_stage(args, root, assets, registry_name, registry, paths):
+    with tempfile.TemporaryDirectory(prefix=".committed-", dir=registry.parent) as temporary:
+        directory = Path(temporary)
+        downloaded_registry, data = download_registry(args, assets, registry_name, directory)
+        artifacts = validate_registry(data, args, root, args.stage, registry_name)
+        registered_paths = {safe_output(args.upstream, artifact["path"]) for artifact in artifacts}
+        if any(path.resolve() not in registered_paths for path in paths):
+            raise SystemExit(f"registered stage unexpectedly produced new outputs: {args.stage}")
+        for artifact in artifacts:
+            if args.project and artifact.get("project", Path(artifact["path"]).parts[1]) != args.project:
+                raise SystemExit(f"registered stage has unexpected RBM project: {args.stage}")
+            output_path = safe_output(args.upstream, artifact["path"])
+            verify_file(output_path, artifact["size"], artifact["sha256"],
+                        "conflicting existing RBM output")
+            downloaded = download_verified(args, assets, artifact, directory)
+            downloaded.unlink()
+        shutil.copyfile(downloaded_registry, registry)
+    print(f"Stage already published and fully restored: {args.stage}")
 
 
 def publish(args, root):
@@ -253,44 +414,80 @@ def publish(args, root):
     before = set(Path(args.before).read_text(encoding="utf-8").splitlines())
     paths = sorted(path for path in (upstream / "out").glob("**/*")
                    if path.is_file() and str(path.relative_to(upstream)) not in before)
+    if args.project:
+        safe_name(args.project)
+        paths = [path for path in paths
+                 if path.relative_to(upstream).parts[1] == args.project]
     provenance = lock(root)
+    identity = expected_identity(args, root)
     artifacts = []
     for path in paths:
+        relative = str(path.relative_to(upstream))
+        safe_output(upstream, relative)
         size = path.stat().st_size
         if size >= MAX_RELEASE_ASSET_SIZE:
             raise SystemExit(
                 f"RBM artifact is too large for a GitHub Release asset "
                 f"({size} bytes; must be below 2 GiB): {path}"
             )
-        relative = str(path.relative_to(upstream))
         project = Path(relative).parts[1]
         asset = f"rbm-{provenance['commit'][:12]}--{project}--{path.name}"
         artifacts.append({"project": project, "filename": path.name, "path": relative,
                           "asset": asset, "sha256": digest(path), "size": size})
-    registry = Path(args.registry_dir) / f"registry-{args.stage}.json"
+    registry_name = f"registry-{safe_name(args.stage)}.json"
+    registry = Path(args.registry_dir) / registry_name
     registry.parent.mkdir(parents=True, exist_ok=True)
-    if registry.exists():
-        existing = json.loads(registry.read_text(encoding="utf-8"))
-        if existing.get("upstream") != provenance or existing.get("stage") != args.stage:
-            raise SystemExit(f"existing stage registry identity mismatch: {registry.name}")
-        if paths:
-            raise SystemExit(f"registered stage unexpectedly produced new outputs: {args.stage}")
-        print(f"Stage already published and fully restored: {args.stage}")
+    if registry.is_symlink() or (registry.exists() and not registry.is_file()):
+        raise SystemExit(f"unsafe stage registry destination: {registry}")
+    exists = release_exists(args.repository, args.release)
+    assets = release_assets(args.repository, args.release) if exists else {}
+    committed = assets.get(registry_name)
+    if committed and committed["state"] == "uploaded":
+        verify_committed_stage(args, root, assets, registry_name, registry, paths)
         return
-    registry.write_text(json.dumps({"schema": 1, "stage": args.stage,
-                                    "upstream": provenance, "artifacts": artifacts},
-                                   indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    if not release_exists(args.repository, args.release):
+    # A local registry is not a commit marker. Resume an interrupted upload only
+    # after validating its records and all currently present payloads.
+    if registry.exists():
+        data = read_json(registry)
+        recorded = validate_registry(data, args, root, args.stage, registry_name)
+        if artifacts and artifacts != recorded:
+            raise SystemExit(f"existing stage registry identity mismatch: {registry_name}")
+        artifacts = recorded
+        paths = [safe_output(upstream, artifact["path"]) for artifact in artifacts]
+        for path, artifact in zip(paths, artifacts):
+            verify_file(path, artifact["size"], artifact["sha256"],
+                        "conflicting existing RBM output")
+    data = {"schema": 1, "stage": args.stage, "upstream": provenance,
+            "identity": identity, "artifacts": artifacts}
+    validate_registry(data, args, root, args.stage, registry_name)
+    if args.project and any(artifact.get("project", Path(artifact["path"]).parts[1]) != args.project
+                            for artifact in artifacts):
+        raise SystemExit(f"unexpected RBM project in stage registry: {args.stage}")
+    registry.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if not exists:
+        # Let GitHub anchor new technical tags to the default branch. Targeting
+        # a feature/workflow commit can require a workflow scope unavailable to
+        # GITHUB_TOKEN, even with contents:write. This tag is a cache index, not
+        # build provenance; the independently verified registry binds the inputs.
+        # Existing tags/releases are never retargeted.
         run("gh", "release", "create", args.release, "--repo", args.repository,
             "--title", f"RBM dependencies for {provenance['tag']}",
-            "--notes", "Unmodified outputs produced by the pinned official RBM recipes.",
-            "--prerelease", "--latest=false", "--target", os.environ["GITHUB_SHA"])
-    # The registry is uploaded last: it is the commit record for this stage.
-    for path, artifact in zip(paths, artifacts):
-        upload = registry.parent / artifact["asset"]
-        shutil.copyfile(path, upload)
-        upload_asset(args, upload)
-    # The stage registry remains the commit record and must always be uploaded last.
+            "--notes", "New technical tags use the repository default branch as a storage/index "
+                       "anchor, not the build source. Build input and artifact provenance is "
+                       "recorded in the verified stage registries. Existing tags are never retargeted.",
+            "--prerelease", "--latest=false")
+    # Upload and verify each payload without retaining a second local output tree.
+    with tempfile.TemporaryDirectory(prefix=".uploads-", dir=registry.parent) as temporary:
+        for path, artifact in zip(paths, artifacts):
+            verify_file(path, artifact["size"], artifact["sha256"],
+                        "conflicting existing RBM output")
+            upload = Path(temporary) / artifact["asset"]
+            try:
+                temporary_upload(path, upload)
+                upload_asset(args, upload, artifact)
+            finally:
+                upload.unlink(missing_ok=True)
+    # The stage registry remains the commit record and must be uploaded last.
     upload_asset(args, registry)
 
 
@@ -304,15 +501,24 @@ def main():
     parser.add_argument("--registry-dir", default=os.environ.get("RUNNER_TEMP", "/tmp") + "/rbm-registry")
     parser.add_argument("--file")
     parser.add_argument("--before")
+    parser.add_argument("--identity-file", help="exact registry identity/provenance JSON")
+    parser.add_argument("--project", help="publish only new outputs from this RBM project")
     parser.add_argument("--stage", action="append")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     if args.command in ("stage-complete", "restore", "restore-required", "publish") and (not args.repository or not args.release):
         parser.error("repository and release are required")
     if args.command == "stage-complete":
-        if not args.stage: parser.error("stage-complete requires --stage")
+        if not args.stage or len(args.stage) != 1:
+            parser.error("stage-complete requires exactly one --stage")
         args.stage = args.stage[0]
-        raise SystemExit(0 if stage_complete(args, root) else 1)
+        try:
+            complete = stage_complete(args, root)
+        except (SystemExit, OSError, ValueError, KeyError, TypeError,
+                subprocess.SubprocessError) as error:
+            print(str(error), file=sys.stderr)
+            raise SystemExit(2)
+        raise SystemExit(0 if complete else 1)
     if args.command == "restore": restore(args, root)
     elif args.command == "restore-required":
         if not args.stage: parser.error("restore-required requires --stage")
@@ -322,7 +528,8 @@ def main():
         if not args.file: parser.error("snapshot requires --file")
         snapshot(args)
     else:
-        if not args.before or not args.stage: parser.error("publish requires --before and --stage")
+        if not args.before or not args.stage or len(args.stage) != 1:
+            parser.error("publish requires --before and exactly one --stage")
         args.stage = args.stage[0]
         publish(args, root)
 

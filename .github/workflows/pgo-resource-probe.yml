@@ -1,0 +1,86 @@
+name: Probe exact RBM resource authority (not a browser build)
+on:
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  resource-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Initialize pinned source probe
+        run: |
+          echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
+      - name: Install RBM requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdata-dump-perl libdata-uuid-perl libdatetime-perl libdigest-sha-perl libfile-copy-recursive-perl libfile-slurp-perl libio-all-perl libcapture-tiny-perl libio-handle-util-perl libjson-perl libparallel-forkmanager-perl libpath-tiny-perl libsort-versions-perl libstring-shellquote-perl libtemplate-perl libxml-libxml-perl libxml-writer-perl libyaml-libyaml-perl git uidmap zstd jq
+      - name: Prepare and validate RBM user namespaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_user="$(id -un)"
+          echo "RBM build user: $build_user (uid=$(id -u) gid=$(id -g))"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          missing_files=()
+          for map_file in /etc/subuid /etc/subgid; do
+            if ! awk -F: -v user="$build_user" '$1 == user && $3 > 0 { found = 1 } END { exit !found }' "$map_file"; then
+              missing_files+=("$map_file")
+            fi
+          done
+          if (( ${#missing_files[@]} )); then
+            range_start="$(python3 - <<'PYNS'
+          from pathlib import Path
+          size = 65536
+          ranges = []
+          for filename in ('/etc/subuid', '/etc/subgid'):
+              for line in Path(filename).read_text().splitlines():
+                  fields = line.split(':')
+                  if len(fields) != 3:
+                      continue
+                  try:
+                      start, length = map(int, fields[1:])
+                  except ValueError:
+                      continue
+                  if length > 0:
+                      ranges.append((start, start + length))
+          candidate = 100000
+          while True:
+              end = candidate + size
+              conflicts = [stop for start, stop in ranges if candidate < stop and start < end]
+              if not conflicts:
+                  print(candidate)
+                  break
+              candidate = max(conflicts)
+          PYNS
+            )"
+            for map_file in "${missing_files[@]}"; do
+              printf '%s:%s:65536\n' "$build_user" "$range_start" | sudo tee -a "$map_file" >/dev/null
+            done
+          fi
+          sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          awk -F: -v user="$build_user" '$1 == user' /etc/subuid | sed 's/^/subuid: /'
+          awk -F: -v user="$build_user" '$1 == user' /etc/subgid | sed 's/^/subgid: /'
+      - name: Fetch exact source and RBM only
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
+          git -C "$UPSTREAM" submodule update --init rbm
+      - name: Probe exact RBM source and namespace controllers
+        timeout-minutes: 4
+        run: python3 ./scripts/probe-rbm-resource-control.py --upstream "$UPSTREAM" --output-directory "$RUNNER_TEMP/rbm-resource-probe"
+      - name: Preserve public source and partial controller evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-rbm-resource-probe
+          path: ${{ runner.temp }}/rbm-resource-probe/
+          if-no-files-found: warn

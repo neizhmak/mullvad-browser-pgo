@@ -1,0 +1,110 @@
+name: Lightweight pipeline checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      baseline_smoke:
+        description: Verify the offline harness against the authenticated same-lock native baseline
+        type: boolean
+        default: true
+      baseline_diagnostics:
+        description: Preserve native navigation logs for a baseline-only diagnostic run (not a performance comparison)
+        type: boolean
+        default: false
+      telemetry_smoke:
+        description: Verify durable resource Checks after publisher death (not a browser build)
+        type: boolean
+        default: false
+      resource_probe:
+        description: Probe exact RBM source and CPU authority only (not a browser build or PGO validation)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  resource-probe:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.resource_probe }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/pgo-resource-probe.yml
+  telemetry-smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.telemetry_smoke }}
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+    uses: ./.github/workflows/pgo-diagnostics.yml
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native recipe test requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtemplate-perl libyaml-libyaml-perl openssl libpath-tiny-perl
+          command -v pwsh
+      - name: Run every lightweight suite and syntax check
+        run: python3 scripts/run-tests.py
+      - name: Validate workflow expressions
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
+            -ignore '"steps" section is missing' \
+            -ignore '"steps" section must be sequence node'
+  windows-native:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Parse all PowerShell entry points natively
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in Get-ChildItem scripts -Filter '*.ps1') {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) { throw ($errors | Out-String) }
+          }
+      - name: Test native Windows process isolation and package contracts
+        shell: pwsh
+        run: |
+          python tests/test_windows_runtime.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/test_baseline_harness.py -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  baseline-smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.baseline_smoke }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Restore authenticated same-lock baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: python scripts/windows-runtime-check.py prepare-baseline --output-directory "$env:RUNNER_TEMP/baseline-smoke" --repository "$env:GITHUB_REPOSITORY"
+      - name: Validate offline harness on the real stock Windows browser
+        env:
+          BASELINE_DIAGNOSTICS: ${{ inputs.baseline_diagnostics }}
+        shell: pwsh
+        run: |
+          $options = @()
+          if ($env:BASELINE_DIAGNOSTICS -eq 'true') { $options += '--browser-diagnostics' }
+          python scripts/check-baseline-harness.py --baseline-directory "$env:RUNNER_TEMP/baseline-smoke" --output-directory "$env:RUNNER_TEMP/baseline-harness" @options
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve actual baseline screenshots, raw results and native logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-offline-harness-report
+          path: ${{ runner.temp }}/baseline-harness/
+          if-no-files-found: warn

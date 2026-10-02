@@ -1,0 +1,46 @@
+name: Smoke-test durable RBM resource telemetry
+on:
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  telemetry-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Start acknowledged diagnostic-only telemetry
+        timeout-minutes: 1
+        env:
+          PGO_TELEMETRY_TOKEN: ${{ github.token }}
+        run: |
+          python3 ./scripts/publish-rbm-telemetry.py start \
+            --resource-log "$RUNNER_TEMP/pgo-telemetry-smoke-resources.jsonl" \
+            --state "$RUNNER_TEMP/pgo-telemetry-smoke-state.json" \
+            --repository "$GITHUB_REPOSITORY" --head "$GITHUB_SHA" \
+            --run "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --job "$GITHUB_JOB" --interval 5
+      - name: Capture real resources and kill only the verified publisher
+        timeout-minutes: 2
+        run: |
+          python3 ./tests/smoke-rbm-telemetry.py capture \
+            --resource-log "$RUNNER_TEMP/pgo-telemetry-smoke-resources.jsonl" \
+            --state "$RUNNER_TEMP/pgo-telemetry-smoke-state.json" \
+            --evidence "$RUNNER_TEMP/pgo-telemetry-smoke-evidence.json" \
+            --work "$RUNNER_TEMP/pgo-telemetry-smoke-work" --deadline 60
+      - name: Independently verify last remote ACK survives publisher death
+        timeout-minutes: 1
+        env:
+          PGO_TELEMETRY_TOKEN: ${{ github.token }}
+        run: |
+          python3 ./tests/smoke-rbm-telemetry.py verify \
+            --state "$RUNNER_TEMP/pgo-telemetry-smoke-state.json" \
+            --evidence "$RUNNER_TEMP/pgo-telemetry-smoke-evidence.json"
