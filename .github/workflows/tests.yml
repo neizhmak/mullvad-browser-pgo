@@ -16,10 +16,19 @@ on:
         description: Verify durable resource Checks after publisher death (not a browser build)
         type: boolean
         default: false
+      resource_probe:
+        description: Probe exact RBM source and CPU authority only (not a browser build or PGO validation)
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
 jobs:
+  resource-probe:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.resource_probe }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/pgo-resource-probe.yml
   telemetry-smoke:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.telemetry_smoke }}
     permissions:

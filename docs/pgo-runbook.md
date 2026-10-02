@@ -97,6 +97,49 @@ diagnostic channel, not the PGO pipeline. No PAT, signing key, or custom artifac
 SDK is needed. Checks retention follows the repository's GitHub retention rules;
 copy useful evidence promptly.
 
+## Resource-control authority probe
+
+Run `36985220391` retained a real OOM-kill counter increase during runner
+shutdown. Available memory and swap were nearly exhausted. The OOM victim and
+the exact cause of runner shutdown remain unknown. SIGTERM/exit 143 does not
+identify the process killed by OOM. Do not attribute earlier lost-runner runs
+to OOM from this later evidence.
+
+Before changing production build concurrency, run the short source/controller
+probe through the registered lightweight workflow:
+
+```sh
+gh workflow run tests.yml --ref codex/complete-windows-alpha-pgo \
+  -f baseline_smoke=false -f telemetry_smoke=false -f resource_probe=true
+```
+
+The probe uses one standard Ubuntu runner with a 15-minute job deadline. It
+fetches the unchanged locked upstream and its exact RBM submodule. It records
+source hashes and tests `num_procs`, `nproc`, and inherited CPU affinity for the
+current mask, a two-job controller environment, two allowed CPUs, and one
+allowed CPU. The actual RBM namespace command runs with networking disabled.
+It does not build a browser or compiler, download compiler archives, clone
+Firefox, publish releases, or change the production build command. The
+`pgo-rbm-resource-probe` artifact can retain exact source evidence even when a
+later runtime probe fails.
+
+This is an authority probe, not full build validation. Its no-chroot namespace
+check does not prove behavior inside the real build image. It also does not
+validate selected filenames, cache identities, compiler bytes, PGO flags, or a
+completed browser. Those checks need the exact restored inputs before any
+heavy compilation. Compare uncapped/two-CPU/one-CPU selected filenames and the
+bound Rust, Node, and compiler identities without changing source, overlays,
+workloads, or C++/Rust PGO flags. Missing inputs or any identity mismatch must
+stop before compilation, not trigger a rebuild or source substitution.
+
+Two workers are a candidate for one bounded generation attempt only after
+these checks pass. CPU affinity is not a memory limit. One large Rust compiler
+or linker can still exceed available memory, and no completed instrumented
+build duration is known. Keep the 285-minute Firefox step and 360-minute job
+limits. Do not automatically retry with one worker or disable either PGO
+language. Scheduling or compression can change archive bytes; bind the actual
+archive hash rather than claim byte-identical output.
+
 ## Re-run boundaries
 
 1. Dispatch `pgo-stage4a.yml -f toolchain_only=true` to test Rust alone. The
