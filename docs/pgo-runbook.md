@@ -50,8 +50,13 @@ timeout/reset/low-speed error. The observed Git RPC form is allowed only when
 one explicit transient HTTP/curl-22 failure with matching status codes has one
 `fatal: expected 'packfile'` companion and the same official RBM clone URL.
 A packfile error alone or mixed integrity/ref/certificate errors is fatal.
-Retries wait 10 then 30 seconds and record their diagnostics on stderr. The URL, commit, arguments, targets, and environment stay
-unchanged. Authentication, certificate, missing-ref, hash, and signature failures
+Retries wait 10 then 30 seconds and record their diagnostics on stderr. PGO
+shell metadata calls use the same helper through its CLI, including overlay
+rendering, preflight, generation output selection, and profile-use packaging.
+The CLI preserves successful rendered stdout; failed stdout is diagnostic only.
+Python identity callers keep their existing whitespace-normalized output.
+The URL, commit, arguments, targets, working directory, and environment stay
+unchanged. Actual compiler builds are not retried by this helper. Authentication, certificate, missing-ref, hash, and signature failures
 stop immediately. A fetch failure never counts as cache absence and never
 permits a compiler rebuild.
 

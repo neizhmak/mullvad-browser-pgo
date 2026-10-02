@@ -45,7 +45,7 @@ for source_name, suffix in [('merged.profdata', 'profdata'), ('jarlog', 'jarlog'
 PY_INPUTS
 common=(--target alpha --target mullvadbrowser-windows-x86_64)
 use=("${common[@]}" --target pgo-use)
-get() { (cd "$UPSTREAM" && ./rbm/rbm showconf "$1" "$2" "${@:3}"); }
+get() { (cd "$UPSTREAM" && python3 "$root/scripts/rbm_network.py" --upstream "$PWD" --project "$1" --key "$2" "${@:3}"); }
 rust_generate="$(get rust filename "${common[@]}" --target pgo-generate)"
 rust_use="$(get rust filename "${use[@]}")"
 firefox_rust="$(get firefox input_files_by_name/rust "${use[@]}")"

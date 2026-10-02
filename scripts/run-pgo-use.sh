@@ -18,7 +18,7 @@ python3 "$root/scripts/profile-artifacts.py" validate --directory "$profile"
 export PGO_PROFILE_SHA256="$(sha256sum "$profile/merged.profdata" | cut -d' ' -f1)"
 export PGO_JARLOG_SHA256="$(sha256sum "$profile/jarlog" | cut -d' ' -f1)"
 args=(--target alpha --target mullvadbrowser-windows-x86_64 --target pgo-use)
-get() { (cd "$UPSTREAM" && ./rbm/rbm showconf "$1" "$2" "${args[@]}"); }
+get() { (cd "$UPSTREAM" && python3 "$root/scripts/rbm_network.py" --upstream "$PWD" --project "$1" --key "$2" "${args[@]}"); }
 selected_directory() {
   local project="$1" filename="$2"
   [[ "$filename" =~ ^[a-zA-Z0-9._-]+$ ]] || { echo 'unsafe RBM output filename' >&2; exit 1; }

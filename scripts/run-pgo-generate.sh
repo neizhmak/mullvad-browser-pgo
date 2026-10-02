@@ -25,7 +25,7 @@ grep -E -- '-C[[:space:]]*profile-generate(=|[[:space:]]|$)' "$project_log" >/de
 if grep -F -- '--enable-profile-use' "$project_log"; then
   echo 'profile-use was accidentally enabled' >&2; exit 1
 fi
-filename="$(./rbm/rbm showconf firefox filename "${common[@]}")"
+filename="$(python3 "$root/scripts/rbm_network.py" --upstream "$PWD" --project firefox --key filename "${common[@]}")"
 [[ -n "$filename" && "$filename" != */* ]] || { echo 'invalid Firefox RBM output filename' >&2; exit 1; }
 output="$UPSTREAM/out/firefox/$filename"
 # Official Firefox output is a directory containing multiple archives, including

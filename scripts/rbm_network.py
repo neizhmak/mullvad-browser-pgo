@@ -5,6 +5,7 @@ HTTP/RPC + expected-packfile signature was observed on October 2. No other
 URL, integrity failure, source selection, compiler build, or showconf error
 is retried.
 """
+import argparse
 from pathlib import Path
 import re
 import subprocess
@@ -68,12 +69,25 @@ def _retryable(stderr, stdout):
                       or (not fatal and rpc == packfile == 1))
 
 
-def showconf(upstream, project, key, targets, *, pause=None) -> str:
+def _relay_stderr(data):
+    buffer = getattr(sys.stderr, "buffer", None)
+    if isinstance(data, bytes) and buffer is not None:
+        sys.stderr.flush()
+        buffer.write(data)
+        buffer.flush()
+    else:
+        sys.stderr.write(data.decode("utf-8", "surrogateescape") if isinstance(data, bytes) else data)
+        sys.stderr.flush()
+
+
+def showconf(upstream, project, key, targets, *, pause=None, raw_output=False) -> str:
     """Run unchanged RBM showconf; retry only the exact config clone failure.
 
     ``pause`` is injectable for native tests. Production waits 10 then 30
     seconds, at most three attempts. A failed command's stdout is never an
     identity; the final CalledProcessError retains its native exit and argv.
+    ``raw_output=True`` returns lossless rendering text without newline conversion
+    (UTF-8/surrogateescape); its failed CalledProcessError streams stay bytes.
     """
     upstream = Path(upstream)
     command = [str(upstream / "rbm/rbm"), "showconf", project, key]
@@ -82,23 +96,24 @@ def showconf(upstream, project, key, targets, *, pause=None) -> str:
     if pause is None:
         pause = time.sleep
     for attempt in range(1, 4):
-        result = subprocess.run(command, cwd=upstream, text=True,
+        result = subprocess.run(command, cwd=upstream, text=not raw_output,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout = result.stdout.decode("utf-8", "surrogateescape") if raw_output else result.stdout
+        stderr = result.stderr.decode("utf-8", "surrogateescape") if raw_output else result.stderr
         if result.stderr:
-            sys.stderr.write(result.stderr)
-            sys.stderr.flush()
+            _relay_stderr(result.stderr)
         if result.returncode == 0:
-            return result.stdout.strip()
-        if result.stderr and not result.stderr.endswith("\n"):
+            return stdout if raw_output else stdout.strip()
+        if stderr and not stderr.endswith("\n"):
             sys.stderr.write("\n")
         # RBM can put clone diagnostics on stdout. Retain failed output only
         # on stderr; it must never become the returned source/tool identity.
         if result.stdout:
-            sys.stderr.write(result.stdout)
-            if not result.stdout.endswith("\n"):
+            _relay_stderr(result.stdout)
+            if not stdout.endswith("\n"):
                 sys.stderr.write("\n")
             sys.stderr.flush()
-        retryable = result.returncode > 0 and _retryable(result.stderr, result.stdout)
+        retryable = result.returncode > 0 and _retryable(stderr, stdout)
         if retryable and attempt < 3:
             delay = (10, 30)[attempt - 1]
             print(f"RBM showconf attempt {attempt}/3 failed (exit {result.returncode}); "
@@ -111,3 +126,31 @@ def showconf(upstream, project, key, targets, *, pause=None) -> str:
                   f"{reason}.", file=sys.stderr, flush=True)
             raise subprocess.CalledProcessError(result.returncode, command,
                                                 output=result.stdout, stderr=result.stderr)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--upstream", type=Path, required=True)
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--key", required=True)
+    parser.add_argument("--target", action="append", default=[])
+    args = parser.parse_args(argv)
+    try:
+        rendering = showconf(args.upstream.resolve(), args.project, args.key, args.target, raw_output=True)
+    except subprocess.CalledProcessError as error:
+        # showconf already relayed both failed streams to stderr. Shell callers
+        # get the native exit (or conventional 128+signal), never a traceback.
+        return 128 - error.returncode if error.returncode < 0 else error.returncode
+    except OSError as error:
+        print(f"RBM showconf could not start: {error}", file=sys.stderr)
+        return 1
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(rendering.encode("utf-8", "surrogateescape"))
+    else:
+        sys.stdout.write(rendering)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

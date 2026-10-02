@@ -90,6 +90,32 @@ class RetryUnitTests(unittest.TestCase):
         self.assertIn(stdout, result["stderr"])
         return result
 
+    def test_raw_output_keeps_bytes_losslessly_and_preserves_failed_native_streams(self):
+        raw = b" \t#!/bin/bash\r\nprintf '\xff'\r\n\n  "
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(rbm_network.subprocess, "run", return_value=outcome(0, raw, b"")) as run:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rendering = rbm_network.showconf(self.upstream, "rust", "filename", TARGETS,
+                                                raw_output=True)
+        self.assertEqual(rendering.encode("utf-8", "surrogateescape"), raw)
+        self.assertFalse(run.call_args.kwargs["text"])
+        self.assertEqual(stdout.getvalue(), "")
+        failed_stdout = b"partial raw output \xff\r\n"
+        failed_stderr = b"Error: SHA256 checksum mismatch\r\n"
+        pauses = []
+        with mock.patch.object(rbm_network.subprocess, "run", return_value=outcome(7, failed_stdout, failed_stderr)):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                with self.assertRaises(subprocess.CalledProcessError) as caught:
+                    rbm_network.showconf(self.upstream, "rust", "filename", TARGETS,
+                                         raw_output=True, pause=pauses.append)
+        self.assertEqual(caught.exception.returncode, 7)
+        self.assertEqual(caught.exception.cmd, self.command)
+        self.assertEqual(caught.exception.output, failed_stdout)
+        self.assertEqual(caught.exception.stderr, failed_stderr)
+        self.assertEqual(pauses, [])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(failed_stdout.decode("utf-8", "surrogateescape"), stderr.getvalue())
+
     def test_success_keeps_exact_argv_cwd_stripping_and_stderr_without_ci_env(self):
         for targets in (TARGETS, TARGETS[:2], []):
             with self.subTest(targets=targets), mock.patch.dict(os.environ, {}, clear=True):
@@ -495,6 +521,192 @@ class NativeProcessTests(unittest.TestCase):
         self.assertIn("retry limit reached", result.stderr)
         for suffix in ("one", "two", "final"):
             self.assertIn(f"bad identity {suffix}\n", result.stderr)
+
+
+
+FAKE_CLI_RBM = r"""import json, os, signal, sys
+from pathlib import Path
+state = Path(os.environ['CLI_STATE'])
+number = int(state.read_text()) if state.exists() else 0
+state.write_text(str(number + 1))
+with open(os.environ['CLI_CALLS'], 'a') as stream:
+    stream.write(json.dumps({'binary': sys.argv[0], 'args': sys.argv[1:], 'cwd': str(Path.cwd()),
+                            'pwd': os.environ.get('PWD'),
+                            'inherited': os.environ.get('CLI_INHERITED')}) + '\n')
+result = json.loads(Path(os.environ['CLI_RESULTS']).read_text())[number]
+sys.stdout.buffer.write(bytes.fromhex(result['stdout_hex']))
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write(bytes.fromhex(result['stderr_hex']))
+sys.stderr.buffer.flush()
+if result.get('signal'):
+    os.kill(os.getpid(), result['signal'])
+sys.exit(result['returncode'])
+"""
+
+FAKE_CLOCK_CLI = r"""import os, runpy, sys, time
+from pathlib import Path
+def pause(delay):
+    with open(os.environ['CLI_PAUSES'], 'a') as stream:
+        stream.write(str(delay) + '\n')
+time.sleep = pause
+script, *arguments = sys.argv[1:]
+sys.argv = [script, *arguments]
+runpy.run_path(script, run_name='__main__')
+"""
+
+
+class NativeCliTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="rbm-network-cli-tests-")
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.launcher = self.base / "launcher directory"
+        self.launcher.mkdir()
+        self.upstream = self.base / "upstream with spaces"
+        self.rbm = self.upstream / "rbm/rbm"
+        self.rbm.parent.mkdir(parents=True)
+        self.rbm.write_text(f"#!{sys.executable}\n" + FAKE_CLI_RBM)
+        self.rbm.chmod(0o755)
+        self.clock = self.base / "fake-clock-cli.py"
+        self.clock.write_text(FAKE_CLOCK_CLI)
+        self.results = self.base / "cli-results.json"
+        self.calls = self.base / "cli-calls.jsonl"
+        self.state = self.base / "cli-state"
+        self.pauses = self.base / "cli-pauses.txt"
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith("GITHUB_") and key != "CI"}
+        self.env.update({"CLI_RESULTS": str(self.results), "CLI_CALLS": str(self.calls),
+                         "CLI_STATE": str(self.state), "CLI_PAUSES": str(self.pauses),
+                         "CLI_INHERITED": "unchanged inherited environment / value",
+                         "PWD": str(self.launcher), "PYTHONDONTWRITEBYTECODE": "1"})
+
+    def run_cli(self, outcomes, *, targets=TARGETS, fake_clock=False, extra=(), upstream=None):
+        for path in (self.calls, self.state, self.pauses):
+            if path.exists():
+                path.unlink()
+        self.results.write_text(json.dumps(outcomes))
+        command = [sys.executable]
+        if fake_clock:
+            command.append(str(self.clock))
+        command += [str(SCRIPTS / "rbm_network.py"), "--upstream", str(self.upstream if upstream is None else upstream),
+                    "--project", "firefox", "--key", "build"]
+        for target in targets:
+            command += ["--target", target]
+        command += list(extra)
+        return subprocess.run(command, cwd=self.launcher, env=self.env,
+                              capture_output=True, timeout=20)
+
+    def result(self, code=0, stdout=b"", stderr=b"", signal=None):
+        return {"returncode": code, "stdout_hex": stdout.hex(),
+                "stderr_hex": stderr.hex(), "signal": signal}
+
+    def assert_attempts(self, count, *, targets=TARGETS, delays=()):
+        records = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        expected = {"binary": str(self.rbm), "args": ["showconf", "firefox", "build",
+                             *[arg for target in targets for arg in ("--target", target)]],
+                    "cwd": str(self.upstream), "pwd": str(self.launcher),
+                    "inherited": self.env["CLI_INHERITED"]}
+        self.assertEqual(records, [expected] * count)
+        actual_delays = [int(line) for line in self.pauses.read_text().splitlines()] if self.pauses.exists() else []
+        self.assertEqual(actual_delays, list(delays))
+
+    def test_cli_preserves_exact_render_bytes_target_order_cwd_and_inherited_env(self):
+        cases = [
+            (b"  \t#!/bin/bash\n./mach configure \\\n\n  \t", TARGETS),
+            (b" leading and trailing spaces without newline  ", TARGETS[:2]),
+            (b"\r\n# native CRLF rendering\r\n\r\n", TARGETS[:2] + ["pgo-use"]),
+            (b"raw non-UTF8 byte \xff\n", ["alpha", "pgo-generate", "alpha"]),
+        ]
+        for rendering, targets in cases:
+            with self.subTest(rendering=rendering, targets=targets):
+                progress = b"native stderr progress\r\n"
+                result = self.run_cli([self.result(stdout=rendering, stderr=progress)], targets=targets)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, rendering)
+                self.assertEqual(result.stderr, progress)
+                self.assert_attempts(1, targets=targets)
+
+    def test_cli_resolves_relative_upstream_without_replacing_inherited_pwd(self):
+        rendering = b" relative upstream rendered output\n "
+        relative = os.path.relpath(self.upstream, self.launcher)
+        result = self.run_cli([self.result(stdout=rendering)], upstream=relative)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, rendering)
+        self.assert_attempts(1)
+
+    def test_cli_empty_rendering_and_target_list_add_no_newline(self):
+        result = self.run_cli([self.result()], targets=[])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        self.assert_attempts(1, targets=[])
+
+    def test_cli_security_failure_exit7_relay_has_empty_stdout_and_no_retry(self):
+        failed_stdout = b"partial untrusted rendering \xff\r\n"
+        failed_stderr = OBSERVED_RPC_FAILURE.encode() + b"Error: SHA256 checksum mismatch\n"
+        result = self.run_cli([self.result(7, failed_stdout, failed_stderr),
+                               self.result(stdout=b"must never be returned")], fake_clock=True)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(failed_stdout, result.stderr)
+        self.assertIn(failed_stderr, result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assert_attempts(1)
+
+    @unittest.skipUnless(os.name == "posix", "native negative signal exit requires POSIX")
+    def test_cli_native_signal_maps_to_128_plus_signal_without_traceback(self):
+        result = self.run_cli([self.result(stderr=b"native child termination\n", signal=15)])
+        self.assertEqual(result.returncode, 143)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"native child termination\n", result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assert_attempts(1)
+
+    def test_cli_missing_executable_has_no_stdout_or_traceback(self):
+        self.rbm.unlink()
+        result = self.run_cli([])
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"RBM showconf could not start:", result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_cli_rejects_arbitrary_command_arguments_before_any_rbm_invocation(self):
+        result = self.run_cli([], extra=("--command", "build"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertFalse(self.calls.exists())
+        self.assertNotIn(b"Traceback", result.stderr)
+
+    def test_cli_old_then_rpc_failure_recovers_raw_rendering_after_10_and_30(self):
+        rendering = b"\t./mach configure \\\n  --enable-profile-generate=cross\n\n "
+        result = self.run_cli([self.result(1, b"partial first\n", failure().encode()),
+                               self.result(2, OBSERVED_RPC_FAILURE.encode(), b""),
+                               self.result(stdout=rendering)], fake_clock=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, rendering)
+        self.assertIn(failure().encode(), result.stderr)
+        self.assertIn(OBSERVED_RPC_FAILURE.encode(), result.stderr)
+        self.assertIn(b"attempt 2/3", result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assert_attempts(3, delays=(10, 30))
+
+    def test_cli_exhaustion_keeps_all_failed_streams_and_stops_at_three(self):
+        failed_stdout = b"final partial \xff\r\n" + OBSERVED_RPC_FAILURE.encode()
+        failed_stderr = b"native final progress\r\n"
+        result = self.run_cli([self.result(1, b"first partial\n", failure().encode()),
+                               self.result(2, b"second partial\n", OBSERVED_RPC_FAILURE.encode()),
+                               self.result(7, failed_stdout, failed_stderr),
+                               self.result(stdout=b"fourth attempt forbidden")], fake_clock=True)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(failed_stdout, result.stderr)
+        self.assertIn(failed_stderr, result.stderr)
+        self.assertIn(b"attempt 3/3", result.stderr)
+        self.assertIn(b"retry limit reached", result.stderr)
+        self.assertNotIn(b"fourth attempt forbidden", result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assert_attempts(3, delays=(10, 30))
 
 
 if __name__ == "__main__":

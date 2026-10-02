@@ -2,12 +2,13 @@
 set -euo pipefail
 : "${UPSTREAM:?}"; : "${RUNNER_TEMP:?}"
 fail() { echo "$*" >&2; exit 1; }
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 common=(--target alpha --target mullvadbrowser-windows-x86_64 --target pgo-generate)
 cd "$UPSTREAM"
-rust_filename="$(./rbm/rbm showconf rust filename "${common[@]}")"
-official_filename="$(./rbm/rbm showconf rust filename --target alpha --target mullvadbrowser-windows-x86_64)"
+rust_filename="$(python3 "$root/scripts/rbm_network.py" --upstream "$PWD" --project rust --key filename "${common[@]}")"
+official_filename="$(python3 "$root/scripts/rbm_network.py" --upstream "$PWD" --project rust --key filename --target alpha --target mullvadbrowser-windows-x86_64)"
 [[ "$rust_filename" != "$official_filename" && "$rust_filename" == *-profiler* ]] || fail 'PGO Rust did not resolve to its distinct profiler identity'
-mingw_filename="$(./rbm/rbm showconf mingw-w64-clang filename "${common[@]}")"
+mingw_filename="$(python3 "$root/scripts/rbm_network.py" --upstream "$PWD" --project mingw-w64-clang --key filename "${common[@]}")"
 # Select the filenames evaluated by RBM, never the first file in an output tree.
 [[ "$rust_filename" != */* && -n "$rust_filename" && "$mingw_filename" != */* && -n "$mingw_filename" ]] || fail 'RBM returned an invalid toolchain filename'
 rust_archive="$PWD/out/rust/$rust_filename"
@@ -34,7 +35,7 @@ done
 [[ "$(realpath -e "$rustc")" == "$rust_sysroot/"* ]] || fail 'rustc symlink escapes the restored PGO artifact'
 [[ "$(realpath -e "$linker")" == "$mingw_root/"* ]] || fail 'linker symlink escapes the restored MinGW artifact'
 [[ -d "$mingw_sysroot" && "$(realpath -e "$mingw_sysroot")" == "$mingw_root/"* ]] || fail 'missing restored MinGW sysroot'
-configured_targets="$(./rbm/rbm showconf rust var/target "${common[@]}")"
+configured_targets="$(python3 "$root/scripts/rbm_network.py" --upstream "$PWD" --project rust --key var/target "${common[@]}")"
 mapfile -t targets < <(printf '%s\n' "$configured_targets" | tr ',' '\n' | sed -n '/^x86_64-.*windows.*gnullvm$/p')
 [[ ${#targets[@]} -eq 1 && "${targets[0]}" == x86_64-pc-windows-gnullvm ]] || fail 'could not derive the pinned Firefox Windows x86_64 Rust target'
 target="${targets[0]}"

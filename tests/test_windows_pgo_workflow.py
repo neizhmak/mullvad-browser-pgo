@@ -136,6 +136,26 @@ class WindowsPGOWorkflowTests(unittest.TestCase):
         self.assertIn("*resources.jsonl", USE)
         self.assertIn("if: always()", job(GEN, "pgo-generate"))
 
+    def test_pgo_shell_metadata_uses_shared_bounded_transport_helper(self):
+        for name in ("validate-pgo-overlay.sh", "preflight-pgo-rust.sh",
+                     "run-pgo-generate.sh", "prepare-pgo-use.sh", "run-pgo-use.sh"):
+            with self.subTest(script=name):
+                contents = (ROOT / "scripts" / name).read_text()
+                self.assertIn("rbm_network.py", contents)
+                self.assertIn('--upstream "$PWD"', contents)
+                self.assertIn("--project", contents)
+                self.assertIn("--key", contents)
+                self.assertNotRegex(contents, r"\./rbm/rbm\s+showconf\b")
+
+    def test_transport_helper_does_not_wrap_actual_compiler_builds(self):
+        generation = (ROOT / "scripts/run-pgo-generate.sh").read_text()
+        optimized = (ROOT / "scripts/run-pgo-use.sh").read_text()
+        for contents in (generation, optimized):
+            self.assertIn('-- ./rbm/rbm build firefox', contents)
+            self.assertNotRegex(contents, r"rbm_network\.py[^\n]*\./rbm/rbm\s+build\b")
+        self.assertIn('./rbm/rbm build browser "${args[@]}"', optimized)
+        self.assertIn('./rbm/rbm build rust', RUST)
+
     def test_native_windows_lightweight_checks_cover_entrypoints(self):
         native = job(UNIT, "windows-native")
         self.assertIn("runs-on: windows-2025", native)
