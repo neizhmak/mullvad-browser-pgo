@@ -65,8 +65,10 @@ permits a compiler rebuild.
 A lost hosted runner can leave no downloadable job log, even when the observer
 flushed local files and console output. A separate prebuild publisher therefore
 creates a diagnostic GitHub Check with `checks: write` scoped to the generation
-job. The existing build command, observer, compiler flags, and child environment
-stay unchanged. Its token exists only in the publisher step and detached process.
+job. The native RBM command, observer code, compiler flags, and child environment
+stay unchanged. Generation can use the child-only CPU envelope described below;
+the separately started publisher stays outside it. Its token exists only in the
+publisher step and detached process.
 
 The check starts completed with a **neutral** conclusion. This means diagnostics
 only, not successful compilation, a valid profile, or a validated browser. The
@@ -139,6 +141,60 @@ build duration is known. Keep the 285-minute Firefox step and 360-minute job
 limits. Do not automatically retry with one worker or disable either PGO
 language. Scheduling or compression can change archive bytes; bind the actual
 archive hash rather than claim byte-identical output.
+
+## Generation CPU envelope and precompile gate
+
+The exact pinned source/controller probe passed in run `37003594291`. Its
+35-second job verified RBM `865f2c9842520958879665d5c9b820d9ed51761e` and
+observed `num_procs=2` with two allowed CPUs. That no-chroot probe alone does
+not validate cache identities, compiler thread counts, or a browser build.
+
+Generation uses a child-only two-CPU envelope only after a fatal precompile
+gate. The gate runs after verified source/compiler/Node restoration and Binutils
+preparation, before the diagnostic publisher and Firefox compilation. It uses
+fresh processes in offline RBM namespaces to compare the current allowed mask,
+two allowed CPUs, and one CPU. The one-CPU case is metadata only, not an automatic
+fallback build. Missing warm inputs, network-dependent metadata, deadlines,
+corruption, or any unexpected identity or source change stop before compilation.
+
+The gate compares the complete Rust identity, its exact serialized file hash,
+the complete Node identity and canonical hash, selected output/dependency
+filenames, actual compiler/Node/Rust archive bytes, and source/workload/overlay
+bindings. The metadata gate never builds dependencies or clones cold sources.
+After it passes, the unchanged native generation can build the same selected
+dependency graph inside the two-CPU envelope. It does not require every unbuilt
+dependency archive to exist before metadata comparison. Rust's pretty-file hash
+and Node's compact canonical hash are different contracts. Do not replace either
+with a filename-only or subset comparison.
+The pinned build ID normalizes processor count to four. Operational inputs use
+the chosen count instead; a normalized on-disk `mozconfig` is not proof of the
+staged operational count. The actual native renderer and host Path::Tiny atomic
+hardlink-replacement check must pass before compilation.
+
+Only the exact documented resource positions can differ: `MOZ_PARALLEL_BUILD`,
+XZ/Zstandard compression thread counts, and the selected packaging XZ thread
+argument. No generic numeric or compiler-flag normalization is allowed. C++ and
+Rust PGO, codegen-units, LTO, optimization/debug flags, source pins/protocols,
+compiler bytes, training workloads, and privacy defaults stay unchanged.
+
+A successful gate writes `pgo-generation-resource-policy.json`. The execution
+wrapper validates its run/head/job/upstream binding and two selected members of
+the current allowed CPU set, then replaces itself with the unchanged
+`run-pgo-generate.sh` command. It does not set a global CPU environment variable,
+retry a compiler, change the inner command arguments, or reset the process group. The
+build-side observer inherits the two-CPU mask. The GitHub runner and detached
+diagnostic publisher remain unrestricted. An observer's own affinity is not a
+measurement of every compiler's thread count or RSS.
+
+The fixed `pgo-generation-resource-validation` artifact retains the policy and
+bounded public metadata diagnostics, including precompile failures. Real native
+C++ and Rust generation flags and a completed browser archive remain mandatory.
+Look for actual mach/Make/Cargo and `NUM_JOBS=2` evidence; metadata success is not
+native training or positive two-language profile proof. The 285-minute Firefox
+step and 360-minute job limits remain unchanged. One large Rust/LLVM/linker can
+still OOM. There is no automatic one-worker retry or completed-time guarantee.
+For the first bounded generation/training/merge attempt, use
+`finish_pipeline=false`; optimized packaging/comparison remains a later gate.
 
 ## Re-run boundaries
 

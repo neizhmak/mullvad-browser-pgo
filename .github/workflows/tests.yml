@@ -44,7 +44,7 @@ jobs:
       - name: Install native recipe test requirements
         run: |
           sudo apt-get update
-          sudo apt-get install -y libtemplate-perl libyaml-libyaml-perl openssl
+          sudo apt-get install -y libtemplate-perl libyaml-libyaml-perl openssl libpath-tiny-perl
           command -v pwsh
       - name: Run every lightweight suite and syntax check
         run: python3 scripts/run-tests.py

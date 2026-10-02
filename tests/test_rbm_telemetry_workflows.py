@@ -62,10 +62,17 @@ class TelemetryWorkflowTests(unittest.TestCase):
         self.assertIn(expected, self.smoke)
 
     def test_readiness_gate_before_literal_unchanged_build_step(self):
+        policy = step(self.generate, "Validate warm offline generation resource policy")
         start = step(self.generate, "Start acknowledged durable resource telemetry")
         build = step(self.generate, "Build only instrumented Firefox")
-        self.assertEqual(build, "      - name: Build only instrumented Firefox\n        timeout-minutes: 285\n        run: ./scripts/run-pgo-generate.sh\n")
+        self.assertEqual(build, '      - name: Build only instrumented Firefox\n        timeout-minutes: 285\n'
+                         '        run: python3 ./scripts/run-pgo-resource-limited.py '
+                         '--policy "$RUNNER_TEMP/pgo-generation-resource-policy.json" -- ./scripts/run-pgo-generate.sh\n')
+        self.assertLess(self.generate.index(policy), self.generate.index(start))
         self.assertLess(self.generate.index(start), self.generate.index(build))
+        self.assertNotIn("env:", policy)
+        self.assertNotIn("continue-on-error", policy)
+        self.assertNotIn("||", policy)
         self.assertIn("--interval 120", start)
         self.assertIn("--resource-log \"$RUNNER_TEMP/pgo-generate-resources.jsonl\"", start)
         self.assertIn("--state \"$RUNNER_TEMP/pgo-durable-telemetry.json\"", start)

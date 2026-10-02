@@ -165,12 +165,15 @@ class WindowsPGOWorkflowTests(unittest.TestCase):
         self.assertNotIn("checks: write", GEN.split("jobs:", 1)[0])
         self.assertIn("publish-rbm-telemetry.py", generation)
         self.assertIn("PGO_TELEMETRY_TOKEN:", generation)
+        self.assertLess(generation.index("Validate warm offline generation resource policy"),
+                        generation.index("publish-rbm-telemetry.py"))
         self.assertLess(generation.index("publish-rbm-telemetry.py"),
                         generation.index("Build only instrumented Firefox"))
         build = generation.split("- name: Build only instrumented Firefox", 1)[1]
         build = build.split("- name:", 1)[0]
-        self.assertIn("timeout-minutes: 285", build)
-        self.assertIn("run: ./scripts/run-pgo-generate.sh", build)
+        self.assertEqual(build, '\n        timeout-minutes: 285\n'
+                         '        run: python3 ./scripts/run-pgo-resource-limited.py '
+                         '--policy "$RUNNER_TEMP/pgo-generation-resource-policy.json" -- ./scripts/run-pgo-generate.sh\n      ')
         self.assertNotIn("PGO_TELEMETRY_TOKEN", build)
         self.assertNotIn("env:", build)
         for name in ("run-pgo-generate.sh", "observe-rbm-build.py"):

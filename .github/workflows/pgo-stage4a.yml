@@ -144,6 +144,9 @@ jobs:
           ./scripts/restore-pgo-support.py --upstream "$UPSTREAM" --pgo-target pgo-generate --output-directory "$RUNNER_TEMP/pgo-support" --expected-release "$PGO_SUPPORT_RELEASE" --expected-identity "$PGO_SUPPORT_IDENTITY" --provenance "$RUNNER_TEMP/provenance/build.json"
       - name: Prepare verified Binutils input
         run: ./scripts/prepare-binutils-input.sh
+      - name: Validate warm offline generation resource policy
+        timeout-minutes: 10
+        run: python3 ./scripts/validate-pgo-resource-policy.py --upstream "$UPSTREAM" --rust-identity "$RUNNER_TEMP/pgo-rust-identity.json" --node-support-directory "$RUNNER_TEMP/pgo-support" --provenance "$RUNNER_TEMP/provenance/build.json" --output "$RUNNER_TEMP/pgo-generation-resource-policy.json" --diagnostic-directory "$RUNNER_TEMP/pgo-resource-validation"
       - name: Start acknowledged durable resource telemetry
         timeout-minutes: 1
         env:
@@ -157,7 +160,7 @@ jobs:
             --job "$GITHUB_JOB" --interval 120
       - name: Build only instrumented Firefox
         timeout-minutes: 285
-        run: ./scripts/run-pgo-generate.sh
+        run: python3 ./scripts/run-pgo-resource-limited.py --policy "$RUNNER_TEMP/pgo-generation-resource-policy.json" -- ./scripts/run-pgo-generate.sh
       - name: Stop durable resource telemetry
         if: always()
         continue-on-error: true
@@ -192,6 +195,15 @@ jobs:
             ${{ runner.temp }}/pgo-support/
             ${{ runner.temp }}/tor-browser-build/logs/
             ${{ runner.temp }}/provenance/
+          if-no-files-found: warn
+      - name: Preserve generation resource policy and validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-generation-resource-validation
+          path: |
+            ${{ runner.temp }}/pgo-generation-resource-policy.json
+            ${{ runner.temp }}/pgo-resource-validation/
           if-no-files-found: warn
   pgo-train:
     needs: pgo-generate
