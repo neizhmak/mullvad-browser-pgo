@@ -10,7 +10,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PosixPath
 import re
 import shutil
 import signal
@@ -531,12 +531,29 @@ def source_records(upstream, inputs, environment, deadline):
     return records
 
 
+def _inventory_prefix(upstream):
+    if type(upstream) is PosixPath and upstream.is_absolute():
+        text = str(upstream)
+        if not text.startswith("//"):
+            return text if text.endswith("/") else text + "/"
+    return None
+
+
+def _inventory_relative(path, upstream, prefix):
+    if prefix is not None and type(path) is PosixPath:
+        full = str(path)
+        if not full.startswith("//") and full.startswith(prefix) and len(full) > len(prefix):
+            return full[len(prefix):]
+    return path.relative_to(upstream).as_posix()
+
+
 def immutable_inventory(upstream, deadline=None):
     """Detect new/mutated payloads or clones without hashing entire Git packs."""
     digest = hashlib.sha256()
     entries = []
     count = 0
     metadata_bytes = 0
+    prefix = _inventory_prefix(upstream)
     for top in ("out", "git_clones", "hg_clones"):
         directory = upstream / top
         require(not directory.is_symlink(), "unsafe_runtime_tree")
@@ -547,7 +564,7 @@ def immutable_inventory(upstream, deadline=None):
             require(count <= 1000000, "runtime_inventory_limit")
             if deadline is not None:
                 deadline.remaining()
-            relative = path.relative_to(upstream).as_posix()
+            relative = _inventory_relative(path, upstream, prefix)
             if relative == "out/firefox/mozconfig":
                 continue
             info = path.lstat()

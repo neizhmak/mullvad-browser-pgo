@@ -4288,5 +4288,715 @@ class ResourceProgressPolicyTests(ProgressAssertions, PolicyMechanicsFixture, un
         self.assertFalse(list(self.base.rglob(".resource-policy-*")))
 
 
+# Independent tiny lexical fixtures. They prove no real-tree timing or PGO work.
+import ast
+import errno
+import types
+from pathlib import PosixPath, PurePath, PurePosixPath, PureWindowsPath
+
+
+LEXICAL_BASE_SOURCE_SHA256 = "67ccbeefe4f5a9add8c6d90523a7b6a3c52a44c9099aed62f95fd3a90c0440ec"
+
+
+def lexical_inventory_baseline(policy):
+    """Bind the exact frozen full module, not a hand-written inventory model."""
+    source = HELPER.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(HELPER))
+    helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+               and node.name in ("_inventory_prefix", "_inventory_relative")]
+    assert [node.name for node in helpers] == ["_inventory_prefix", "_inventory_relative"]
+    inventory = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "immutable_inventory")
+    lines = source.splitlines(keepends=True)
+    # Remove only the added contiguous helper region. Frozen bytes bind spacing too.
+    assert helpers[0].lineno < helpers[1].lineno < inventory.lineno
+    restored = "".join(lines[:helpers[0].lineno - 1] + lines[inventory.lineno - 1:])
+    replacements = (
+        ("from pathlib import Path, PosixPath\n", "from pathlib import Path\n"),
+        ("    prefix = _inventory_prefix(upstream)\n", ""),
+        ("            relative = _inventory_relative(path, upstream, prefix)\n",
+         "            relative = path.relative_to(upstream).as_posix()\n"),
+    )
+    for changed, original in replacements:
+        assert restored.count(changed) == 1, changed
+        restored = restored.replace(changed, original, 1)
+    assert digest(restored.encode("utf-8")) == LEXICAL_BASE_SOURCE_SHA256
+
+    # Reverse the whole AST independently of the byte reversal.
+    reverse = copy.deepcopy(tree)
+    reverse.body = [node for node in reverse.body if not
+                    (isinstance(node, ast.FunctionDef) and node.name in
+                     ("_inventory_prefix", "_inventory_relative"))]
+    imports = [node for node in reverse.body if isinstance(node, ast.ImportFrom)
+               and node.module == "pathlib"]
+    assert len(imports) == 1
+    assert [(item.name, item.asname) for item in imports[0].names] == [("Path", None), ("PosixPath", None)]
+    imports[0].names.pop()
+    reverse_inventory = next(node for node in reverse.body if isinstance(node, ast.FunctionDef)
+                             and node.name == "immutable_inventory")
+    prefix_nodes = [node for node in reverse_inventory.body if isinstance(node, ast.Assign)
+                    and [ast.unparse(target) for target in node.targets] == ["prefix"]]
+    assert len(prefix_nodes) == 1
+    prefix = prefix_nodes[0]
+    assert ast.unparse(prefix.value) == "_inventory_prefix(upstream)"
+    prefix_index = reverse_inventory.body.index(prefix)
+    assert ast.unparse(reverse_inventory.body[prefix_index - 1]) == "metadata_bytes = 0"
+    assert isinstance(reverse_inventory.body[prefix_index + 1], ast.For)
+    reverse_inventory.body.remove(prefix)
+    relative_nodes = [node for node in ast.walk(reverse_inventory) if isinstance(node, ast.Assign)
+                      and [ast.unparse(target) for target in node.targets] == ["relative"]]
+    assert len(relative_nodes) == 1
+    assert ast.unparse(relative_nodes[0].value) == "_inventory_relative(path, upstream, prefix)"
+    relative_nodes[0].value = ast.parse("path.relative_to(upstream).as_posix()", mode="eval").body
+    expected_tree = ast.parse(restored, filename=str(HELPER))
+    assert ast.dump(reverse, include_attributes=False) == ast.dump(expected_tree, include_attributes=False)
+
+    def function_code(module_code):
+        found = [item for item in module_code.co_consts if isinstance(item, types.CodeType)
+                 and item.co_name == "immutable_inventory"]
+        assert len(found) == 1
+        return found[0]
+
+    # Full-module compilation retains the interpreter's imported-name context.
+    current_code = function_code(compile(source, str(HELPER), "exec", dont_inherit=True, optimize=0))
+    assert current_code == policy.immutable_inventory.__code__
+    baseline_code = function_code(compile(restored, str(HELPER), "exec", dont_inherit=True, optimize=0))
+    assert baseline_code == function_code(compile(expected_tree, str(HELPER), "exec",
+                                                dont_inherit=True, optimize=0))
+    baseline = types.FunctionType(baseline_code, dict(policy.__dict__),
+                                  "immutable_inventory", policy.immutable_inventory.__defaults__)
+    baseline.__kwdefaults__ = policy.immutable_inventory.__kwdefaults__
+    return baseline, restored, tree, expected_tree
+
+
+class LexicalInventoryCustomPosix(PosixPath):
+    """A non-stock path must use the original methods."""
+
+
+class LexicalInventoryReadTrace:
+    def __init__(self, stream, events, path, failure):
+        self.stream, self.events, self.path, self.failure = stream, events, path, failure
+
+    def __enter__(self):
+        self.stream.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.stream.__exit__(*args)
+
+    def read(self, size):
+        data = self.stream.read(size)
+        self.events.append(("read", self.path, size, len(data), digest(data)))
+        if self.failure == ("read", self.path):
+            raise OSError(errno.EIO, "synthetic read failure", self.path)
+        return data
+
+
+class ResourceLexicalInventoryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.policy = load_validator()
+        baseline, cls.restored_source, cls.current_tree, cls.restored_tree = lexical_inventory_baseline(cls.policy)
+        cls.baseline = staticmethod(baseline)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pgo-lexical-unit-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.upstream = self.base / "checkout é fixture"
+        self.upstream.mkdir()
+
+    def write(self, relative, data=b"tiny fixture\n"):
+        path = self.upstream / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def capture(self, function, *, upstream=None, yields=None, transform=None,
+                failure=None, fail_deadline=None, seed_count=None, forbidden_lstat=(), before_lstat=None):
+        upstream = self.upstream if upstream is None else upstream
+        events, records, yielded, ordered, publications = [], [], {}, [], []
+        original_rglob, original_lstat, original_open = Path.rglob, Path.lstat, Path.open
+        original_readlink, original_dumps = os.readlink, json.dumps
+        original_relative = PurePath.relative_to
+        original_require = function.__globals__["require"]
+        original_progress = function.__globals__["progress_counters"]
+        original_helper = self.policy._inventory_relative
+        seeded = []
+
+        class Deadline:
+            def __init__(self):
+                self.calls = 0
+
+            def remaining(self):
+                self.calls += 1
+                events.append(("remaining", self.calls))
+                if self.calls == fail_deadline:
+                    raise RuntimeError("synthetic deadline")
+                return 300.0
+
+        def rglob(directory, pattern, *args, **kwargs):
+            events.append(("rglob", str(directory), pattern, args, kwargs))
+            items = yields.get(str(directory), ()) if yields is not None else original_rglob(directory, pattern, *args, **kwargs)
+            for path in items:
+                yielded[str(path)] = path
+                events.append(("yield", str(path)))
+                yield path
+
+        def lstat(path, *args, **kwargs):
+            self.assertFalse(any(path is item for item in forbidden_lstat), "fallback reached lstat")
+            if str(path) in yielded:
+                self.assertIs(path, yielded[str(path)], "inventory replaced the yielded Path")
+            if before_lstat is not None and str(path) in yielded:
+                before_lstat(path)
+            info = original_lstat(path, *args, **kwargs)
+            events.append(("lstat", str(path)))
+            if failure == ("lstat", str(path)):
+                raise FileNotFoundError(errno.ENOENT, "synthetic lstat failure", str(path))
+            return transform(path, info) if transform else info
+
+        def readlink(path, *args, **kwargs):
+            self.assertIs(path, yielded[str(path)], "readlink lost the yielded Path")
+            value = original_readlink(path, *args, **kwargs)
+            events.append(("readlink", str(path), value))
+            if failure == ("readlink", str(path)):
+                raise OSError(errno.EIO, "synthetic readlink failure", str(path))
+            return value
+
+        def opening(path, *args, **kwargs):
+            self.assertIs(path, yielded[str(path)], "open lost the yielded Path")
+            stream = original_open(path, *args, **kwargs)
+            events.append(("open", str(path), args, kwargs))
+            if failure == ("open", str(path)):
+                stream.close()
+                raise PermissionError(errno.EACCES, "synthetic open failure", str(path))
+            return LexicalInventoryReadTrace(stream, events, str(path), failure)
+
+        def dumps(value, *args, **kwargs):
+            text = original_dumps(value, *args, **kwargs)
+            records.append((value, args, kwargs, text.encode()))
+            events.append(("JSON", text, args, kwargs))
+            return text
+
+        def sorting(items, *args, **kwargs):
+            items = list(items)
+            result = sorted(items, *args, **kwargs)
+            ordered.extend(result)
+            events.append(("sort", [(key, value.hex()) for key, value in result], args, kwargs))
+            return result
+
+        def requiring(condition, code):
+            events.append(("require", condition, code))
+            return original_require(condition, code)
+
+        def progress(deadline, **counts):
+            publications.append(counts)
+            events.append(("counters", counts))
+            return original_progress(deadline, **counts)
+
+        def relative(path, other, *args, **kwargs):
+            if function is self.baseline and sys._getframe(1).f_code is function.__code__:
+                events.append(("relative", str(path)))
+            return original_relative(path, other, *args, **kwargs)
+
+        def helper(path, root, prefix):
+            events.append(("relative", str(path)))
+            return original_helper(path, root, prefix)
+
+        def count_trace(frame, event, arg):
+            if (frame.f_code is function.__code__ and event == "line" and not seeded
+                    and frame.f_locals.get("count") == 0 and "path" in frame.f_locals):
+                frame.f_locals["count"] = seed_count
+                seeded.append(seed_count)
+                events.append(("seed_count", seed_count))
+            return count_trace
+
+        replacements = {"require": requiring, "progress_counters": progress, "sorted": sorting,
+                        "_inventory_relative": helper}
+        previous_trace = sys.gettrace()
+        outcome = None
+        with patch.dict(function.__globals__, replacements), \
+             patch.object(Path, "rglob", rglob), patch.object(Path, "lstat", lstat), \
+             patch.object(Path, "open", opening), patch.object(os, "readlink", readlink), \
+             patch.object(json, "dumps", dumps), patch.object(PurePath, "relative_to", relative):
+            try:
+                if seed_count is not None:
+                    sys.settrace(count_trace)
+                result = function(upstream, Deadline())
+                outcome = ("success", result)
+            except Exception as error:
+                outcome = ("error", type(error), error.args, str(error),
+                           getattr(error, "errno", None), getattr(error, "filename", None))
+            finally:
+                if seed_count is not None:
+                    sys.settrace(previous_trace)
+        if seed_count is not None:
+            self.assertEqual(seeded, [seed_count], "tiny count seed did not bind the actual inventory frame")
+        return {"outcome": outcome, "events": events, "records": records,
+                "ordered": ordered, "counters": publications}
+
+    def compare(self, **kwargs):
+        before = self.capture(self.baseline, **kwargs)
+        after = self.capture(self.policy.immutable_inventory, **kwargs)
+        self.assertEqual(after, before)
+        return after
+
+    def test_exact_full_source_and_AST_reverse_bind_all_old_bodies_and_encoder_policy(self):
+        self.assertEqual(digest(self.restored_source.encode()), LEXICAL_BASE_SOURCE_SHA256)
+        self.assertEqual(self.baseline.__code__.co_filename, str(HELPER))
+        self.assertEqual(self.baseline.__code__.co_firstlineno, 534)
+        self.assertEqual(self.baseline.__defaults__, (None,))
+        original = {node.name: node for node in self.restored_tree.body
+                    if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
+        current = {node.name: node for node in self.current_tree.body
+                   if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
+        for name, node in original.items():
+            if name != "immutable_inventory":
+                with self.subTest(body=name):
+                    self.assertEqual(ast.dump(current[name]), ast.dump(node))
+        inventory = current["immutable_inventory"]
+        self.assertFalse(any(isinstance(node, ast.Attribute) and node.attr in
+                             ("JSONEncoder", "iterencode", "scandir", "walk", "resolve", "normpath")
+                             for node in ast.walk(inventory)))
+        self.assertEqual((self.policy.TOTAL_SECONDS, self.policy.CALL_SECONDS), (300, 45))
+        self.assertEqual(self.policy.NS_CODE, ast.literal_eval(next(node.value for node in self.restored_tree.body
+                         if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and
+                         target.id == "NS_CODE" for target in node.targets))))
+
+    def test_prefix_exact_stock_absolute_single_anchor_and_no_io_or_clock(self):
+        class HostileCustom(PosixPath):
+            def is_absolute(self):
+                raise AssertionError("custom prefix method called")
+
+            def __str__(self):
+                raise AssertionError("custom prefix string called")
+
+        cases = [(PosixPath("/"), "/"), (PosixPath("/a/"), "/a/"),
+                 (PosixPath("/é/\udcff/../name"), "/é/\udcff/../name/"),
+                 (PosixPath("//a"), None), (PosixPath("a/../b"), None),
+                 (PurePosixPath("/a"), None), (PureWindowsPath("C:/a"), None),
+                 (HostileCustom("/a"), None)]
+        with patch.object(Path, "lstat", side_effect=AssertionError("prefix IO")), \
+             patch.object(Path, "resolve", side_effect=AssertionError("prefix resolve")), \
+             patch.object(self.policy.time, "monotonic", side_effect=AssertionError("prefix clock")):
+            for root, expected in cases:
+                self.assertEqual(self.policy._inventory_prefix(root), expected)
+
+    def test_stock_fastpath_unicode_surrogates_literal_dot_and_dotdot_avoid_original_methods(self):
+        cases = [("/root", "/root/child"), ("/", "/child"),
+                 ("/root-é/\udcff", "/root-é/\udcff/e\u0301/☃\udcfe"),
+                 ("/root/a/..", "/root/a/../b/./x"),
+                 ("/root", "/root/./child/../leaf")]
+        bound = [(PosixPath(root), PosixPath(child)) for root, child in cases]
+        expected = [path.relative_to(root).as_posix() for root, path in bound]
+        with patch.object(PurePath, "relative_to", side_effect=AssertionError("fastpath fallback")), \
+             patch.object(PurePath, "as_posix", side_effect=AssertionError("fastpath result allocation")):
+            for (root, path), relative in zip(bound, expected):
+                self.assertEqual(self.policy._inventory_relative(path, root, self.policy._inventory_prefix(root)), relative)
+
+    def test_fallback_self_outside_sibling_double_anchor_relative_custom_and_pure_exact_errors(self):
+        cases = [(PosixPath("/root"), PosixPath("/root")), (PosixPath("/"), PosixPath("/")),
+                 (PosixPath("/root"), PosixPath("/outside/item")),
+                 (PosixPath("/root"), PosixPath("/root-sibling/item")),
+                 (PosixPath("//root"), PosixPath("//root/item")),
+                 (PosixPath("//root"), PosixPath("/root/item")),
+                 (PosixPath("/root"), PosixPath("//root/item")),
+                 (PosixPath("root"), PosixPath("root/item")),
+                 (PosixPath("root"), PosixPath("/root/item")),
+                 (LexicalInventoryCustomPosix("/root"), PosixPath("/root/item")),
+                 (PosixPath("/root"), LexicalInventoryCustomPosix("/root/item")),
+                 (PurePosixPath("/root"), PurePosixPath("/root/item")),
+                 (PosixPath("/root"), PurePosixPath("/root/item")),
+                 (PureWindowsPath("C:/root"), PureWindowsPath("C:/root/item")),
+                 (PureWindowsPath("C:/root"), PureWindowsPath("D:/root/item"))]
+        original = PurePath.relative_to
+        calls = []
+        def relative(path, root, *args, **kwargs):
+            calls.append(path)
+            return original(path, root, *args, **kwargs)
+        for root, path in cases:
+            with self.subTest(root=str(root), path=str(path), kind=type(path).__name__):
+                try:
+                    expected = ("value", path.relative_to(root).as_posix())
+                except Exception as error:
+                    expected = ("error", type(error), error.args, str(error))
+                calls.clear()
+                with patch.object(PurePath, "relative_to", relative):
+                    try:
+                        actual = ("value", self.policy._inventory_relative(path, root, self.policy._inventory_prefix(root)))
+                    except Exception as error:
+                        actual = ("error", type(error), error.args, str(error))
+                self.assertEqual(actual, expected)
+                self.assertEqual(len(calls), 1)
+                self.assertIs(calls[0], path)
+
+    def test_fallback_inventory_original_error_precedes_same_yield_lstat(self):
+        self.write("out/present")
+        root = self.upstream
+        paths = [root, root.parent / (root.name + "-sibling/item"), root.parent / "outside/item",
+                 PosixPath("/" + str(root) + "/out/item"), PosixPath("out/relative"),
+                 PurePosixPath(str(root.parent / "pure-outside/item")),
+                 LexicalInventoryCustomPosix(str(root.parent / "custom-outside/item"))]
+        for path in paths[1:]:
+            with self.subTest(path=str(path), kind=type(path).__name__):
+                try:
+                    path.relative_to(root).as_posix()
+                except Exception as error:
+                    expected = (type(error), error.args, str(error))
+                else:
+                    self.fail("fallback fixture unexpectedly belongs to the root")
+                result = self.compare(yields={str(root / "out"): [path]}, forbidden_lstat=(path,))
+                self.assertEqual(result["outcome"][1:4], expected)
+                self.assertEqual(result["counters"], [])
+
+    def test_real_relative_and_custom_root_inventories_use_original_fallback(self):
+        self.write("out/é/\udcff")
+        self.write("git_clones/repo/.git/logs/HEAD", b"small reflog\n")
+        roots = [PosixPath(os.path.relpath(self.upstream, Path.cwd())),
+                 LexicalInventoryCustomPosix(self.upstream)]
+        for root in roots:
+            with self.subTest(root=str(root), kind=type(root).__name__):
+                self.assertIsNone(self.policy._inventory_prefix(root))
+                self.assertEqual(self.compare(upstream=root)["outcome"][0], "success")
+
+    def test_same_real_rglob_yields_fresh_lstat_readlink_and_open_no_scanner(self):
+        self.write("out/é/\udcff.bin")
+        self.write("git_clones/repo/.git/HEAD", b"raw HEAD\n")
+        link = self.upstream / "git_clones/repo/link"
+        link.symlink_to("../outside-☃/\udcfe")
+        calls = []
+        original = self.policy._inventory_prefix
+        def prefix(root):
+            calls.append(root)
+            return original(root)
+        with patch.object(self.policy, "_inventory_prefix", prefix):
+            result = self.compare()
+        self.assertEqual(calls, [self.upstream])
+        self.assertEqual(result["outcome"][0], "success")
+        self.assertEqual([event[1] for event in result["events"] if event[0] == "rglob"],
+                         [str(self.upstream / name) for name in ("out", "git_clones")])
+        self.assertIn(("readlink", str(link), "../outside-☃/\udcfe"), result["events"])
+        for event in result["events"]:
+            if event[0] == "yield":
+                self.assertIn(("lstat", event[1]), result["events"])
+
+
+    def test_custom_overridden_fallback_keeps_original_root_and_exception_arguments(self):
+        calls = []
+        class Custom(PosixPath):
+            def relative_to(self, root):
+                calls.append((self, root))
+                raise RuntimeError("original custom fallback", root)
+        root, path = PosixPath("/root"), Custom("/root/item")
+        with self.assertRaises(RuntimeError) as failure:
+            self.policy._inventory_relative(path, root, self.policy._inventory_prefix(root))
+        self.assertEqual(failure.exception.args, ("original custom fallback", root))
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][0], path)
+        self.assertIs(calls[0][1], root)
+
+    def test_fresh_same_Path_lstat_observes_tiny_mutation_after_enumeration(self):
+        path = self.write("out/file", b"x")
+        for function in (self.baseline, self.policy.immutable_inventory):
+            path.write_bytes(b"x")
+            changed = []
+            def before_lstat(item):
+                self.assertIs(item, path)
+                fd = os.open(item, os.O_WRONLY | os.O_TRUNC)
+                try:
+                    os.write(fd, b"fresh bytes")
+                finally:
+                    os.close(fd)
+                changed.append(item)
+            result = self.capture(function, yields={str(self.upstream / "out"): [path]}, before_lstat=before_lstat)
+            self.assertEqual(changed, [path])
+            self.assertEqual(result["records"][0][0][1], len(b"fresh bytes"))
+            self.assertEqual(result["records"][0][0][2:],
+                             (path.lstat().st_ino, path.lstat().st_mtime_ns, path.lstat().st_nlink))
+            self.assertEqual(result["outcome"][0], "success")
+
+    def test_original_pathlib_rglob_audit_event_and_denial_are_retained(self):
+        self.write("out/file")
+        state = {"enabled": False, "deny": False, "events": []}
+        def audit(event, arguments):
+            if state["enabled"] and event == "pathlib.Path.rglob" and arguments[0] == self.upstream / "out":
+                state["events"].append((event, arguments))
+                if state["deny"]:
+                    raise PermissionError(errno.EACCES, "synthetic rglob audit denial", str(arguments[0]))
+        sys.addaudithook(audit)
+        try:
+            for deny in (False, True):
+                results, audits = [], []
+                for function in (self.baseline, self.policy.immutable_inventory):
+                    state.update(enabled=True, deny=deny, events=[])
+                    try:
+                        results.append(self.capture(function))
+                    finally:
+                        state["enabled"] = False
+                    audits.append(state["events"])
+                self.assertEqual(results[0], results[1])
+                self.assertEqual(audits[0], audits[1])
+                self.assertEqual(audits[0], [("pathlib.Path.rglob", (self.upstream / "out", "*"))])
+                self.assertEqual(results[0]["outcome"][0], "error" if deny else "success")
+                if deny:
+                    self.assertEqual(results[0]["outcome"][1], PermissionError)
+                    self.assertEqual(results[0]["counters"], [])
+        finally:
+            state["enabled"] = False
+
+    def raw_git_fixture(self):
+        opened, reflogs = [], []
+        normal = ("HEAD", "config", "refs/heads/topic", "logs/HEAD", "logs/refs/heads/topic",
+                  "logs/refs/remotes/origin/topic", "logs/refs/stash", "logs/refs/notes/review",
+                  "objects/loose", "logs/visible.PACK")
+        for directory in ("git_clones/one/.git", "git_clones/two/.git", "hg_clones/mirror/.git", "out/nested/.git"):
+            for leaf in normal:
+                path = self.write(directory + "/" + leaf, b"old raw bytes\n")
+                opened.append(path)
+                if leaf.startswith("logs/"):
+                    reflogs.append(path)
+            for leaf in ("objects/excluded.pack", "objects/excluded.idx", "logs/excluded.pack", "logs/excluded.idx"):
+                self.write(directory + "/" + leaf, b"stat-only suffix\n")
+        for relative in ("git_clones/file-repo/.git", "git_clones/repo/.git-like/logs/HEAD",
+                         "out/ordinary.pack", "out/ordinary.idx"):
+            self.write(relative)
+        return opened, reflogs
+
+    def test_raw_git_all_fixture_reflogs_literal_predicate_suffixes_and_EOF_reads(self):
+        opened, reflogs = self.raw_git_fixture()
+        result = self.compare()
+        actual = [event[1] for event in result["events"] if event[0] == "open"]
+        self.assertCountEqual(actual, [str(path) for path in opened])
+        self.assertTrue(set(map(str, reflogs)) <= set(actual))
+        self.assertEqual(result["counters"][0]["git_metadata_bytes"], sum(path.stat().st_size for path in opened))
+        for path in opened:
+            reads = [event for event in result["events"] if event[0] == "read" and event[1] == str(path)]
+            self.assertEqual([event[2:4] for event in reads], [(1024 * 1024, path.stat().st_size), (1024 * 1024, 0)])
+        for path in opened:
+            value = next(record[0] for record in result["records"] if record[0][0] == path.relative_to(self.upstream).as_posix())
+            self.assertEqual(value, (path.relative_to(self.upstream).as_posix(), path.stat().st_size, digest(path.read_bytes())))
+
+    def test_each_covered_reflog_same_size_restored_mtime_mutation_is_freshly_hashed(self):
+        _, reflogs = self.raw_git_fixture()
+        initial = self.compare()["outcome"]
+        for path in reflogs:
+            with self.subTest(reflog=str(path)):
+                before = path.stat()
+                original = path.read_bytes()
+                path.write_bytes(b"new raw bytes\n")
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                self.assertEqual((path.stat().st_size, path.stat().st_ino, path.stat().st_mtime_ns),
+                                 (before.st_size, before.st_ino, before.st_mtime_ns))
+                self.assertNotEqual(self.compare()["outcome"], initial)
+                path.write_bytes(original)
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                self.assertEqual(self.compare()["outcome"], initial)
+
+    def test_byte_identical_raw_reflog_replacement_new_inode_keeps_original_digest(self):
+        path = self.write("git_clones/repo/.git/logs/HEAD", b"unchanged raw reflog\n")
+        initial = self.compare()["outcome"]
+        inode = path.stat().st_ino
+        replacement = self.base / "replacement"
+        replacement.write_bytes(path.read_bytes())
+        os.replace(replacement, path)
+        self.assertNotEqual(path.stat().st_ino, inode)
+        self.assertEqual(self.compare()["outcome"], initial)
+
+    def test_original_JSON_tuples_inner_hashes_spaced_directories_and_global_hash(self):
+        self.write("out/a-\udcff/é", b"ordinary")
+        self.write("git_clones/a/.git/HEAD", b"ref\n")
+        self.write("hg_clones/a-/file", b"ordinary")
+        link = self.upstream / "hg_clones/a-/link"
+        link.symlink_to("../target-é/\udcfe")
+        result = self.compare()
+        inner = []
+        for value, args, options, raw in result["records"]:
+            self.assertEqual(args, ())
+            if len(value) == 2:
+                self.assertEqual(value[1], "directory")
+                self.assertEqual(options, {})
+                self.assertIn(b'", "directory"', raw)
+            else:
+                self.assertEqual(options, {"separators": (",", ":")})
+            expected = json.dumps(value, **options).encode()
+            self.assertEqual(raw, expected)
+            inner.append((value[0], hashlib.sha256(expected).digest()))
+        self.assertEqual(result["ordered"], sorted(inner))
+        self.assertEqual(result["outcome"], ("success", digest(b"".join(item for _, item in sorted(inner)))))
+        self.assertTrue(any(b"\\udcff" in record[3] for record in result["records"]))
+        self.assertTrue(any(b"\\u00e9" in record[3] for record in result["records"]))
+
+    def test_full_global_tuple_sort_preserves_prefix_order_and_equal_key_digest_ties(self):
+        a = self.write("git_clones/a/file", b"x")
+        b = self.write("git_clones/a-", b"y")
+        self.write("out/z", b"z")
+        self.write("hg_clones/m", b"m")
+        directory = a.parent
+        for function in (self.baseline, self.policy.immutable_inventory):
+            calls = []
+            def transform(path, info):
+                if path == b:
+                    calls.append(path)
+                    return types.SimpleNamespace(st_mode=info.st_mode, st_size=info.st_size,
+                                                 st_ino=info.st_ino + len(calls), st_mtime_ns=info.st_mtime_ns,
+                                                 st_nlink=info.st_nlink)
+                return info
+            result = self.capture(function, yields={str(self.upstream / "git_clones"): [b, a, directory, b],
+                                  str(self.upstream / "out"): [self.upstream / "out/z"],
+                                  str(self.upstream / "hg_clones"): [self.upstream / "hg_clones/m"]}, transform=transform)
+            self.assertEqual([key for key, _ in result["ordered"]],
+                             ["git_clones/a", "git_clones/a-", "git_clones/a-", "git_clones/a/file", "hg_clones/m", "out/z"])
+            equal_keys = [item for key, item in result["ordered"] if key == "git_clones/a-"]
+            self.assertEqual(equal_keys, sorted(equal_keys))
+            self.assertNotEqual(equal_keys[0], equal_keys[1])
+            sort = next(event for event in result["events"] if event[0] == "sort")
+            self.assertEqual(sort[2:], ((), {}))
+            if function is self.baseline:
+                baseline_result = result
+            else:
+                self.assertEqual(result, baseline_result)
+
+    def test_count_cap_precedes_deadline_and_exact_skip_with_two_real_small_files(self):
+        mozconfig = self.write("out/firefox/mozconfig")
+        other = self.write("out/firefox/other")
+        result = self.compare(yields={str(self.upstream / "out"): [mozconfig, other]}, seed_count=999999)
+        self.assertEqual(result["outcome"][1:4], (self.policy.GateError, ("runtime_inventory_limit",), "runtime_inventory_limit"))
+        self.assertEqual([event for event in result["events"] if event[0] == "remaining"], [("remaining", 1)])
+        self.assertNotIn(("lstat", str(mozconfig)), result["events"])
+        self.assertNotIn(("lstat", str(other)), result["events"])
+        self.assertEqual(result["counters"], [])
+        relevant = [event[0] for event in result["events"] if event[0] in ("seed_count", "remaining", "relative")]
+        self.assertEqual(relevant, ["seed_count", "remaining", "relative"])
+
+    def test_deadline_precedes_relative_exact_mozconfig_skip_and_counter_publication(self):
+        mozconfig = self.write("out/firefox/mozconfig")
+        result = self.compare(yields={str(self.upstream / "out"): [mozconfig]}, fail_deadline=1,
+                              forbidden_lstat=(mozconfig,))
+        self.assertEqual(result["outcome"][1:4], (RuntimeError, ("synthetic deadline",), "synthetic deadline"))
+        self.assertFalse(any(event[0] == "relative" for event in result["events"]))
+        self.assertEqual(result["counters"], [])
+
+    def test_only_exact_mozconfig_node_skips_lstat_all_forms_and_descendant_is_retained(self):
+        for kind in ("regular", "symlink", "fifo", "directory"):
+            with self.subTest(kind=kind):
+                if (self.upstream / "out").exists():
+                    shutil.rmtree(self.upstream / "out")
+                mozconfig = self.upstream / "out/firefox/mozconfig"
+                mozconfig.parent.mkdir(parents=True)
+                if kind == "regular":
+                    mozconfig.write_bytes(b"generated")
+                elif kind == "symlink":
+                    mozconfig.symlink_to(self.base / "missing")
+                elif kind == "fifo":
+                    os.mkfifo(mozconfig)
+                else:
+                    mozconfig.mkdir()
+                    self.write("out/firefox/mozconfig/child")
+                near = self.write("out/firefox/mozconfig-near")
+                result = self.compare()
+                self.assertEqual(result["outcome"][0], "success")
+                self.assertNotIn(("lstat", str(mozconfig)), result["events"])
+                self.assertIn(("lstat", str(near)), result["events"])
+                self.assertEqual(result["counters"][0]["inventory_entries"],
+                                 len([event for event in result["events"] if event[0] == "yield"]))
+                if kind == "directory":
+                    self.assertIn(("lstat", str(mozconfig / "child")), result["events"])
+                    self.assertTrue(any(record[0][0] == "out/firefox/mozconfig/child" for record in result["records"]))
+
+    def test_git_size_cap_before_open_and_exact_boundary_with_tiny_stream(self):
+        path = self.write("git_clones/repo/.git/HEAD", b"small stream")
+        for size, success in ((128 * 1024 * 1024 + 1, False), (128 * 1024 * 1024, True)):
+            def transform(item, info):
+                if item == path:
+                    return types.SimpleNamespace(st_mode=info.st_mode, st_size=size)
+                return info
+            result = self.compare(transform=transform)
+            self.assertEqual(result["outcome"][0], "success" if success else "error")
+            self.assertEqual(any(event[0] == "open" for event in result["events"]), success)
+            if not success:
+                self.assertEqual(result["outcome"][1:4], (self.policy.GateError, ("git_metadata_limit",), "git_metadata_limit"))
+                self.assertEqual(result["counters"], [])
+
+    def test_git_deadline_checks_before_data_and_EOF_reads_and_no_partial_counters(self):
+        path = self.write("out/repo/.git/HEAD", b"small stream")
+        for call, reads in ((2, []), (3, [len(b"small stream")])):
+            with self.subTest(deadline_call=call):
+                result = self.compare(yields={str(self.upstream / "out"): [path]}, fail_deadline=call)
+                self.assertEqual(result["outcome"][1:4], (RuntimeError, ("synthetic deadline",), "synthetic deadline"))
+                self.assertEqual([event[3] for event in result["events"] if event[0] == "read"], reads)
+                self.assertEqual(result["counters"], [])
+
+    def test_original_lstat_open_read_and_readlink_exception_args_and_errno_are_retained(self):
+        ordinary = self.write("out/file")
+        metadata = self.write("git_clones/repo/.git/HEAD", b"tiny")
+        link = self.upstream / "git_clones/repo/link"
+        link.symlink_to("missing")
+        for operation, path, error in (("lstat", ordinary, FileNotFoundError), ("open", metadata, PermissionError),
+                                       ("read", metadata, OSError), ("readlink", link, OSError)):
+            with self.subTest(operation=operation):
+                result = self.compare(failure=(operation, str(path)))
+                self.assertEqual(result["outcome"][0:2], ("error", error))
+                self.assertEqual(result["outcome"][-1], str(path))
+                self.assertEqual(result["counters"], [])
+
+    def test_ordinary_stat_tuple_fields_default_JSON_types_and_actual_hardlinks(self):
+        path = self.write("out/ordinary")
+        initial = self.compare()["outcome"]
+        original_info = path.lstat()
+        for field in ("st_size", "st_ino", "st_mtime_ns", "st_nlink"):
+            def transform_field(item, info):
+                if item == path:
+                    values = {name: getattr(info, name) for name in
+                              ("st_mode", "st_size", "st_ino", "st_mtime_ns", "st_nlink")}
+                    values[field] += 1
+                    return types.SimpleNamespace(**values)
+                return info
+            self.assertNotEqual(self.compare(transform=transform_field)["outcome"], initial)
+        for value in (True, 2 ** 100, float("nan"), float("inf"), -float("inf"), object()):
+            def transform_json(item, info):
+                if item == path:
+                    return types.SimpleNamespace(st_mode=info.st_mode, st_size=value, st_ino=info.st_ino,
+                                                 st_mtime_ns=info.st_mtime_ns, st_nlink=info.st_nlink)
+                return info
+            with self.subTest(JSON_type=type(value).__name__, value=repr(value)):
+                result = self.compare(transform=transform_json)
+                if type(value) is object:
+                    self.assertEqual(result["outcome"][0:2], ("error", TypeError))
+                else:
+                    self.assertEqual(result["outcome"][0], "success")
+        os.link(path, self.base / "outside-hardlink")
+        self.assertEqual(path.lstat().st_nlink, original_info.st_nlink + 1)
+        self.assertNotEqual(self.compare()["outcome"], initial)
+
+
+class ResourceLexicalCheckpointTests(PolicyMechanicsFixture, unittest.TestCase):
+    def test_original_five_inventory_source_guards_four_selected_passes_and_archive_boundaries(self):
+        inventories, sources, selected, archives = [], [], [], []
+        original_inventory = self.policy.immutable_inventory
+        original_selected = self.policy.validate_selected_inputs
+        original_archives = self.policy.archive_boundary_records
+        def inventory(*args, **kwargs):
+            inventories.append(len(self.seen_cases))
+            return original_inventory(*args, **kwargs)
+        def source(*args, **kwargs):
+            sources.append(len(self.seen_cases))
+            return self.sources
+        def selection(*args, **kwargs):
+            selected.append(len(self.seen_cases))
+            return original_selected(*args, **kwargs)
+        def archive(*args, **kwargs):
+            archives.append(len(self.seen_cases))
+            return original_archives(*args, **kwargs)
+        with patch.object(self.policy, "immutable_inventory", inventory), \
+             patch.object(self.policy, "source_records", source), \
+             patch.object(self.policy, "validate_selected_inputs", selection), \
+             patch.object(self.policy, "archive_boundary_records", archive):
+            self.assertTrue(self.validate()["verified"])
+        self.assertEqual(inventories, [0, 1, 2, 3, 3])
+        self.assertEqual(sources, [0, 1, 2, 3, 3])
+        self.assertEqual(selected, [1, 2, 3, 3])
+        self.assertEqual(archives, [0, 3])
+
+
 if __name__ == "__main__":
     unittest.main()

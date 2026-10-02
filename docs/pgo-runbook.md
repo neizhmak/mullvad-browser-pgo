@@ -208,10 +208,34 @@ render/Tiny checks remain mandatory.
 Run `37036435522` stopped at `native_deadline` after 300 seconds. It retained only
 a completed four-CPU baseline; the two/one cases and final gate did not complete.
 Publisher start and Firefox compilation were skipped. The saved report does not
-identify the timed-out operation. Diagnostic and hash-deduplication changes alone
-do not prove that the full gate fits its deadline or that compilation will finish.
-Real native C++ and Rust generation flags and a completed browser archive remain
-mandatory.
+identify the timed-out operation.
+
+The separately authorized follow-up run `37053243555` failed before compilation
+with `global_deadline`. Its bounded sidecar records expiry during the selected-two
+inventory. Two completed inventories each covered 818636 entries and 214934591
+Git-metadata bytes, taking 50.057 and 47.372 seconds. The two observed native-case
+groups took 83.119 and 82.695 seconds. Only baseline-four was a completed case;
+completed selected-two native operations are not a completed case or policy.
+The one-case and final work were not measured.
+
+Inventory retains the original `Path.rglob` traversal and fresh `lstat`, `readlink`
+and raw Git-metadata reads, including all currently covered reflogs. A lexical
+fastpath avoids constructing a second relative `Path` for exact stock absolute
+POSIX descendants. Relative/custom paths, double-slash anchors, root/self,
+outside paths and sibling-prefix collisions keep the original method fallback.
+Count/deadline/skip order, stat tuples, JSON spacing/options, global tuple sorting,
+all five fresh inventory/source guards and separate byte bindings stay unchanged.
+It is not a new scanner, stat/hash cache, native batch or input policy.
+
+A bounded local synthetic experiment used 4354 entries and 524288 Git bytes.
+The helper's median was 57.152 ms versus 155.555 ms for the untouched baseline,
+from four interleaved measured runs per variant. Independent review accepted the
+recorded local feasibility only. This does not establish scaling to the real
+checkout, the Actions interpreter/CPU, allocation/RSS savings, completion of the
+unseen cases or a full gate within 300 seconds. The original limits remain.
+Diagnostic, hash-deduplication and lexical changes alone do not prove that the
+full gate fits its deadline or that compilation will finish. Real native C++ and
+Rust generation flags and a completed browser archive remain mandatory.
 Look for actual mach/Make/Cargo and `NUM_JOBS=2` evidence; metadata success is not
 native training or positive two-language profile proof. The 285-minute Firefox
 step and 360-minute job limits remain unchanged. One large Rust/LLVM/linker can
