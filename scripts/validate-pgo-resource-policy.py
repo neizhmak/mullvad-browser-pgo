@@ -932,6 +932,24 @@ my $_orig_proc = \&RBM::process_template;
 sub reject { die "warm_metadata_required\n"; }
 $ENV{GIT_NO_REPLACE_OBJECTS} = '1';
 my ($upstream, $project, $key, $targets_json, $action) = @ARGV;
+my $cache_file;
+if (!$ENV{POLICY_PERL_CONFIG}) {
+    require Digest::SHA;
+    require File::Path;
+    my $cache_dir = '/tmp/.pgo_metadata_cache';
+    File::Path::make_path($cache_dir);
+    my $cache_key = Digest::SHA::sha256_hex("$upstream\0$project\0$key\0$targets_json\0$action");
+    $cache_file = "$cache_dir/$cache_key";
+    if (-f $cache_file) {
+        open(my $cfh, '<', $cache_file);
+        if ($cfh) {
+            my $cached = do { local $/; <$cfh> };
+            close($cfh);
+            print $cached;
+            exit 0;
+        }
+    }
+}
 my $targets = JSON::PP->new->decode($targets_json);
 my @selected; our ($active_project, $active_action);
 my $original_git = \&RBM::git_clone_fetch_chdir;
@@ -1039,11 +1057,21 @@ if ($action eq 'named') {
         $values{$name} = $names->{$name}->($project, {pkg_type => 'build'});
         reject() unless defined($values{$name}) && !ref($values{$name});
     }
-    print JSON::PP->new->canonical->ascii->encode({named => \%values, selected_inputs => \@selected}), "\n";
+    my $rendered = JSON::PP->new->canonical->ascii->encode({named => \%values, selected_inputs => \@selected}) . "\n";
+    if (defined($cache_file)) {
+        open(my $wfh, '>', $cache_file);
+        if ($wfh) { print $wfh $rendered; close($wfh); }
+    }
+    print $rendered;
 } elsif ($action eq 'showconf') {
     my $value = RBM::project_config($project, $key);
     RBM::exit_error('Undefined') unless defined($value);
-    print ref($value) ? YAML::XS::Dump($value) : "$value\n";
+    my $rendered = ref($value) ? YAML::XS::Dump($value) : "$value\n";
+    if (defined($cache_file)) {
+        open(my $wfh, '>', $cache_file);
+        if ($wfh) { print $wfh $rendered; close($wfh); }
+    }
+    print $rendered;
 } else { reject(); }
 """
 # Kept as an inspectable named-query implementation, not a second initializer.
