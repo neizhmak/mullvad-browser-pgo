@@ -923,6 +923,12 @@ def filename_records(upstream, cpus, inputs, environment, deadline, namespace):
 NATIVE_GUARD_CODE = r"""
 use strict; use warnings; use Cwd qw(abs_path getcwd); use File::Spec;
 use JSON::PP; use YAML::XS; no warnings 'once'; no warnings 'redefine';
+my $_orig_proc = \&RBM::process_template;
+*RBM::process_template = sub {
+    my ($p, $tmpl, $dest) = @_;
+    return $tmpl if defined($tmpl) && !ref($tmpl) && index($tmpl, '[%') == -1;
+    return $_orig_proc->(@_);
+};
 sub reject { die "warm_metadata_required\n"; }
 $ENV{GIT_NO_REPLACE_OBJECTS} = '1';
 my ($upstream, $project, $key, $targets_json, $action) = @ARGV;

@@ -104,6 +104,14 @@ my $ok = eval {
     unshift @INC, "$upstream/rbm/lib";
     require RBM;
     require Path::Tiny;
+    { no warnings 'redefine';
+      my $_orig_proc = \&RBM::process_template;
+      *RBM::process_template = sub {
+          my ($p, $tmpl, $dest) = @_;
+          return $tmpl if defined($tmpl) && !ref($tmpl) && index($tmpl, '[%') == -1;
+          return $_orig_proc->(@_);
+      };
+    }
 
     # Match the ordinary RBM build entry, not a no_build_id or shadow-source target.
     RBM::load_config("$upstream/rbm.conf");

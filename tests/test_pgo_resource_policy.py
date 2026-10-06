@@ -4295,7 +4295,7 @@ import types
 from pathlib import PosixPath, PurePath, PurePosixPath, PureWindowsPath
 
 
-LEXICAL_BASE_SOURCE_SHA256 = "67ccbeefe4f5a9add8c6d90523a7b6a3c52a44c9099aed62f95fd3a90c0440ec"
+LEXICAL_BASE_SOURCE_SHA256 = "6fde283068160eb31735ec8c64d307a5cb4f8f3a0f09f76c3424c042240423ba"
 
 
 def lexical_inventory_baseline(policy):
