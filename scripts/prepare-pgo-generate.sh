@@ -9,3 +9,4 @@ git -C "$UPSTREAM" apply --check "$patch_file"
 git -C "$UPSTREAM" apply "$patch_file"
 git -C "$UPSTREAM" diff --check
 sha256sum "$patch_file" | tee "${RUNNER_TEMP:-/tmp}/pgo-overlay.sha256"
+"$root/scripts/prepare-wasi-config-input.sh"
