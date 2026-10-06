@@ -67,6 +67,8 @@ readonly signature="$filename.sig"
 readonly output_dir="$UPSTREAM/out/binutils"
 readonly configured_base="https://ftpmirror.gnu.org/gnu/binutils"
 readonly fallback_base="https://ftp.gnu.org/gnu/binutils"
+readonly mirror_fallback_base="https://mirrors.kernel.org/gnu/binutils"
+readonly backup_mirror_base="https://mirror.init7.net/gnu/binutils"
 
 [[ -f "$keyring" ]] || { echo "error: pinned Binutils keyring is missing: $keyring" >&2; exit 1; }
 mkdir -p "$output_dir"
@@ -122,6 +124,12 @@ if download_and_verify "$configured_base" "RBM-configured GNU mirror"; then
   exit 0
 fi
 if download_and_verify "$fallback_base" "GNU primary fallback"; then
+  exit 0
+fi
+if download_and_verify "$mirror_fallback_base" "GNU kernel.org mirror"; then
+  exit 0
+fi
+if download_and_verify "$backup_mirror_base" "GNU init7.net mirror"; then
   exit 0
 fi
 
