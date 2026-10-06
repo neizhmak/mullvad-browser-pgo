@@ -27,7 +27,7 @@ _TRANSIENT = re.compile(
     r"(?: with \d+ (?:out of \d+ )?bytes received)?)?"
     r"|Timeout was reached"
     r"|Failed to connect to git\.savannah\.gnu\.org port 443(?: after \d+ ms)?: "
-    r"(?:Connection timed out|Timeout was reached)"
+    r"(?:Connection timed out|Timeout was reached|Couldn't connect to server)"
     r"|(?:Recv|Send) failure: Connection (?:was )?reset(?: by peer)?"
     r"|Connection (?:was )?reset(?: by peer)?"
     r"|Operation too slow\. Less than \d+ bytes/sec transferred the last \d+ seconds)\Z"

@@ -180,6 +180,8 @@ class RetryUnitTests(unittest.TestCase):
             "Operation timed out after 1000 ms with 8 out of 99 bytes received",
             "Failed to connect to git.savannah.gnu.org port 443 after 1000 ms: Connection timed out",
             "Failed to connect to git.savannah.gnu.org port 443: Timeout was reached",
+            "Failed to connect to git.savannah.gnu.org port 443 after 134339 ms: Couldn't connect to server",
+            "Failed to connect to git.savannah.gnu.org port 443: Couldn't connect to server",
             "Recv failure: Connection reset by peer", "Send failure: Connection was reset",
             "Connection reset by peer", "Connection was reset",
             "Operation too slow. Less than 1 bytes/sec transferred the last 30 seconds",
