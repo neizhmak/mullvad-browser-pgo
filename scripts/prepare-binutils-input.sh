@@ -70,6 +70,30 @@ readonly fallback_base="https://ftp.gnu.org/gnu/binutils"
 readonly mirror_fallback_base="https://mirrors.kernel.org/gnu/binutils"
 readonly backup_mirror_base="https://mirror.init7.net/gnu/binutils"
 
+configure_host_swap() {
+  if [[ "$(uname -s)" == "Linux" ]] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    local swap_total_kb
+    swap_total_kb="$(awk '/SwapTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if (( swap_total_kb < 8000000 )); then
+      local swap_dir="/mnt"
+      [[ -d "$swap_dir" ]] || swap_dir="/var/tmp"
+      local free_kb
+      free_kb="$(df -k "$swap_dir" 2>/dev/null | awk 'NR==2 {print $4}')"
+      if (( free_kb > 15000000 )); then
+        local swap_file="$swap_dir/pgo-swapfile"
+        if ! grep -q "$swap_file" /proc/swaps 2>/dev/null; then
+          if sudo fallocate -l 10G "$swap_file" 2>/dev/null || sudo dd if=/dev/zero of="$swap_file" bs=1M count=10240 status=none 2>/dev/null; then
+            sudo chmod 600 "$swap_file"
+            sudo mkswap "$swap_file" >/dev/null 2>&1 || true
+            sudo swapon "$swap_file" >/dev/null 2>&1 || true
+          fi
+        fi
+      fi
+    fi
+  fi
+}
+configure_host_swap
+
 [[ -f "$keyring" ]] || { echo "error: pinned Binutils keyring is missing: $keyring" >&2; exit 1; }
 mkdir -p "$output_dir"
 
