@@ -988,8 +988,8 @@ class ResourcePolicyMechanicsTests(PolicyMechanicsFixture, unittest.TestCase):
         self.assertEqual(policy["kind"], "pgo-generation-resource-policy")
         self.assertEqual(policy["target"], "pgo-generate")
         self.assertEqual(policy["parent_affinity"], self.parent)
-        self.assertEqual(policy["selected_affinity"], self.parent[:2])
-        self.assertEqual(policy["expected_num_procs"], 2)
+        self.assertEqual(policy["selected_affinity"], self.parent)
+        self.assertEqual(policy["expected_num_procs"], 4)
         self.assertEqual(policy["rust_identity_sha256"], self.rust_sha)
         self.assertEqual(policy["node_identity_sha256"], self.node_sha)
         self.assertEqual(policy["binding"], {"head": "f" * 40, "run": "12345", "attempt": "1",
@@ -4295,7 +4295,7 @@ import types
 from pathlib import PosixPath, PurePath, PurePosixPath, PureWindowsPath
 
 
-LEXICAL_BASE_SOURCE_SHA256 = "e4d8fa73281a4548f2f7325d3579bf7e83fa4bc633738aeae8112436c2c6485c"
+LEXICAL_BASE_SOURCE_SHA256 = "903e7866b1d216c88f97eaf0952ea9c9217e1f6fbffcf21d871d60de2d6c0b81"
 
 
 def lexical_inventory_baseline(policy):

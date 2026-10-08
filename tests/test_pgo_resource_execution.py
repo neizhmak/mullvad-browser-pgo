@@ -76,6 +76,20 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertNotIn(b"secret-private", result.stderr)
         return result
 
+    def test_exact_four_cpu_policy_execution(self):
+        if len(self.before) < 4:
+            self.skipTest("requires four currently allowed CPU members")
+        policy = self.policy.copy()
+        policy["selected_affinity"] = sorted(self.before)[:4]
+        policy["expected_num_procs"] = 4
+        self.write(policy)
+        code = "import json, os; print(json.dumps(sorted(os.sched_getaffinity(0))))"
+        process = subprocess.Popen(self.command(code), cwd=self.base,
+                                   env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        output, error = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, error)
+        self.assertEqual(json.loads(output), sorted(self.before)[:4])
+
     def test_exact_two_cpu_argv_cwd_environment_pid_and_group(self):
         self.environment["UNCHANGED_VALUE"] = "spaces 'quotes' snowman-\u2603"
         arguments = ["--", "spaces here", "'quoted'", "$(not-a-shell)", "unicode-\u2603"]

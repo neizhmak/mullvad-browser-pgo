@@ -163,7 +163,7 @@ def validate_policy(policy, environment, current_affinity):
     if (type(policy["schema"]) is not int or policy["schema"] != 1
             or policy["kind"] != "pgo-generation-resource-policy"
             or policy["verified"] is not True or policy["target"] != "pgo-generate"
-            or type(policy["expected_num_procs"]) is not int or policy["expected_num_procs"] != 2):
+            or type(policy["expected_num_procs"]) is not int or policy["expected_num_procs"] not in (2, 4)):
         raise Rejected("unverified_policy")
     exact_keys(policy["upstream_lock"], EXPECTED_LOCK)
     if policy["upstream_lock"] != EXPECTED_LOCK or policy["rbm_commit"] != EXPECTED_RBM:
@@ -184,7 +184,7 @@ def validate_policy(policy, environment, current_affinity):
         raise Rejected("invalid_job")
     safe_directory(binding["upstream"])
     parent, selected = cpus(policy["parent_affinity"]), cpus(policy["selected_affinity"])
-    if (parent != sorted(current_affinity) or len(selected) != 2
+    if (parent != sorted(current_affinity) or len(selected) != policy["expected_num_procs"]
             or not set(selected).issubset(parent)):
         raise Rejected("stale_affinity")
     if any(key in environment for key in CPU_ENV):

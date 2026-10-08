@@ -178,11 +178,12 @@ Rust PGO, codegen-units, LTO, optimization/debug flags, source pins/protocols,
 compiler bytes, training workloads, and privacy defaults stay unchanged.
 
 A successful gate writes `pgo-generation-resource-policy.json`. The execution
-wrapper validates its run/head/job/upstream binding and two selected members of
-the current allowed CPU set, then replaces itself with the unchanged
+wrapper validates its run/head/job/upstream binding and the verified selected members
+of the current allowed CPU set (four CPUs on standard runners when auxiliary swap is
+configured, or two CPUs on restricted hosts), then replaces itself with the unchanged
 `run-pgo-generate.sh` command. It does not set a global CPU environment variable,
 retry a compiler, change the inner command arguments, or reset the process group. The
-build-side observer inherits the two-CPU mask. The GitHub runner and detached
+build-side observer inherits the selected CPU mask. The GitHub runner and detached
 diagnostic publisher remain unrestricted. An observer's own affinity is not a
 measurement of every compiler's thread count or RSS.
 

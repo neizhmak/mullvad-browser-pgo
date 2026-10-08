@@ -1304,9 +1304,11 @@ def validate(args, *, environment=None):
             require(sorted(os.sched_getaffinity(0)) == parent and {key: key in environment for key in INFLUENCERS}
                     == original_presence, "parent_policy_changed")
         with progress_phase(deadline, "final_report"):
+            selected_count = 4 if len(parent) >= 4 else (2 if len(parent) >= 2 else 1)
+            selected_cpus = parent[:selected_count]
             policy = {"schema": 1, "kind": "pgo-generation-resource-policy", "verified": True, "target": "pgo-generate",
                       "binding": current_binding, "upstream_lock": LOCK, "rbm_commit": RBM_COMMIT,
-                      "parent_affinity": parent, "selected_affinity": parent[:2], "expected_num_procs": 2,
+                      "parent_affinity": parent, "selected_affinity": selected_cpus, "expected_num_procs": selected_count,
                       "rust_identity_sha256": EXPECTED_RUST_SHA, "node_identity_sha256": EXPECTED_NODE_SHA}
             diagnostic["status"] = "verified-metadata-only"
             diagnostic["source_records_sha256"] = canonical_sha(before_sources)
