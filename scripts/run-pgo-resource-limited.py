@@ -216,9 +216,15 @@ def main():
         injector = Path(__file__).resolve().parent / "inject-pgo-profile-runtime.py"
         if injector.is_file():
             try:
+                log_dir = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "pgo-resource-validation"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log_file = log_dir / "pgo-injector.log"
+                tools_dir = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "pgo-rust-preflight-tools"
                 subprocess.Popen(
                     [sys.executable, str(injector),
-                     "--upstream", str(policy["binding"]["upstream"])],
+                     "--upstream", str(policy["binding"]["upstream"]),
+                     "--tools", str(tools_dir),
+                     "--log-file", str(log_file)],
                     close_fds=True,
                 )
             except OSError:
