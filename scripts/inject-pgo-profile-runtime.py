@@ -8,9 +8,9 @@ compiler-rt profile runtime. Rust's toolchain (built with profiler=true) already
 contains the exact bit-compatible Windows x86_64 compiler-rt profile object files
 in libprofiler_builtins.
 
-This watcher monitors the container filesystem under upstream/tmp/ and automatically
-installs libclang_rt.profile.a into the unpacked mingw-w64-clang toolchain inside the
-container rootfs as soon as it appears.
+This watcher monitors active build processes via /proc/*/root and filesystem trees
+(upstream/tmp, /tmp, /var/tmp, /mnt) and automatically installs libclang_rt.profile.a
+into the unpacked mingw-w64-clang toolchain inside the container rootfs as soon as it appears.
 """
 import argparse
 import os
@@ -92,23 +92,43 @@ def find_runtime(upstream=None, tools_dir=None, runner_temp=None, log_file=None)
 
 def find_clang_version_dirs(upstream):
     dirs = []
-    tmp_dir = Path(upstream) / "tmp"
-    if not tmp_dir.is_dir():
-        return dirs
+    seen = set()
 
-    # 1. Direct glob for RBM temporary container paths
-    for p in tmp_dir.glob("rbm-*/rbm-containers/*/var/tmp/dist/mingw-w64-clang/lib/clang/*"):
-        if p.is_dir():
+    def add_dir(p):
+        try:
+            resolved = str(p.resolve())
+        except OSError:
+            resolved = str(p)
+        if p.is_dir() and resolved not in seen:
+            seen.add(resolved)
             dirs.append(p)
-    # 2. Alternative RBM container structure
-    for p in tmp_dir.glob("rbm-containers/*/var/tmp/dist/mingw-w64-clang/lib/clang/*"):
-        if p.is_dir():
-            dirs.append(p)
-    # 3. General fallback under tmp
-    if not dirs:
-        for p in tmp_dir.glob("**/mingw-w64-clang/lib/clang/*"):
-            if p.is_dir():
-                dirs.append(p)
+
+    # 1. Check proc roots of active processes
+    for proc_entry in Path("/proc").glob("[0-9]*"):
+        try:
+            cmdline = (proc_entry / "cmdline").read_bytes()
+            if any(k in cmdline for k in (b"firefox", b"clang", b"mach", b"cargo", b"rbm", b"gmake")):
+                clang_base = proc_entry / "root/var/tmp/dist/mingw-w64-clang/lib/clang"
+                if clang_base.is_dir():
+                    for v in clang_base.iterdir():
+                        add_dir(v)
+        except (OSError, PermissionError):
+            continue
+
+    # 2. Check candidate filesystem trees under upstream
+    search_roots = [
+        Path(upstream) / "tmp",
+        Path(upstream),
+    ]
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        try:
+            for p in root.glob("**/mingw-w64-clang/lib/clang/*"):
+                add_dir(p)
+        except OSError:
+            pass
+
     return dirs
 
 
@@ -130,16 +150,19 @@ def inject_into_containers(upstream, runtime, log_file=None):
                 break
 
         if need_inject:
-            dest1.mkdir(parents=True, exist_ok=True)
-            dest2.mkdir(parents=True, exist_ok=True)
-            for f in (dest1_file, dest2_file, dest3_file, dest4_file):
-                shutil.copyfile(runtime, f)
-                try:
-                    os.chmod(f, 0o644)
-                except OSError:
-                    pass
-            injected += 1
-            log_msg(log_file, f"[inject-pgo-profile-runtime] Injected profile runtime into {version_dir}")
+            try:
+                dest1.mkdir(parents=True, exist_ok=True)
+                dest2.mkdir(parents=True, exist_ok=True)
+                for f in (dest1_file, dest2_file, dest3_file, dest4_file):
+                    shutil.copyfile(runtime, f)
+                    try:
+                        os.chmod(f, 0o644)
+                    except OSError:
+                        pass
+                injected += 1
+                log_msg(log_file, f"[inject-pgo-profile-runtime] Injected profile runtime into {version_dir}")
+            except OSError as ex:
+                log_msg(log_file, f"[inject-pgo-profile-runtime] Injection into {version_dir} failed: {ex}")
     return injected
 
 

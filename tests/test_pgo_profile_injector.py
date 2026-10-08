@@ -36,23 +36,26 @@ class InjectorTests(unittest.TestCase):
         self.assertIsNotNone(found)
         self.assertEqual(found, self.runtime)
 
-        # 2. simulate RBM nested container appearance: tmp/rbm-XXXXXX/rbm-containers/...
-        container = self.upstream / "tmp/rbm-abc123/rbm-containers/test-container-123"
-        clang_dir = container / "var/tmp/dist/mingw-w64-clang/lib/clang/21"
-        clang_dir.mkdir(parents=True)
+        # 2. simulate RBM nested container appearance
+        container = self.upstream / "tmp/rbm-abc123/rbm-xyz/var/tmp/dist/mingw-w64-clang/lib/clang/21"
+        container.mkdir(parents=True)
 
         log_file = self.base / "injector.log"
 
-        # 3. run injection logic
+        # 3. test find_clang_version_dirs
+        dirs = mod.find_clang_version_dirs(self.upstream)
+        self.assertIn(container, dirs)
+
+        # 4. run injection logic
         count = mod.inject_into_containers(self.upstream, found, log_file)
         self.assertGreater(count, 0)
         self.assertTrue(log_file.is_file())
 
-        # 4. verify all destinations exist and match
-        dest1 = clang_dir / "lib/x86_64-w64-windows-gnu/libclang_rt.profile.a"
-        dest2 = clang_dir / "lib/windows/libclang_rt.profile-x86_64.a"
-        dest3 = clang_dir / "lib/windows/libclang_rt.profile.a"
-        dest4 = clang_dir / "lib/x86_64-w64-windows-gnu/libclang_rt.profile-x86_64.a"
+        # 5. verify all destinations exist and match
+        dest1 = container / "lib/x86_64-w64-windows-gnu/libclang_rt.profile.a"
+        dest2 = container / "lib/windows/libclang_rt.profile-x86_64.a"
+        dest3 = container / "lib/windows/libclang_rt.profile.a"
+        dest4 = container / "lib/x86_64-w64-windows-gnu/libclang_rt.profile-x86_64.a"
 
         for dest in (dest1, dest2, dest3, dest4):
             self.assertTrue(dest.is_file(), f"Missing {dest}")
