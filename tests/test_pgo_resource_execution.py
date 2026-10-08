@@ -76,6 +76,23 @@ class PolicyExecutionTests(unittest.TestCase):
         self.assertNotIn(b"secret-private", result.stderr)
         return result
 
+
+    def test_run_pgo_generate_launches_injector(self):
+        scripts_dir = ROOT / "scripts"
+        injector = scripts_dir / "inject-pgo-profile-runtime.py"
+        self.assertTrue(injector.is_file())
+        with patch.object(EXECUTION.subprocess, "Popen") as mock_popen:
+            command = ["./scripts/run-pgo-generate.sh"]
+            with patch.object(sys, "argv", ["wrapper", "--policy", str(self.path), "--", *command]):
+                with patch.object(EXECUTION.os, "sched_setaffinity") as mock_setaffinity:
+                    with patch.object(EXECUTION.os, "execvpe") as mock_exec:
+                        with patch.dict(os.environ, self.environment, clear=True):
+                            EXECUTION.main()
+                            mock_setaffinity.assert_called_once()
+                            mock_popen.assert_called_once()
+                            self.assertIn("inject-pgo-profile-runtime.py", str(mock_popen.call_args[0][0]))
+                            mock_exec.assert_called_once_with(command[0], command, EXECUTION.os.environ)
+
     def test_exact_four_cpu_policy_execution(self):
         if len(self.before) < 4:
             self.skipTest("requires four currently allowed CPU members")

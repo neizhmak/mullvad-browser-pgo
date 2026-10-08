@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 
 MAX_POLICY_BYTES = 64 * 1024
@@ -205,11 +206,23 @@ def main():
             raise Rejected("invalid_arguments")
         if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
             raise Rejected("unsupported_platform")
-        selected = validate_policy(read_policy(args.policy), os.environ, os.sched_getaffinity(0))
+        policy = read_policy(args.policy)
+        selected = validate_policy(policy, os.environ, os.sched_getaffinity(0))
         os.sched_setaffinity(0, set(selected))
     except (Rejected, OSError):
         print("PGO resource policy rejected; command was not started.", file=sys.stderr)
         return 2
+    if any("run-pgo-generate.sh" in argument for argument in command):
+        injector = Path(__file__).resolve().parent / "inject-pgo-profile-runtime.py"
+        if injector.is_file():
+            try:
+                subprocess.Popen(
+                    [sys.executable, str(injector),
+                     "--upstream", str(policy["binding"]["upstream"])],
+                    close_fds=True,
+                )
+            except OSError:
+                pass
     try:
         # No fork, session, signal, cwd, ENV or inherited-FD change here.
         os.execvpe(command[0], command, os.environ)
