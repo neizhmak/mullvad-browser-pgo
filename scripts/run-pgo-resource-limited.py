@@ -220,11 +220,15 @@ def main():
                 log_dir.mkdir(parents=True, exist_ok=True)
                 log_file = log_dir / "pgo-injector.log"
                 tools_dir = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "pgo-rust-preflight-tools"
+                log_handle = open(log_file, "a")
                 subprocess.Popen(
                     [sys.executable, str(injector),
                      "--upstream", str(policy["binding"]["upstream"]),
                      "--tools", str(tools_dir),
+                     "--parent-pid", str(os.getpid()),
                      "--log-file", str(log_file)],
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
                     close_fds=True,
                 )
             except OSError:

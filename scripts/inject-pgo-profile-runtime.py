@@ -21,19 +21,56 @@ import sys
 import time
 
 
-def find_runtime(upstream=None, tools_dir=None, runner_temp=None):
-    candidates = []
+def log_msg(log_file, msg):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+    sys.stderr.write(line)
+    sys.stderr.flush()
+    if log_file:
+        try:
+            with open(log_file, "a") as lf:
+                lf.write(line)
+                lf.flush()
+        except OSError:
+            pass
+
+
+def is_process_alive(pid):
+    if pid is None or pid <= 1:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def find_runtime(upstream=None, tools_dir=None, runner_temp=None, log_file=None):
+    # 1. Check direct known paths in tools_dir
     if tools_dir and Path(tools_dir).is_dir():
-        candidates.extend(Path(tools_dir).rglob("libprofiler_builtins-*.rlib"))
-    if runner_temp and Path(runner_temp).is_dir():
-        candidates.extend(Path(runner_temp).rglob("libprofiler_builtins-*.rlib"))
+        for subpath in (
+            "rust/lib/rustlib/x86_64-pc-windows-gnullvm/lib",
+            "rust/rust/lib/rustlib/x86_64-pc-windows-gnullvm/lib",
+        ):
+            target_dir = Path(tools_dir) / subpath
+            if target_dir.is_dir():
+                for f in target_dir.glob("libprofiler_builtins-*.rlib"):
+                    if f.is_file() and f.stat().st_size > 0:
+                        return f
+
+    # 2. Targeted search in tools_dir
+    if tools_dir and Path(tools_dir).is_dir():
+        for f in Path(tools_dir).glob("**/libprofiler_builtins-*.rlib"):
+            if f.is_file() and f.stat().st_size > 0:
+                return f
+
+    # 3. Cache directory
     cache_dir = Path("/tmp/.pgo_profiler_runtime")
     if cache_dir.is_dir():
-        candidates.extend(cache_dir.rglob("libprofiler_builtins-*.rlib"))
-    for c in candidates:
-        if c.is_file() and c.stat().st_size > 0:
-            return c
-    # Fallback: extract from upstream/out/rust/*.tar.zst
+        for f in cache_dir.glob("libprofiler_builtins-*.rlib"):
+            if f.is_file() and f.stat().st_size > 0:
+                return f
+
+    # 4. Fallback: extract from upstream/out/rust/*.tar.zst
     if upstream and Path(upstream).is_dir():
         rust_out = Path(upstream) / "out/rust"
         if rust_out.is_dir():
@@ -44,22 +81,41 @@ def find_runtime(upstream=None, tools_dir=None, runner_temp=None):
                         ["tar", "-xaf", str(archive), "--wildcards", "*libprofiler_builtins-*.rlib", "-C", str(cache_dir)],
                         check=True
                     )
-                    cached = list(cache_dir.rglob("libprofiler_builtins-*.rlib"))
-                    if cached and cached[0].stat().st_size > 0:
-                        return cached[0]
-                except Exception:
-                    pass
+                    for f in cache_dir.rglob("libprofiler_builtins-*.rlib"):
+                        if f.is_file() and f.stat().st_size > 0:
+                            return f
+                except Exception as ex:
+                    log_msg(log_file, f"Extraction from {archive.name} failed: {ex}")
+
     return None
+
+
+def find_clang_version_dirs(upstream):
+    dirs = []
+    tmp_dir = Path(upstream) / "tmp"
+    if not tmp_dir.is_dir():
+        return dirs
+
+    # 1. Direct glob for RBM temporary container paths
+    for p in tmp_dir.glob("rbm-*/rbm-containers/*/var/tmp/dist/mingw-w64-clang/lib/clang/*"):
+        if p.is_dir():
+            dirs.append(p)
+    # 2. Alternative RBM container structure
+    for p in tmp_dir.glob("rbm-containers/*/var/tmp/dist/mingw-w64-clang/lib/clang/*"):
+        if p.is_dir():
+            dirs.append(p)
+    # 3. General fallback under tmp
+    if not dirs:
+        for p in tmp_dir.glob("**/mingw-w64-clang/lib/clang/*"):
+            if p.is_dir():
+                dirs.append(p)
+    return dirs
 
 
 def inject_into_containers(upstream, runtime, log_file=None):
     injected = 0
-    tmp_dir = Path(upstream) / "tmp"
-    if not tmp_dir.is_dir():
-        return injected
-    for version_dir in tmp_dir.glob("**/mingw-w64-clang/lib/clang/*"):
-        if not version_dir.is_dir():
-            continue
+    version_dirs = find_clang_version_dirs(upstream)
+    for version_dir in version_dirs:
         dest1 = version_dir / "lib/x86_64-w64-windows-gnu"
         dest1_file = dest1 / "libclang_rt.profile.a"
         dest2 = version_dir / "lib/windows"
@@ -83,14 +139,7 @@ def inject_into_containers(upstream, runtime, log_file=None):
                 except OSError:
                     pass
             injected += 1
-            msg = f"[inject-pgo-profile-runtime] Injected profile runtime into {version_dir}"
-            print(msg, file=sys.stderr, flush=True)
-            if log_file:
-                try:
-                    with open(log_file, "a") as lf:
-                        lf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
-                except OSError:
-                    pass
+            log_msg(log_file, f"[inject-pgo-profile-runtime] Injected profile runtime into {version_dir}")
     return injected
 
 
@@ -98,6 +147,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upstream", type=Path, required=True)
     parser.add_argument("--tools", type=Path)
+    parser.add_argument("--parent-pid", type=int)
     parser.add_argument("--log-file", type=Path)
     args = parser.parse_args()
 
@@ -105,32 +155,45 @@ def main():
     runner_temp = Path(os.environ.get("RUNNER_TEMP", "/tmp"))
     tools_dir = args.tools.resolve() if args.tools else runner_temp / "pgo-rust-preflight-tools"
     log_file = args.log_file.resolve() if args.log_file else None
+    parent_pid = args.parent_pid or os.getppid()
 
-    if log_file:
-        try:
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(log_file, "a") as lf:
-                lf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [inject-pgo-profile-runtime] Started watcher for {upstream}\n")
-        except OSError:
-            pass
+    log_msg(log_file, f"[inject-pgo-profile-runtime] Started watcher for {upstream} (parent PID: {parent_pid})")
 
-    parent_pid = os.getppid()
+    runtime = find_runtime(upstream, tools_dir, runner_temp, log_file)
+    if not runtime:
+        log_msg(log_file, "[inject-pgo-profile-runtime] WARNING: Initial runtime resolution found no file; will keep retrying.")
+    else:
+        log_msg(log_file, f"[inject-pgo-profile-runtime] Resolved profiler runtime: {runtime} ({runtime.stat().st_size} bytes)")
+
     start_time = time.time()
+    last_heartbeat = start_time
     max_duration = 280 * 60  # 280 minutes
+    injected_total = 0
 
     while time.time() - start_time < max_duration:
-        try:
-            if os.getppid() != parent_pid:
-                break
-        except Exception:
+        if not is_process_alive(parent_pid):
+            log_msg(log_file, f"[inject-pgo-profile-runtime] Monitored parent PID {parent_pid} has exited. Terminating watcher.")
             break
 
-        runtime = find_runtime(upstream, tools_dir, runner_temp)
+        if not runtime:
+            runtime = find_runtime(upstream, tools_dir, runner_temp, log_file)
+            if runtime:
+                log_msg(log_file, f"[inject-pgo-profile-runtime] Resolved profiler runtime: {runtime} ({runtime.stat().st_size} bytes)")
+
         if runtime:
-            inject_into_containers(upstream, runtime, log_file)
+            count = inject_into_containers(upstream, runtime, log_file)
+            injected_total += count
+
+        now = time.time()
+        if now - last_heartbeat >= 60:
+            last_heartbeat = now
+            elapsed_min = (now - start_time) / 60
+            version_dirs = find_clang_version_dirs(upstream)
+            log_msg(log_file, f"[inject-pgo-profile-runtime] Heartbeat: elapsed {elapsed_min:.1f}m, containers seen: {len(version_dirs)}, injected: {injected_total}")
 
         time.sleep(2)
 
+    log_msg(log_file, f"[inject-pgo-profile-runtime] Finished watcher. Injected total: {injected_total}")
     return 0
 
 
