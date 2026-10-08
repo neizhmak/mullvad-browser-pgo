@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -60,6 +61,47 @@ class InjectorTests(unittest.TestCase):
         for dest in (dest1, dest2, dest3, dest4):
             self.assertTrue(dest.is_file(), f"Missing {dest}")
             self.assertEqual(dest.read_bytes(), self.runtime.read_bytes())
+
+    def test_inject_into_compiler_archive(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("injector", INJECTOR)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        found = mod.find_runtime(self.upstream, self.tools, self.base)
+        self.assertIsNotNone(found)
+
+        # Prepare dummy out/mingw-w64-clang archive
+        mwc_dir = self.upstream / "out/mingw-w64-clang"
+        mwc_dir.mkdir(parents=True)
+
+        staging = self.base / "staging/mingw-w64-clang/lib/clang/21"
+        staging.mkdir(parents=True)
+        (staging / "test.txt").write_text("dummy clang header")
+
+        tar_path = self.base / "archive.tar"
+        subprocess.run(
+            ["tar", "-cf", str(tar_path), "mingw-w64-clang/lib/clang/21/test.txt"],
+            cwd=self.base / "staging",
+            check=True,
+        )
+
+        tar_zst = mwc_dir / "mingw-w64-clang-test-21.1.8.tar.zst"
+        subprocess.run(["zstd", "-f", str(tar_path), "-o", str(tar_zst)], check=True)
+
+        log_file = self.base / "archive_injector.log"
+        injected = mod.inject_into_compiler_archives(self.upstream, found, log_file)
+        self.assertEqual(injected, 1)
+
+        # Verify tar contents
+        list_proc = subprocess.run(["tar", "-tf", str(tar_zst)], stdout=subprocess.PIPE, text=True, check=True)
+        self.assertIn("mingw-w64-clang/lib/clang/21/lib/x86_64-w64-windows-gnu/libclang_rt.profile.a", list_proc.stdout)
+        self.assertIn("mingw-w64-clang/lib/clang/21/lib/windows/libclang_rt.profile.a", list_proc.stdout)
+        self.assertIn("mingw-w64-clang/lib/clang/21/lib/windows/libclang_rt.profile-x86_64.a", list_proc.stdout)
+
+        # Second call should skip cleanly
+        injected2 = mod.inject_into_compiler_archives(self.upstream, found, log_file)
+        self.assertEqual(injected2, 0)
 
 
 if __name__ == "__main__":

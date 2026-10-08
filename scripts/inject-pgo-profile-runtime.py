@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Asynchronously inject the verified Windows x86_64 PGO compiler runtime.
+"""Inject the verified Windows x86_64 PGO compiler runtime.
 
 When compiling instrumented Firefox for Windows x86_64, the Clang driver passes
 libclang_rt.profile.a at link time. In the Tor Browser Build / RBM container,
@@ -8,9 +8,13 @@ compiler-rt profile runtime. Rust's toolchain (built with profiler=true) already
 contains the exact bit-compatible Windows x86_64 compiler-rt profile object files
 in libprofiler_builtins.
 
-This watcher monitors active build processes via /proc/*/root and filesystem trees
-(upstream/tmp, /tmp, /var/tmp, /mnt) and automatically installs libclang_rt.profile.a
-into the unpacked mingw-w64-clang toolchain inside the container rootfs as soon as it appears.
+This script delivers libclang_rt.profile.a into the compiler toolchain:
+1. Immediately pre-injects the profile runtime directly into the cached compiler
+   archive in upstream/out/mingw-w64-clang/*.tar.* so that RBM automatically extracts
+   it into the build container when setting up the toolchain.
+2. Continually monitors active processes via /proc/*/root and filesystem trees
+   (upstream/tmp, /tmp, /var/tmp, /mnt) to ensure any active container instance is also
+   injected.
 """
 import argparse
 import os
@@ -18,6 +22,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -88,6 +93,103 @@ def find_runtime(upstream=None, tools_dir=None, runner_temp=None, log_file=None)
                     log_msg(log_file, f"Extraction from {archive.name} failed: {ex}")
 
     return None
+
+
+def inject_into_compiler_archives(upstream, runtime, log_file=None):
+    if not upstream or not runtime:
+        return 0
+    injected = 0
+    mwc_out = Path(upstream) / "out/mingw-w64-clang"
+    if not mwc_out.is_dir():
+        return 0
+
+    for archive_path in mwc_out.glob("mingw-w64-clang-*.tar.*"):
+        if not archive_path.is_file():
+            continue
+        try:
+            # 1. Check if archive already contains libclang_rt.profile.a
+            list_proc = subprocess.run(
+                ["tar", "-tf", str(archive_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            if "libclang_rt.profile.a" in list_proc.stdout:
+                continue
+
+            # 2. Find clang version and prefix from archive listing
+            clang_vers = set()
+            prefix = ""
+            for line in list_proc.stdout.splitlines():
+                parts = line.strip("/").split("/")
+                if "lib" in parts and "clang" in parts:
+                    idx = parts.index("clang")
+                    if idx + 1 < len(parts):
+                        ver = parts[idx + 1]
+                        if ver.isdigit():
+                            clang_vers.add(ver)
+                            prefix = "/".join(parts[:idx + 1])
+
+            if not clang_vers:
+                continue
+
+            # 3. Decompress, append runtime, and recompress
+            with tempfile.TemporaryDirectory(prefix="mwc-repack-") as td:
+                work = Path(td)
+                raw_tar = work / "uncompressed.tar"
+
+                # Decompress based on extension
+                if archive_path.name.endswith(".zst"):
+                    subprocess.run(["zstd", "-d", str(archive_path), "-o", str(raw_tar)], check=True)
+                elif archive_path.name.endswith(".gz"):
+                    with open(raw_tar, "wb") as out_f:
+                        subprocess.run(["gzip", "-d", "-c", str(archive_path)], stdout=out_f, check=True)
+                elif archive_path.name.endswith(".xz"):
+                    with open(raw_tar, "wb") as out_f:
+                        subprocess.run(["xz", "-d", "-c", str(archive_path)], stdout=out_f, check=True)
+                else:
+                    shutil.copyfile(archive_path, raw_tar)
+
+                files_to_append = []
+                for ver in sorted(clang_vers):
+                    for subdir in ("lib/x86_64-w64-windows-gnu", "lib/windows"):
+                        target_dir = work / prefix / ver / subdir
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        dest_a = target_dir / "libclang_rt.profile.a"
+                        shutil.copyfile(runtime, dest_a)
+                        os.chmod(dest_a, 0o644)
+                        files_to_append.append(str(dest_a.relative_to(work)))
+
+                        dest_b = target_dir / "libclang_rt.profile-x86_64.a"
+                        shutil.copyfile(runtime, dest_b)
+                        os.chmod(dest_b, 0o644)
+                        files_to_append.append(str(dest_b.relative_to(work)))
+
+                # Append files into tar archive
+                subprocess.run(["tar", "-rf", str(raw_tar)] + files_to_append, cwd=work, check=True)
+
+                # Recompress
+                recompressed = work / ("recompressed" + archive_path.suffix)
+                if archive_path.name.endswith(".zst"):
+                    subprocess.run(["zstd", "-T0", "-f", str(raw_tar), "-o", str(recompressed)], check=True)
+                elif archive_path.name.endswith(".gz"):
+                    with open(recompressed, "wb") as out_f:
+                        subprocess.run(["gzip", "-c", str(raw_tar)], stdout=out_f, check=True)
+                elif archive_path.name.endswith(".xz"):
+                    with open(recompressed, "wb") as out_f:
+                        subprocess.run(["xz", "-T0", "-c", str(raw_tar)], stdout=out_f, check=True)
+                else:
+                    recompressed = raw_tar
+
+                # Replace original archive
+                shutil.move(recompressed, archive_path)
+                injected += 1
+                log_msg(log_file, f"[inject-pgo-profile-runtime] Injected profile runtime into compiler archive {archive_path.name}")
+        except Exception as ex:
+            log_msg(log_file, f"[inject-pgo-profile-runtime] Archive injection into {archive_path.name} failed: {ex}")
+
+    return injected
 
 
 def find_clang_version_dirs(upstream):
@@ -187,6 +289,8 @@ def main():
         log_msg(log_file, "[inject-pgo-profile-runtime] WARNING: Initial runtime resolution found no file; will keep retrying.")
     else:
         log_msg(log_file, f"[inject-pgo-profile-runtime] Resolved profiler runtime: {runtime} ({runtime.stat().st_size} bytes)")
+        # Pre-inject directly into compiler archives before RBM extracts them
+        inject_into_compiler_archives(upstream, runtime, log_file)
 
     start_time = time.time()
     last_heartbeat = start_time
@@ -202,6 +306,7 @@ def main():
             runtime = find_runtime(upstream, tools_dir, runner_temp, log_file)
             if runtime:
                 log_msg(log_file, f"[inject-pgo-profile-runtime] Resolved profiler runtime: {runtime} ({runtime.stat().st_size} bytes)")
+                inject_into_compiler_archives(upstream, runtime, log_file)
 
         if runtime:
             count = inject_into_containers(upstream, runtime, log_file)
