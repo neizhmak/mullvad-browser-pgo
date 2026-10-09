@@ -72,6 +72,17 @@ readonly backup_mirror_base="https://mirror.init7.net/gnu/binutils"
 
 configure_host_swap() {
   if [[ "$(uname -s)" == "Linux" ]] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo rm -rf \
+      /usr/local/lib/android \
+      /usr/share/dotnet \
+      /opt/ghc \
+      /usr/local/.ghcup \
+      /usr/local/share/powershell \
+      /usr/local/share/chromium \
+      /opt/hostedtoolcache/CodeQL \
+      /usr/lib/jvm \
+      2>/dev/null || true
+
     local swap_total_kb
     swap_total_kb="$(awk '/SwapTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
     if (( swap_total_kb < 18000000 )); then
@@ -94,6 +105,20 @@ configure_host_swap() {
             sudo swapon "$swap_file" >/dev/null 2>&1 || true
           fi
         fi
+      fi
+    fi
+
+    if [[ -d "/mnt" ]]; then
+      local mnt_tmp="/mnt/rbm-tmp"
+      sudo mkdir -p "$mnt_tmp" 2>/dev/null || true
+      sudo chown -R "$(id -u):$(id -g)" "$mnt_tmp" 2>/dev/null || true
+      chmod 777 "$mnt_tmp" 2>/dev/null || true
+      if [[ -d "$UPSTREAM" ]]; then
+        if [[ -d "$UPSTREAM/tmp" && ! -L "$UPSTREAM/tmp" ]]; then
+          cp -a "$UPSTREAM/tmp/." "$mnt_tmp/" 2>/dev/null || true
+          rm -rf "$UPSTREAM/tmp"
+        fi
+        ln -sfn "$mnt_tmp" "$UPSTREAM/tmp"
       fi
     fi
   fi
