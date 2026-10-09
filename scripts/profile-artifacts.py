@@ -282,6 +282,8 @@ def check_training_logs(directory):
         require(path.is_file() and not path.is_symlink(), f"missing native training log: {name}")
         with path.open(encoding="utf-8", errors="replace") as stream:
             for line in stream:
+                if line.strip().startswith("Verify log for LLVM Profile Error"):
+                    continue
                 require("LLVM Profile Error" not in line and "PROCESS-CRASH" not in line,
                         f"profile error or crash reported in {name}")
     require(not list(directory.rglob("*.dmp")), "training left crash minidumps")
