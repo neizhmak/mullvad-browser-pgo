@@ -150,5 +150,47 @@ class InjectorTests(unittest.TestCase):
         self.assertIn("llvm-strip.real", strip_bin.read_text())
         self.assertEqual(real_bin.read_text(), "#!/bin/sh\necho original\n")
 
+    def test_restore_compiler_archives(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("injector", INJECTOR)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        found = mod.find_runtime(self.upstream, self.tools, self.base)
+        self.assertIsNotNone(found)
+
+        mwc_dir = self.upstream / "out/mingw-w64-clang"
+        mwc_dir.mkdir(parents=True, exist_ok=True)
+
+        staging = self.base / "staging_restore/mingw-w64-clang"
+        (staging / "lib/clang/21").mkdir(parents=True)
+        (staging / "lib/clang/21/test.txt").write_text("original-unmodified-content")
+
+        tar_path = self.base / "archive_restore.tar"
+        subprocess.run(
+            ["tar", "-cf", str(tar_path), "mingw-w64-clang"],
+            cwd=self.base / "staging_restore",
+            check=True,
+        )
+
+        tar_zst = mwc_dir / "mingw-w64-clang-restore-21.1.8.tar.zst"
+        subprocess.run(["zstd", "-f", str(tar_path), "-o", str(tar_zst)], check=True)
+        orig_bytes = tar_zst.read_bytes()
+
+        log_file = self.base / "restore_injector.log"
+        injected = mod.inject_into_compiler_archives(self.upstream, found, log_file)
+        self.assertEqual(injected, 1)
+
+        # Check backup was created and archive was modified
+        backup_file = tar_zst.with_name(tar_zst.name + ".original")
+        self.assertTrue(backup_file.is_file())
+        self.assertNotEqual(tar_zst.read_bytes(), orig_bytes)
+
+        # Restore
+        restored = mod.restore_compiler_archives(self.upstream, log_file)
+        self.assertEqual(restored, 1)
+        self.assertFalse(backup_file.exists())
+        self.assertEqual(tar_zst.read_bytes(), orig_bytes)
+
 if __name__ == "__main__":
     unittest.main()

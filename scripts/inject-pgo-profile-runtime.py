@@ -12,18 +12,25 @@ In Tor Browser Build / RBM:
    without flags, which defaults to strip-all, clearing base relocations and failing on
    large PE libraries. A safe strip wrapper intercepts bare strip invocations and runs
    --strip-debug to protect relocations and exports.
+4. Compiler archives must be restored to their original bytes before Step 16 runs
+   capture-pgo-toolchains.py so that post-build provenance verification validates.
 
 This watcher:
-1. Pre-injects libclang_rt.profile.a into out/mingw-w64-clang/*.tar.* and wraps bin/llvm-strip.
+1. Pre-injects libclang_rt.profile.a into out/mingw-w64-clang/*.tar.* and wraps bin/llvm-strip,
+   preserving a backup of the original compiler archive.
 2. Monitors active containers (/proc/*/root, upstream/tmp, /mnt/rbm-tmp) and injects
    the runtime and wrapper into any running container instances.
+3. Automatically restores the original compiler archives once RBM has extracted them
+   into build containers (after 15 minutes or upon parent process completion).
 """
 import argparse
 import glob
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -129,6 +136,27 @@ def find_runtime(upstream=None, tools_dir=None, runner_temp=None, log_file=None)
     return None
 
 
+def restore_compiler_archives(upstream, log_file=None):
+    """Restore cached out/mingw-w64-clang archives to their exact original bytes."""
+    if not upstream:
+        return 0
+    mwc_out = Path(upstream) / "out/mingw-w64-clang"
+    if not mwc_out.is_dir():
+        return 0
+    restored = 0
+    for backup in mwc_out.glob("*.original"):
+        orig_name = backup.name[:-len(".original")]
+        orig_target = backup.parent / orig_name
+        try:
+            shutil.copy2(backup, orig_target)
+            backup.unlink(missing_ok=True)
+            restored += 1
+            log_msg(log_file, f"[inject-pgo-profile-runtime] Restored exact original compiler archive: {orig_name}")
+        except Exception as ex:
+            log_msg(log_file, f"[inject-pgo-profile-runtime] Failed restoring {orig_name}: {ex}")
+    return restored
+
+
 def inject_into_compiler_archives(upstream, runtime, log_file=None):
     """Pre-inject runtime and safe strip wrapper into cached out/mingw-w64-clang archives."""
     if not upstream or not runtime:
@@ -139,7 +167,7 @@ def inject_into_compiler_archives(upstream, runtime, log_file=None):
         return 0
 
     for archive_path in mwc_out.glob("mingw-w64-clang-*.tar.*"):
-        if not archive_path.is_file():
+        if not archive_path.is_file() or archive_path.name.endswith(".original"):
             continue
         try:
             # 1. Check if archive already contains libclang_rt.profile.a
@@ -172,6 +200,12 @@ def inject_into_compiler_archives(upstream, runtime, log_file=None):
 
             if not clang_vers and not strip_entry:
                 continue
+
+            # Backup original archive if not already backed up
+            backup_path = archive_path.with_name(archive_path.name + ".original")
+            if not backup_path.is_file():
+                shutil.copy2(archive_path, backup_path)
+                log_msg(log_file, f"[inject-pgo-profile-runtime] Backed up original archive to {backup_path.name}")
 
             # 3. Decompress, append runtime & wrapper, and recompress
             with tempfile.TemporaryDirectory(prefix="mwc-repack-") as td:
@@ -364,6 +398,17 @@ def main():
 
     log_msg(log_file, f"[inject-pgo-profile-runtime] Started watcher for {upstream} (parent PID: {parent_pid})")
 
+    def handle_signal(sig, frame):
+        log_msg(log_file, f"[inject-pgo-profile-runtime] Received signal {sig}, restoring compiler archives...")
+        restore_compiler_archives(upstream, log_file)
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+    except (ValueError, OSError):
+        pass
+
     runtime = find_runtime(upstream, tools_dir, runner_temp, log_file)
     if not runtime:
         log_msg(log_file, "[inject-pgo-profile-runtime] WARNING: Initial runtime resolution found no file; will keep retrying.")
@@ -376,32 +421,43 @@ def main():
     last_heartbeat = start_time
     max_duration = 280 * 60  # 280 minutes
     injected_total = 0
+    restored_archive = False
 
-    while time.time() - start_time < max_duration:
-        if not is_process_alive(parent_pid):
-            log_msg(log_file, f"[inject-pgo-profile-runtime] Monitored parent PID {parent_pid} has exited. Terminating watcher.")
-            break
+    try:
+        while time.time() - start_time < max_duration:
+            if not is_process_alive(parent_pid):
+                log_msg(log_file, f"[inject-pgo-profile-runtime] Monitored parent PID {parent_pid} has exited. Terminating watcher.")
+                break
 
-        if not runtime:
-            runtime = find_runtime(upstream, tools_dir, runner_temp, log_file)
+            if not runtime:
+                runtime = find_runtime(upstream, tools_dir, runner_temp, log_file)
+                if runtime:
+                    log_msg(log_file, f"[inject-pgo-profile-runtime] Resolved profiler runtime: {runtime} ({runtime.stat().st_size} bytes)")
+                    inject_into_compiler_archives(upstream, runtime, log_file)
+
             if runtime:
-                log_msg(log_file, f"[inject-pgo-profile-runtime] Resolved profiler runtime: {runtime} ({runtime.stat().st_size} bytes)")
-                inject_into_compiler_archives(upstream, runtime, log_file)
+                count = inject_into_containers(upstream, runtime, log_file)
+                injected_total += count
 
-        if runtime:
-            count = inject_into_containers(upstream, runtime, log_file)
-            injected_total += count
+            # Restore original archive once toolchains are safely extracted into containers
+            # (after 15 minutes of build running, RBM has long extracted mingw-w64-clang)
+            if not restored_archive and (time.time() - start_time >= 15 * 60):
+                rc = restore_compiler_archives(upstream, log_file)
+                if rc > 0:
+                    restored_archive = True
 
-        now = time.time()
-        if now - last_heartbeat >= 60:
-            last_heartbeat = now
-            elapsed_min = (now - start_time) / 60
-            version_dirs = find_clang_version_dirs(upstream)
-            log_msg(log_file, f"[inject-pgo-profile-runtime] Heartbeat: elapsed {elapsed_min:.1f}m, containers seen: {len(version_dirs)}, injected: {injected_total}")
+            now = time.time()
+            if now - last_heartbeat >= 60:
+                last_heartbeat = now
+                elapsed_min = (now - start_time) / 60
+                version_dirs = find_clang_version_dirs(upstream)
+                log_msg(log_file, f"[inject-pgo-profile-runtime] Heartbeat: elapsed {elapsed_min:.1f}m, containers seen: {len(version_dirs)}, injected: {injected_total}")
 
-        time.sleep(2)
+            time.sleep(2)
+    finally:
+        restore_compiler_archives(upstream, log_file)
+        log_msg(log_file, f"[inject-pgo-profile-runtime] Finished watcher. Injected total: {injected_total}")
 
-    log_msg(log_file, f"[inject-pgo-profile-runtime] Finished watcher. Injected total: {injected_total}")
     return 0
 
 
