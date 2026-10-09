@@ -436,6 +436,11 @@ def run_profileserver(source, binary, output, build_path, timeout=3600, bootstra
     crash_tools = output / "crash-tools"
     crash_tools.mkdir(exist_ok=True)
     env["MOZ_FETCHES_DIR"] = str(crash_tools)
+    if sys.platform == "win32":
+        mb_dir = Path(env.get("MOZILLABUILD", output / "mozilla-build"))
+        for sub in ("msys2/usr/bin", "msys/bin", "bin"):
+            (mb_dir / sub).mkdir(parents=True, exist_ok=True)
+        env["MOZILLABUILD"] = str(mb_dir)
     # Exact mozcrash saves dumps and counts crashes without a stackwalker. This
     # directory prevents profileserver's missing MOZ_FETCHES_DIR exception. A
     # missing binary produces a diagnostic on crash, never a false success.

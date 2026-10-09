@@ -92,6 +92,12 @@ try {
     # topsrcdir. Its mozrunner adds --wait-for-browser on Windows and propagates
     # both initialization and workload native exit codes. No wrapper workload or
     # extra Firefox launch contributes profile data.
+    # Ensure MozillaBuild directory exists on Windows runners where C:\mozilla-build is absent
+    $mozillabuild = "$env:RUNNER_TEMP\mozilla-build"
+    New-Item -ItemType Directory -Force "$mozillabuild\msys2\usr\bin" | Out-Null
+    New-Item -ItemType Directory -Force "$mozillabuild\msys\bin" | Out-Null
+    New-Item -ItemType Directory -Force "$mozillabuild\bin" | Out-Null
+    $env:MOZILLABUILD = $mozillabuild
     # Command executed by helper: python mach python --virtualenv build build/pgo/profileserver.py --binary ...
     Get-ChildItem $source -File -Filter '*.profraw' -ErrorAction SilentlyContinue | Remove-Item -Force
     Invoke-NativeChecked 'python' @($helper, 'run-profileserver', '--source-directory', $source,
