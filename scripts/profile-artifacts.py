@@ -440,6 +440,9 @@ def run_profileserver(source, binary, output, build_path, timeout=3600, bootstra
         mb_dir = Path(env.get("MOZILLABUILD", output / "mozilla-build"))
         for sub in ("msys2/usr/bin", "msys/bin", "bin"):
             (mb_dir / sub).mkdir(parents=True, exist_ok=True)
+        version_file = mb_dir / "VERSION"
+        if not version_file.is_file():
+            version_file.write_text("4.1.0\n", encoding="utf-8")
         env["MOZILLABUILD"] = str(mb_dir)
     # Exact mozcrash saves dumps and counts crashes without a stackwalker. This
     # directory prevents profileserver's missing MOZ_FETCHES_DIR exception. A

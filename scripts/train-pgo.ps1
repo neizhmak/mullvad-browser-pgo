@@ -97,6 +97,7 @@ try {
     New-Item -ItemType Directory -Force "$mozillabuild\msys2\usr\bin" | Out-Null
     New-Item -ItemType Directory -Force "$mozillabuild\msys\bin" | Out-Null
     New-Item -ItemType Directory -Force "$mozillabuild\bin" | Out-Null
+    Set-Content -Path "$mozillabuild\VERSION" -Value "4.1.0"
     $env:MOZILLABUILD = $mozillabuild
     # Command executed by helper: python mach python --virtualenv build build/pgo/profileserver.py --binary ...
     Get-ChildItem $source -File -Filter '*.profraw' -ErrorAction SilentlyContinue | Remove-Item -Force
