@@ -67,6 +67,63 @@ readonly signature="$filename.sig"
 readonly output_dir="$UPSTREAM/out/binutils"
 readonly configured_base="https://ftpmirror.gnu.org/gnu/binutils"
 readonly fallback_base="https://ftp.gnu.org/gnu/binutils"
+readonly mirror_fallback_base="https://mirrors.kernel.org/gnu/binutils"
+readonly backup_mirror_base="https://mirror.init7.net/gnu/binutils"
+
+configure_host_swap() {
+  if [[ "$(uname -s)" == "Linux" ]] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo rm -rf \
+      /usr/local/lib/android \
+      /usr/share/dotnet \
+      /opt/ghc \
+      /usr/local/.ghcup \
+      /usr/local/share/powershell \
+      /usr/local/share/chromium \
+      /opt/hostedtoolcache/CodeQL \
+      /usr/lib/jvm \
+      2>/dev/null || true
+
+    local swap_total_kb
+    swap_total_kb="$(awk '/SwapTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if (( swap_total_kb < 18000000 )); then
+      local swap_dir="/mnt"
+      [[ -d "$swap_dir" ]] || swap_dir="/var/tmp"
+      local free_kb
+      free_kb="$(df -k "$swap_dir" 2>/dev/null | awk 'NR==2 {print $4}')"
+      local swap_file="$swap_dir/pgo-swapfile"
+      if ! grep -q "$swap_file" /proc/swaps 2>/dev/null; then
+        if (( free_kb > 25000000 )); then
+          if sudo fallocate -l 20G "$swap_file" 2>/dev/null || sudo dd if=/dev/zero of="$swap_file" bs=1M count=20480 status=none 2>/dev/null; then
+            sudo chmod 600 "$swap_file"
+            sudo mkswap "$swap_file" >/dev/null 2>&1 || true
+            sudo swapon "$swap_file" >/dev/null 2>&1 || true
+          fi
+        elif (( free_kb > 15000000 )); then
+          if sudo fallocate -l 10G "$swap_file" 2>/dev/null || sudo dd if=/dev/zero of="$swap_file" bs=1M count=10240 status=none 2>/dev/null; then
+            sudo chmod 600 "$swap_file"
+            sudo mkswap "$swap_file" >/dev/null 2>&1 || true
+            sudo swapon "$swap_file" >/dev/null 2>&1 || true
+          fi
+        fi
+      fi
+    fi
+
+    if [[ -d "/mnt" ]]; then
+      local mnt_tmp="/mnt/rbm-tmp"
+      sudo mkdir -p "$mnt_tmp" 2>/dev/null || true
+      sudo chown -R "$(id -u):$(id -g)" "$mnt_tmp" 2>/dev/null || true
+      chmod 777 "$mnt_tmp" 2>/dev/null || true
+      if [[ -d "$UPSTREAM" ]]; then
+        if [[ -d "$UPSTREAM/tmp" && ! -L "$UPSTREAM/tmp" ]]; then
+          cp -a "$UPSTREAM/tmp/." "$mnt_tmp/" 2>/dev/null || true
+          rm -rf "$UPSTREAM/tmp"
+        fi
+        ln -sfn "$mnt_tmp" "$UPSTREAM/tmp"
+      fi
+    fi
+  fi
+}
+configure_host_swap
 
 [[ -f "$keyring" ]] || { echo "error: pinned Binutils keyring is missing: $keyring" >&2; exit 1; }
 mkdir -p "$output_dir"
@@ -122,6 +179,12 @@ if download_and_verify "$configured_base" "RBM-configured GNU mirror"; then
   exit 0
 fi
 if download_and_verify "$fallback_base" "GNU primary fallback"; then
+  exit 0
+fi
+if download_and_verify "$mirror_fallback_base" "GNU kernel.org mirror"; then
+  exit 0
+fi
+if download_and_verify "$backup_mirror_base" "GNU init7.net mirror"; then
   exit 0
 fi
 

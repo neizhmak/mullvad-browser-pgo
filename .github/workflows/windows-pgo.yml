@@ -1,0 +1,339 @@
+name: Build and validate optimized Windows Alpha PGO packages
+on:
+  workflow_dispatch:
+    inputs:
+      profile_release:
+        description: Immutable verified pgo-profile prerelease from Stage 4A
+        type: string
+        required: true
+      profile_identity:
+        description: Full verified profile identity SHA-256
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      profile_release:
+        type: string
+        required: true
+      profile_identity:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+env:
+  RBM_NO_DEBUG: "1"
+  PGO_PROFILE_RELEASE: ${{ inputs.profile_release }}
+  PGO_PROFILE_IDENTITY: ${{ inputs.profile_identity }}
+concurrency:
+  group: windows-pgo-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate-request:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject unsupported or ambiguous profile checkpoint
+        run: |
+          set -euo pipefail
+          [[ "$PGO_PROFILE_IDENTITY" =~ ^[0-9a-f]{64}$ ]]
+          expected="pgo-profile-$(jq -r .tag upstream.lock.json)-$PGO_PROFILE_IDENTITY"
+          test "$PGO_PROFILE_RELEASE" = "$expected"
+          python3 scripts/validate-update-config.py
+  pgo-firefox:
+    needs: validate-request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize pinned build
+        run: |
+          echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
+          tag="$(jq -r .tag upstream.lock.json)"
+          echo "RBM_RELEASE=rbm-dependencies-$tag" >> "$GITHUB_ENV"
+      - name: Install RBM requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdata-dump-perl libdata-uuid-perl libdatetime-perl libdigest-sha-perl libfile-copy-recursive-perl libfile-slurp-perl libio-all-perl libcapture-tiny-perl libio-handle-util-perl libjson-perl libparallel-forkmanager-perl libpath-tiny-perl libsort-versions-perl libstring-shellquote-perl libtemplate-perl libxml-libxml-perl libxml-writer-perl libyaml-libyaml-perl git uidmap zstd jq
+      - name: Prepare and validate RBM user namespaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_user="$(id -un)"
+          echo "RBM build user: $build_user (uid=$(id -u) gid=$(id -g))"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          missing_files=()
+          for map_file in /etc/subuid /etc/subgid; do
+            if ! awk -F: -v user="$build_user" '$1 == user && $3 > 0 { found = 1 } END { exit !found }' "$map_file"; then
+              missing_files+=("$map_file")
+            fi
+          done
+          if (( ${#missing_files[@]} )); then
+            range_start="$(python3 - <<'PYNS'
+          from pathlib import Path
+          size = 65536
+          ranges = []
+          for filename in ('/etc/subuid', '/etc/subgid'):
+              for line in Path(filename).read_text().splitlines():
+                  fields = line.split(':')
+                  if len(fields) != 3:
+                      continue
+                  try:
+                      start, length = map(int, fields[1:])
+                  except ValueError:
+                      continue
+                  if length > 0:
+                      ranges.append((start, start + length))
+          candidate = 100000
+          while True:
+              end = candidate + size
+              conflicts = [stop for start, stop in ranges if candidate < stop and start < end]
+              if not conflicts:
+                  print(candidate)
+                  break
+              candidate = max(conflicts)
+          PYNS
+            )"
+            for map_file in "${missing_files[@]}"; do
+              printf '%s:%s:65536\n' "$build_user" "$range_start" | sudo tee -a "$map_file" >/dev/null
+            done
+          fi
+          sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          awk -F: -v user="$build_user" '$1 == user' /etc/subuid | sed 's/^/subuid: /'
+          awk -F: -v user="$build_user" '$1 == user' /etc/subgid | sed 's/^/subgid: /'
+      - name: Fetch exact upstream and restore compilers
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
+          git -C "$UPSTREAM" submodule update --init rbm
+          "$UPSTREAM/rbm/container" run -- /bin/true
+          ./scripts/rbm-release-artifacts.py restore-required --upstream "$UPSTREAM" --stage clang --stage mingw-w64-clang --stage rust
+      - name: Restore exact profiler toolchain and recompute local expected provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ./scripts/prepare-pgo-generate.sh
+          ./scripts/validate-pgo-overlay.sh
+          ./scripts/resolve-pgo-rust-identity.py --upstream "$UPSTREAM" --output "$RUNNER_TEMP/pgo-rust-identity.json"
+          release="pgo-toolchains-$(jq -r .tag upstream.lock.json)-$(sha256sum "$RUNNER_TEMP/pgo-rust-identity.json" | cut -d' ' -f1)"
+          ./scripts/rbm-release-artifacts.py restore-required --upstream "$UPSTREAM" --release "$release" --stage rust-pgo --identity-file "$RUNNER_TEMP/pgo-rust-identity.json"
+          ./scripts/preflight-pgo-rust.sh
+          ./scripts/resolve-pgo-provenance.sh
+          ./scripts/capture-pgo-toolchains.py --upstream "$UPSTREAM" --provenance "$RUNNER_TEMP/provenance/build.json" --rust-identity "$RUNNER_TEMP/pgo-rust-identity.json" --tools "$RUNNER_TEMP/pgo-rust-preflight-tools"
+          echo "PGO_EXPECTED_PROVENANCE=$RUNNER_TEMP/provenance/build.json" >> "$GITHUB_ENV"
+      - name: Restore exact pinned Node support and recompute expected archive bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/restore-pgo-support.py --upstream "$UPSTREAM" --pgo-target pgo-generate --output-directory "$RUNNER_TEMP/pgo-support" --provenance "$PGO_EXPECTED_PROVENANCE"
+      - name: Strictly restore identity-bound C++ and Rust profile
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ./scripts/profile-artifacts.py restore --repository "$GITHUB_REPOSITORY" --release "$PGO_PROFILE_RELEASE" --directory "$RUNNER_TEMP/restored-profile" --expected-provenance "$PGO_EXPECTED_PROVENANCE" --expected-identity "$PGO_PROFILE_IDENTITY"
+          echo "PGO_PROFILE_DIR=$RUNNER_TEMP/restored-profile" >> "$GITHUB_ENV"
+      - name: Prepare verified profile-use inputs without changing normal targets
+        run: ./scripts/prepare-pgo-use.sh
+      - name: Confirm profile-use selects the same pinned Node support
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/restore-pgo-support.py --upstream "$UPSTREAM" --pgo-target pgo-use --output-directory "$RUNNER_TEMP/pgo-support" --provenance "$PGO_EXPECTED_PROVENANCE"
+      - name: Prepare verified Binutils input
+        run: ./scripts/prepare-binutils-input.sh
+      - name: Build only optimized Firefox with C++ and Rust profile use
+        timeout-minutes: 285
+        run: ./scripts/run-pgo-use.sh --stage firefox
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgo-optimized-firefox
+          path: |
+            ${{ runner.temp }}/pgo-use/firefox-output.tar
+            ${{ runner.temp }}/pgo-use/firefox-output.json
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
+      - name: Preserve optimized build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-optimized-firefox-logs
+          path: |
+            ${{ runner.temp }}/pgo-use/*.log
+            ${{ runner.temp }}/pgo-use/*.json
+            ${{ runner.temp }}/pgo-use/*.rendered
+            ${{ runner.temp }}/pgo-use/*.env
+            ${{ runner.temp }}/pgo-use/*.sha256
+            ${{ runner.temp }}/pgo-use/*resources.jsonl
+            ${{ runner.temp }}/pgo-support/
+            ${{ runner.temp }}/provenance/
+            ${{ runner.temp }}/tor-browser-build/logs/
+          if-no-files-found: warn
+  pgo-package:
+    needs: pgo-firefox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize pinned build
+        run: |
+          echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
+          tag="$(jq -r .tag upstream.lock.json)"
+          echo "RBM_RELEASE=rbm-dependencies-$tag" >> "$GITHUB_ENV"
+      - name: Install RBM requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdata-dump-perl libdata-uuid-perl libdatetime-perl libdigest-sha-perl libfile-copy-recursive-perl libfile-slurp-perl libio-all-perl libcapture-tiny-perl libio-handle-util-perl libjson-perl libparallel-forkmanager-perl libpath-tiny-perl libsort-versions-perl libstring-shellquote-perl libtemplate-perl libxml-libxml-perl libxml-writer-perl libyaml-libyaml-perl git uidmap zstd jq
+      - name: Prepare and validate RBM user namespaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_user="$(id -un)"
+          echo "RBM build user: $build_user (uid=$(id -u) gid=$(id -g))"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          missing_files=()
+          for map_file in /etc/subuid /etc/subgid; do
+            if ! awk -F: -v user="$build_user" '$1 == user && $3 > 0 { found = 1 } END { exit !found }' "$map_file"; then
+              missing_files+=("$map_file")
+            fi
+          done
+          if (( ${#missing_files[@]} )); then
+            range_start="$(python3 - <<'PYNS'
+          from pathlib import Path
+          size = 65536
+          ranges = []
+          for filename in ('/etc/subuid', '/etc/subgid'):
+              for line in Path(filename).read_text().splitlines():
+                  fields = line.split(':')
+                  if len(fields) != 3:
+                      continue
+                  try:
+                      start, length = map(int, fields[1:])
+                  except ValueError:
+                      continue
+                  if length > 0:
+                      ranges.append((start, start + length))
+          candidate = 100000
+          while True:
+              end = candidate + size
+              conflicts = [stop for start, stop in ranges if candidate < stop and start < end]
+              if not conflicts:
+                  print(candidate)
+                  break
+              candidate = max(conflicts)
+          PYNS
+            )"
+            for map_file in "${missing_files[@]}"; do
+              printf '%s:%s:65536\n' "$build_user" "$range_start" | sudo tee -a "$map_file" >/dev/null
+            done
+          fi
+          sysctl kernel.unprivileged_userns_clone 2>/dev/null || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          awk -F: -v user="$build_user" '$1 == user' /etc/subuid | sed 's/^/subuid: /'
+          awk -F: -v user="$build_user" '$1 == user' /etc/subgid | sed 's/^/subgid: /'
+      - name: Fetch exact upstream and restore compilers
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
+          git -C "$UPSTREAM" submodule update --init rbm
+          "$UPSTREAM/rbm/container" run -- /bin/true
+          ./scripts/rbm-release-artifacts.py restore-required --upstream "$UPSTREAM" --stage clang --stage mingw-w64-clang --stage rust
+      - name: Restore exact profiler toolchain and recompute local expected provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ./scripts/prepare-pgo-generate.sh
+          ./scripts/validate-pgo-overlay.sh
+          ./scripts/resolve-pgo-rust-identity.py --upstream "$UPSTREAM" --output "$RUNNER_TEMP/pgo-rust-identity.json"
+          release="pgo-toolchains-$(jq -r .tag upstream.lock.json)-$(sha256sum "$RUNNER_TEMP/pgo-rust-identity.json" | cut -d' ' -f1)"
+          ./scripts/rbm-release-artifacts.py restore-required --upstream "$UPSTREAM" --release "$release" --stage rust-pgo --identity-file "$RUNNER_TEMP/pgo-rust-identity.json"
+          ./scripts/preflight-pgo-rust.sh
+          ./scripts/resolve-pgo-provenance.sh
+          ./scripts/capture-pgo-toolchains.py --upstream "$UPSTREAM" --provenance "$RUNNER_TEMP/provenance/build.json" --rust-identity "$RUNNER_TEMP/pgo-rust-identity.json" --tools "$RUNNER_TEMP/pgo-rust-preflight-tools"
+          echo "PGO_EXPECTED_PROVENANCE=$RUNNER_TEMP/provenance/build.json" >> "$GITHUB_ENV"
+      - name: Restore exact pinned Node support and recompute expected archive bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/restore-pgo-support.py --upstream "$UPSTREAM" --pgo-target pgo-generate --output-directory "$RUNNER_TEMP/pgo-support" --provenance "$PGO_EXPECTED_PROVENANCE"
+      - name: Strictly restore identity-bound C++ and Rust profile
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ./scripts/profile-artifacts.py restore --repository "$GITHUB_REPOSITORY" --release "$PGO_PROFILE_RELEASE" --directory "$RUNNER_TEMP/restored-profile" --expected-provenance "$PGO_EXPECTED_PROVENANCE" --expected-identity "$PGO_PROFILE_IDENTITY"
+          echo "PGO_PROFILE_DIR=$RUNNER_TEMP/restored-profile" >> "$GITHUB_ENV"
+      - name: Prepare verified profile-use inputs without changing normal targets
+        run: ./scripts/prepare-pgo-use.sh
+      - name: Confirm profile-use selects the same pinned Node support
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/restore-pgo-support.py --upstream "$UPSTREAM" --pgo-target pgo-use --output-directory "$RUNNER_TEMP/pgo-support" --provenance "$PGO_EXPECTED_PROVENANCE"
+      - name: Prepare verified Binutils input
+        run: ./scripts/prepare-binutils-input.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: pgo-optimized-firefox
+          path: ${{ runner.temp }}/optimized-firefox
+      - name: Package verified Firefox without rebuilding it
+        timeout-minutes: 240
+        env:
+          PGO_FIREFOX_ARTIFACT_DIR: ${{ runner.temp }}/optimized-firefox
+        run: ./scripts/run-pgo-use.sh --stage browser
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mullvad-browser-alpha-windows-x86_64-pgo
+          path: ${{ runner.temp }}/final-packages/
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+      - name: Preserve packaging diagnostics and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-packaging-logs
+          path: |
+            ${{ runner.temp }}/pgo-use/*.log
+            ${{ runner.temp }}/pgo-use/*.json
+            ${{ runner.temp }}/pgo-use/*.rendered
+            ${{ runner.temp }}/pgo-use/*.env
+            ${{ runner.temp }}/pgo-use/*.sha256
+            ${{ runner.temp }}/pgo-use/*resources.jsonl
+            ${{ runner.temp }}/pgo-support/
+            ${{ runner.temp }}/provenance/
+            ${{ runner.temp }}/tor-browser-build/logs/
+          if-no-files-found: warn
+  pgo-windows-check:
+    needs: pgo-package
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: mullvad-browser-alpha-windows-x86_64-pgo
+          path: ${{ runner.temp }}/pgo-packages
+      - name: Restore same-lock baseline with original artifact digest verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: python scripts/windows-runtime-check.py prepare-baseline --output-directory "$env:RUNNER_TEMP/baseline" --repository "$env:GITHUB_REPOSITORY"
+      - name: Check installer and portable with an isolated offline native workload
+        shell: pwsh
+        run: ./scripts/check-windows-packages.ps1
+      - name: Preserve native checks and raw benchmark samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-windows-runtime-report
+          path: ${{ runner.temp }}/pgo-runtime-check/
+          if-no-files-found: warn

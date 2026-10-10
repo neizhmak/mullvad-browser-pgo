@@ -1,0 +1,280 @@
+diff --git a/projects/firefox/build b/projects/firefox/build
+--- a/projects/firefox/build
++++ b/projects/firefox/build
+@@ -118,14 +118,88 @@
+   [% END -%]
+ [% END -%]
+ 
++[% IF c("var/pgo_use") -%]
++  [% IF c("var/pgo_generate") -%]
++    echo 'PGO generation and profile use are mutually exclusive' >&2
++    exit 1
++  [% END -%]
++  mkdir -p /var/tmp/dist/pgo
++  cp "$rootdir/[% c('input_files_by_name/pgo-profdata') %]" /var/tmp/dist/pgo/merged.profdata
++  cp "$rootdir/[% c('input_files_by_name/pgo-jarlog') %]" /var/tmp/dist/pgo/jarlog
++[% END -%]
++
+ echo "Starting ./mach configure $(date)"
+ ./mach configure \
+   --with-distribution-id=org.torproject \
+   [% IF c("var/pgo_generate") -%]--enable-profile-generate=cross[% END %] \
++[% IF c("var/pgo_use") -%]
++  --enable-profile-use=cross \
++  --with-pgo-profile-path=/var/tmp/dist/pgo/merged.profdata \
++  --with-pgo-jarlog=/var/tmp/dist/pgo/jarlog \
++[% END -%]
+   [% IF !c("var/firefox-browser") %]--with-base-browser-version=[% c("var/torbrowser_version") %][% END %] \
+   [% IF c("var/updater_enabled") -%]--enable-update-channel=[% c("var/channel") %][% END %] \
+   [% IF !c("var/firefox-browser") -%]--with-branding="$branding_dir"[% END %] \
+   [% IF !c("var/rlbox") -%]--without-wasm-sandboxed-libraries[% END %]
++
++[% IF c("var/pgo_use") -%]
++# The exact pinned configure.py emits this JSON; do not execute config.status.
++python3 - "[% out_dir %]/pgo-use-proof.json" <<'PY_PGO_PROOF'
++import glob, json, pathlib, sys
++statuses = glob.glob("obj-*/config.status.json")
++if len(statuses) != 1:
++    raise SystemExit("expected exactly one configured Firefox object directory")
++configuration = json.loads(pathlib.Path(statuses[0]).read_text())
++substs = configuration["substs"]
++defines = configuration["defines"]
++profile = "/var/tmp/dist/pgo/merged.profdata"
++jarlog = "/var/tmp/dist/pgo/jarlog"
++for key in ("MOZ_PROFILE_USE", "MOZ_PGO_RUST"):
++    if not substs.get(key):
++        raise SystemExit("configured Firefox did not enable " + key)
++if substs.get("MOZ_PROFILE_GENERATE"):
++    raise SystemExit("configured profile-use Firefox still enables generation")
++if substs.get("PGO_PROFILE_PATH") != profile:
++    raise SystemExit("configured Firefox uses the wrong profile")
++if "-fprofile-use=" + profile not in substs.get("PROFILE_USE_CFLAGS", []):
++    raise SystemExit("C++ profile-use flags are absent from config.status")
++configured_jarlog = substs.get("PGO_JARLOG_PATH")
++if configured_jarlog not in (jarlog, [jarlog], (jarlog,)):
++    raise SystemExit("configured Firefox uses the wrong jarlog")
++# Prove the unchanged official signed Alpha route, not actual MAR integration.
++update_substs = {
++    "MOZ_UPDATER": "1", "BASE_BROWSER_UPDATE": "1", "MOZ_VERIFY_MAR_SIGNATURE": "1",
++    "MOZ_USE_NSS_FOR_MAR": "1", "MOZ_UPDATE_CHANNEL": "alpha",
++    "BB_UPDATER_URL": "https://cdn.mullvad.net/browser/update_responses/update_1",
++    "MAR_CHANNEL_ID": "mullvadbrowser-mullvad-alpha",
++    "ACCEPTED_MAR_CHANNEL_IDS": "mullvadbrowser-mullvad-alpha",
++}
++update_defines = {
++    "MOZ_VERIFY_MAR_SIGNATURE": "1",
++    "BASE_BROWSER_VERSION": "[% c('var/torbrowser_version') %]",
++    "BASE_BROWSER_VERSION_QUOTED": '"[% c('var/torbrowser_version') %]"',
++}
++for section, expected in ((substs, update_substs), (defines, update_defines)):
++    for key, value in expected.items():
++        if section.get(key) != value:
++            raise SystemExit("secure official Alpha updater configuration mismatch: " + key)
++disabled_update_options = ("MOZ_MAINTENANCE_SERVICE", "MOZ_UPDATE_AGENT", "DISABLE_UPDATER_AUTHENTICODE_CHECK")
++for key in disabled_update_options:
++    if substs.get(key) or defines.get(key):
++        raise SystemExit("unexpected updater security/background option: " + key)
++executable = "[% c('var/exe_name') %].exe"
++if executable != "mullvadbrowser.exe":
++    raise SystemExit("PGO use supports the pinned Mullvad executable only")
++proof = {"schema": 1, "executable": executable, "firefox_revision": "[% c('var/git_commit') %]",
++         "pgo_profile_sha256": "[% c('var/pgo_profile_sha256') %]",
++         "pgo_jarlog_sha256": "[% c('var/pgo_jarlog_sha256') %]",
++         "substs": {k: substs.get(k) for k in ("MOZ_PGO", "MOZ_PROFILE_USE", "MOZ_PGO_RUST", "MOZ_PROFILE_GENERATE", "PGO_PROFILE_PATH", "PROFILE_USE_CFLAGS", "PGO_JARLOG_PATH", *update_substs, *disabled_update_options)},
++         "defines": {k: defines.get(k) for k in (*update_defines, *disabled_update_options)},
++         "updater_verification": "unchanged secure official signed Alpha configuration; MAR integration not tested"}
++pathlib.Path(sys.argv[1]).write_text(json.dumps(proof, sort_keys=True, indent=2) + "\n")
++print("Verified configured C++ and Rust cross-language profile use.")
++PY_PGO_PROOF
++[% END -%]
+ 
+ echo "Starting ./mach build $(date)"
+ ./mach build --verbose
+diff --git a/projects/firefox/config b/projects/firefox/config
+--- a/projects/firefox/config
++++ b/projects/firefox/config
+@@ -94,6 +94,13 @@
+         version: '[% c("abbrev") %]'
+ 
+ targets:
++  # Explicit overlay-only profile consumer; normal target chains remain unchanged.
++  pgo-use:
++    var:
++      pgo_use: 1
++      pgo_profile_sha256: '[% ENV.PGO_PROFILE_SHA256 %]'
++      pgo_jarlog_sha256: '[% ENV.PGO_JARLOG_SHA256 %]'
++
+   # Overlay-selected target: absent from all normal release target chains.
+   pgo-generate:
+     var:
+@@ -172,6 +179,16 @@
+     tag_gpg_id: 0
+ 
+ input_files:
++  - filename: 'pgo-[% c("var/pgo_profile_sha256") %].profdata'
++    name: pgo-profdata
++    sha256sum: '[% c("var/pgo_profile_sha256") %]'
++    refresh_input: 1
++    enable: '[% c("var/pgo_use") %]'
++  - filename: 'pgo-[% c("var/pgo_jarlog_sha256") %].jarlog'
++    name: pgo-jarlog
++    sha256sum: '[% c("var/pgo_jarlog_sha256") %]'
++    refresh_input: 1
++    enable: '[% c("var/pgo_use") %]'
+   - project: container-image
+   - filename: 'mozconfig'
+     content: '[% INCLUDE "mozconfig.in" %]'
+diff --git a/projects/browser/build b/projects/browser/build
+--- a/projects/browser/build
++++ b/projects/browser/build
+@@ -1,5 +1,11 @@
+ #!/bin/bash
+ [% c("var/set_default_env") -%]
++[% SET firefox_input = c('input_files_by_name/firefox') -%]
++[% IF c("var/pgo_use") -%]
++  mkdir -p "$rootdir/pgo-firefox"
++  tar -C "$rootdir/pgo-firefox" -xf "$rootdir/[% firefox_input %]"
++  [% SET firefox_input = 'pgo-firefox' -%]
++[% END -%]
+ distdir=/var/tmp/dist/[% project %]
+ export TORBROWSER_VERSION='[% c("version") %]'
+ 
+@@ -64,7 +70,7 @@
+ 
+ [% IF c("var/updater_enabled") -%]
+   # Extract the MAR tools.
+-  unzip -d $rootdir $rootdir/[% c('input_files_by_name/firefox') %]/mar-tools-*.zip
++  unzip -d $rootdir $rootdir/[% firefox_input %]/mar-tools-*.zip
+   MARTOOLS=$rootdir/mar-tools
+ [% END -%]
+ 
+@@ -166,7 +172,7 @@
+   cp $rootdir/gtk3-settings.ini $GTK_SETTINGS_DIR/settings.ini
+ [% END %]
+ 
+-tar -C "${TB_STAGE_DIR}" -xf [% c('input_files_by_name/firefox') %]/browser.tar.[% c("compress_tar") %]
++tar -C "${TB_STAGE_DIR}" -xf [% firefox_input %]/browser.tar.[% c("compress_tar") %]
+ 
+ [% IF c("var/macos_universal") -%]
+   # Use symlink in tmp dir to extract "Tor Browser.app" to "Tor Browser-aarch64.app"
+@@ -280,7 +286,7 @@
+ 
+   [% IF c('var/mullvad-browser') -%]
+     pushd $distdir/windows-installer
+-    tar -xf $rootdir/[% c('input_files_by_name/firefox') %]/nsis-plugins.tar.[% c("compress_tar") %]
++    tar -xf $rootdir/[% firefox_input %]/nsis-plugins.tar.[% c("compress_tar") %]
+     # While Firefox re-uses the uninstaller for this, we cannot do it, because
+     # we write the uninstaller from the installer.
+     # Instead, we need to write an updated postupdate.exe also when updating.
+@@ -317,7 +323,7 @@
+ [% END -%]
+ 
+ [% IF c("var/updater_enabled") -%]
+-  cp $rootdir/[% c('input_files_by_name/firefox') %]/mar-tools-*.zip "$OUTDIR"/
++  cp $rootdir/[% firefox_input %]/mar-tools-*.zip "$OUTDIR"/
+ [% END -%]
+ 
+ [% IF c("var/windows") -%]
+@@ -326,12 +332,12 @@
+   archive_ext=tar.xz
+ [% END -%]
+ 
+-debug_symbols="$rootdir/[% c('input_files_by_name/firefox') %]/browser-debug-symbols.$archive_ext"
++debug_symbols="$rootdir/[% firefox_input %]/browser-debug-symbols.$archive_ext"
+ if [[ -f "$debug_symbols" ]]; then
+   cp "$debug_symbols"  "$OUTDIR/[% c('var/project-name') %]-debug-symbols-[% c('var/mar_osname') %]-[% c('var/torbrowser_version') %].$archive_ext"
+ fi
+ 
+-geckodriver="$rootdir/[% c('input_files_by_name/firefox') %]/geckodriver.$archive_ext"
++geckodriver="$rootdir/[% firefox_input %]/geckodriver.$archive_ext"
+ if [[ -f "$geckodriver" ]]; then
+   cp "$geckodriver" "$OUTDIR/geckodriver-[% c('var/osname') %]-[% c('var/torbrowser_version') %].$archive_ext"
+ fi
+@@ -355,7 +361,7 @@
+   [% END -%]
+ [% END -%]
+ [% IF c("var/build_infos_json") -%]
+-  cp $rootdir/[% c('input_files_by_name/firefox') %]/build-infos.json "$OUTDIR"/build-infos-[% c("var/mar_osname") %].json
++  cp $rootdir/[% firefox_input %]/build-infos.json "$OUTDIR"/build-infos-[% c("var/mar_osname") %].json
+ [% END -%]
+ 
+ [% IF c("var/updater_enabled") -%]
+@@ -398,6 +404,39 @@
+     makensis browser-install.nsi
+     python3 $rootdir/pe_checksum_fix.py browser-install.exe
+     mv browser-install.exe $OUTDIR/[% c("var/project-name") %]-[% c("var/osname") %]-[% c("var/torbrowser_version") %].exe
++    [% IF c('var/pgo_use') -%]
++    # The stock standalone installer copies the full Mullvad Browser tree.
++    # Its absence of Browser/system-install selects Mullvad portable data paths.
++    python3 - '[% c("var/Project_Name") %]' "$OUTDIR/[% c("var/project-name") %]-[% c("var/osname") %]-portable-[% c("var/torbrowser_version") %].zip" '[% c("var/browser_release_date_timestamp") %]' <<'PY_PGO_PORTABLE'
++import pathlib, stat, sys, time, zipfile
++root = pathlib.Path(sys.argv[1])
++executable = "[% c('var/exe_name') %].exe"
++if executable != "mullvadbrowser.exe":
++    raise SystemExit("portable output must use the pinned Mullvad executable")
++if not (root / "Browser" / executable).is_file():
++    raise SystemExit("portable browser tree is missing " + executable)
++if (root / "Browser/firefox.exe").exists():
++    raise SystemExit("portable tree contains an unexpected Firefox executable")
++if (root / "Browser/system-install").exists():
++    raise SystemExit("portable tree contains the system-install marker")
++launcher = root / "Start Mullvad Browser.cmd"
++launcher.write_bytes(('@echo off\r\nsetlocal\r\nstart "" /d "%~dp0" "%~dp0Browser\\' + executable + '" %*\r\n').encode("utf-8"))
++stamp = time.gmtime(int(sys.argv[3]))[:6]
++with zipfile.ZipFile(sys.argv[2], "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
++    for path in sorted(root.rglob("*")):
++        if path.is_symlink():
++            raise SystemExit("portable tree contains a symlink")
++        if not path.is_file():
++            continue
++        info = zipfile.ZipInfo(path.as_posix(), stamp)
++        info.compress_type = zipfile.ZIP_DEFLATED
++        info.external_attr = (stat.S_IFREG | 0o644) << 16
++        with path.open("rb") as source, archive.open(info, "w") as output:
++            while block := source.read(1024 * 1024):
++                output.write(block)
++print("Created complete Mullvad standalone portable ZIP.")
++PY_PGO_PORTABLE
++    [% END -%]
+   [% ELSE -%]
+     makensis browser-portable.nsi
+     # Working around NSIS braindamage
+@@ -412,7 +451,7 @@
+   [% IF c("var/macos_universal") -%]
+     cp -a $rootdir/[% c('input_files_by_name/firefox-aarch64') %]/artifacts "$OUTDIR"
+   [% END -%]
+-  cp -a $rootdir/[% c('input_files_by_name/firefox') %]/artifacts "$OUTDIR"
++  cp -a $rootdir/[% firefox_input %]/artifacts "$OUTDIR"
+   [%
+      SET artifacts_archs = [ c("var/osname") ];
+      IF c("var/macos_universal");
+diff --git a/projects/browser/config b/projects/browser/config
+--- a/projects/browser/config
++++ b/projects/browser/config
+@@ -16,6 +16,11 @@
+ 
+ 
+ targets:
++
++  pgo-use:
++    var:
++      pgo_use: 1
++      pgo_firefox_sha256: '[% ENV.PGO_FIREFOX_SHA256 %]'
+ 
+   linux:
+     var:
+@@ -70,7 +75,13 @@
+     enable: '[% c("var/macos") %]'
+   - project: firefox
+     name: firefox
+-    enable: '[% !c("var/android") %]'
++    enable: '[% !c("var/android") && !c("var/pgo_use") %]'
++  # Do not recurse into Firefox in the packaging job. Consume only its verified output.
++  - filename: 'pgo-firefox-[% c("var/pgo_firefox_sha256") %].tar'
++    name: firefox
++    sha256sum: '[% c("var/pgo_firefox_sha256") %]'
++    refresh_input: 1
++    enable: '[% c("var/pgo_use") %]'
+   - project: firefox
+     name: firefox-aarch64
+     enable: '[% c("var/macos_universal") %]'

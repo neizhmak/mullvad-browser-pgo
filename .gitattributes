@@ -1,0 +1,3 @@
+# A unified diff uses one space as the prefix for empty context lines.
+# The patched upstream tree has its own mandatory git diff --check gate.
+*.patch whitespace=-blank-at-eol

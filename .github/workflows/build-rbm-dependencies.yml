@@ -120,6 +120,8 @@ jobs:
           if ./scripts/rbm-release-artifacts.py stage-complete --upstream "$UPSTREAM" --stage "$RBM_PROJECT"; then
             echo "complete=true" >> "$GITHUB_OUTPUT"
           else
+            status=$?
+            test "$status" -eq 1 || { echo 'Dependency checkpoint failed integrity/access verification' >&2; exit "$status"; }
             echo "complete=false" >> "$GITHUB_OUTPUT"
           fi
         env:

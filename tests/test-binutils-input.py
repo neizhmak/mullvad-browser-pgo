@@ -22,7 +22,7 @@ input_files:
 
 
 class BinutilsInputTests(unittest.TestCase):
-    def run_runner(self, mirror="missing", primary="valid", config_text=CONFIG):
+    def run_runner(self, mirror="missing", primary="valid", kernel="missing", init7="missing", config_text=CONFIG):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             upstream = root / "upstream"
@@ -40,7 +40,10 @@ while (($#)); do
   if [[ $1 == --output ]]; then output=$2; shift 2; continue; fi
   url=$1; shift
 done
-if [[ $url == https://ftpmirror.gnu.org/* ]]; then mode=$MIRROR_MODE; else mode=$PRIMARY_MODE; fi
+if [[ $url == https://ftpmirror.gnu.org/* ]]; then mode=$MIRROR_MODE;
+elif [[ $url == https://ftp.gnu.org/* ]]; then mode=$PRIMARY_MODE;
+elif [[ $url == https://mirrors.kernel.org/* ]]; then mode=$KERNEL_MODE;
+else mode=$INIT7_MODE; fi
 if [[ $mode == partial ]]; then printf partial > "$output"; exit 22; fi
 [[ $mode != missing ]] || exit 22
 if [[ $url == *.sig ]]; then printf '%s\n' "$mode" > "$output"; else printf tarball > "$output"; fi
@@ -58,6 +61,8 @@ grep -qx valid "$signature"
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
                 "MIRROR_MODE": mirror,
                 "PRIMARY_MODE": primary,
+                "KERNEL_MODE": kernel,
+                "INIT7_MODE": init7,
                 "GPG_CALLS": str(root / "gpg-calls"),
             }
             before = config.read_bytes()
@@ -87,7 +92,7 @@ grep -qx valid "$signature"
                 self.assertEqual(len(gpg_calls), 0 if signature == "missing" else 1)
 
     def test_partial_download_never_becomes_canonical_input(self):
-        result, files, _, _ = self.run_runner(mirror="partial", primary="partial")
+        result, files, _, _ = self.run_runner(mirror="partial", primary="partial", kernel="partial", init7="partial")
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(files, [])
 
@@ -98,6 +103,23 @@ grep -qx valid "$signature"
         self.assertEqual(files, [])
         self.assertEqual(gpg_calls, [])
         self.assertTrue(config_unchanged)
+
+
+    def test_verified_kernel_mirror_fallback_is_published_when_primary_is_missing(self):
+        result, files, gpg_calls, config_unchanged = self.run_runner(mirror="missing", primary="missing", kernel="valid")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(files, ["binutils-9.99.tar.xz", "binutils-9.99.tar.xz.sig"])
+        self.assertEqual(gpg_calls, ["verify"])
+        self.assertTrue(config_unchanged)
+        self.assertIn("Using verified Binutils input from GNU kernel.org mirror", result.stdout)
+
+    def test_verified_backup_mirror_fallback_is_published_when_kernel_is_missing(self):
+        result, files, gpg_calls, config_unchanged = self.run_runner(mirror="missing", primary="missing", kernel="missing", init7="valid")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(files, ["binutils-9.99.tar.xz", "binutils-9.99.tar.xz.sig"])
+        self.assertEqual(gpg_calls, ["verify"])
+        self.assertTrue(config_unchanged)
+        self.assertIn("Using verified Binutils input from GNU init7.net mirror", result.stdout)
 
 
 if __name__ == "__main__":

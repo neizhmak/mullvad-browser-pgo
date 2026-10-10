@@ -114,3 +114,109 @@ uploads resulting Windows `.exe` and `.mar` packages as private workflow-run
 artifacts for inspection, and always uploads available RBM/browser logs. It
 does not publish a product Release and applies no Firefox, recipe, or PGO
 changes.
+
+## Verified Windows Alpha C++ and Rust PGO
+
+Current scope is **Alpha, Windows x86_64 only**, using the existing
+`mb-16.0a9-build1` lock. Stable is not selected. Both C++ and Rust PGO are
+mandatory. No Firefox privacy, extension, RLBox, or MAR-verification setting
+is weakened. This is still an unofficial build.
+
+The **Stage 4A - Generate verified Windows PGO profile** workflow separates
+long work across standard GitHub-hosted runners. Every job is at most six
+hours. Run it on the overlay branch you want to test:
+
+```sh
+# First validate the durable Rust toolchain checkpoint on native Windows.
+gh workflow run pgo-stage4a.yml --ref YOUR_BRANCH -f toolchain_only=true
+
+# Complete instrumented build -> native training -> checked profile ->
+# optimized Firefox -> installer + portable ZIP -> native Windows comparison.
+gh workflow run pgo-stage4a.yml --ref YOUR_BRANCH
+```
+
+The default dispatch completes the pipeline (`finish_pipeline=true`). For a
+profile checkpoint only, pass `-f finish_pipeline=false`. The reusable
+workflow defaults to profile generation only; a caller must explicitly enable
+`finish_pipeline` to build and validate the final packages.
+
+1. **Rust:** target-scoped `profiler=true` only for
+   `x86_64-pc-windows-gnullvm`. Stock Linux, bare WASM, and i686 settings stay
+   unchanged. Generation and use select the same distinct profiler Rust
+   artifact. A real cross-compile/link test and native Windows `.profraw`
+   emission must pass before publication.
+2. **Generation:** build the exact RBM-selected Firefox output. Require
+   configure and actual C++/Rust instrumentation evidence. Select only its
+   `browser.tar.*`, never an NSIS or unrelated archive.
+3. **Training:** use the exact pinned Firefox `profileserver.py`, its mach
+   build virtualenv, and a native Windows runner. Bind raw profiles and jarlog
+   to the source, workload, instrumented package, overlay, and compiler bytes.
+   Failures retain logs, raw files, and crash evidence.
+4. **Merge:** use matching restored LLVM tools. Require positive function,
+   block, and execution counts, including at least one positive C++ function
+   and one positive Rust function. An empty or single-language profile fails.
+5. **Use:** independently recompute source and compiler provenance in each
+   final runner before strict profile restoration. Build optimized Firefox
+   with cross-language profile use. Hand off its verified output to a separate
+   packaging job, which must not recursively rebuild Firefox.
+6. **Packages:** produce both the stock installer and a complete standalone
+   portable ZIP with `Start Mullvad Browser.cmd`. Portable mode preserves the
+   full `Browser/` tree and has no `Browser/system-install` marker.
+7. **Validation:** verify hashes before extraction/execution, install to
+   disposable paths, check both layouts and common product bytes, and run an
+   offline native screenshot/JavaScript workload. Compare interleaved samples
+   with the successful same-lock baseline. Reports include raw samples and
+   descriptive medians; they do not promise a speedup or invent a performance
+   threshold.
+
+Successful final packages are Actions artifacts named
+`mullvad-browser-alpha-windows-x86_64-pgo`, with a `packages.json` inventory.
+This workflow does **not** publish a browser product Release. Technical Rust
+and profile checkpoints are prereleases and never GitHub's latest release.
+A workflow file or artifact alone is not evidence that the full pipeline
+passed: require successful generation, training, merge, both builds, and the
+native Windows report.
+
+For retrying only final use/packaging after a verified profile is published:
+
+```sh
+gh workflow run windows-pgo.yml --ref YOUR_BRANCH \
+  -f profile_release='pgo-profile-mb-16.0a9-build1-FULL_IDENTITY_SHA256' \
+  -f profile_identity='FULL_IDENTITY_SHA256'
+```
+
+GitHub may not list a new standalone workflow until it has reached the default
+branch. In that case dispatch the already registered `pgo-stage4a.yml` on the
+implementation branch. See [the runbook](docs/pgo-runbook.md) for checkpoints,
+retries, diagnostics, and known limits.
+
+## Updates and publication limits
+
+Automatic updates keep the **official signed Mullvad Alpha track** intact in
+the interim. An official update replaces this unofficial PGO build with the
+standard upstream browser. Authenticode signing is separate from signed MAR
+verification; omitting Authenticode never permits an unsigned MAR.
+
+A private signed PGO track is preparation only. It still needs user-owned
+hosting, protected signing keys, deliberate public-certificate embedding, a
+monotonic version policy, and real update tests. Nothing is deployed by the
+example configuration. Read [the update design](docs/updates.md) before
+changing updater settings. Full public browser publication is deferred.
+
+## Lightweight regression checks
+
+```sh
+python3 scripts/run-tests.py
+```
+
+This runs every Python test directly, including historical hyphenated names,
+plus shell integrity and syntax checks. Install Template Toolkit to execute
+native recipe-rendering tests and PowerShell to execute its optional training
+wrapper tests. CI provisions these requirements. A separate Windows job tests
+native process isolation and parses all PowerShell entry points. Tests use
+local fixtures and fake tool commands, not heavy browser builds.
+
+To test the offline harness against the actual authenticated stock baseline
+before waiting for Firefox PGO compilation, manually dispatch
+`tests.yml -f baseline_smoke=true`. Its baseline-only report never claims a
+validated PGO pipeline. The smoke job does not run on ordinary pushes or PRs.

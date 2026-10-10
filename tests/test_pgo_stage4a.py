@@ -9,9 +9,22 @@ PATCH=(ROOT/'patches/firefox-pgo-generate.patch').read_text()
 TRAIN=(ROOT/'scripts/train-pgo.ps1').read_text()
 RUN=(ROOT/'scripts/run-pgo-generate.sh').read_text()
 PUBLISH=(ROOT/'scripts/publish-pgo-profile.py').read_text()
+PREFLIGHT=(ROOT/'scripts/preflight-pgo-rust.sh').read_text()
+RUST_IDENTITY=(ROOT/'scripts/resolve-pgo-rust-identity.py').read_text()
+RELEASES=(ROOT/'scripts/rbm-release-artifacts.py').read_text()
+TOOLCHAIN=(ROOT/'.github/workflows/pgo-toolchain.yml').read_text()
+MERGE=(ROOT/'scripts/merge-pgo-profile.py').read_text()
+PROFILE=(ROOT/'scripts/profile-artifacts.py').read_text()
 VALIDATOR=ROOT/'scripts/validate-pgo-rendering.py'
 BASELINE=(ROOT/'.github/workflows/baseline.yml').read_text()
 class Stage4ATests(unittest.TestCase):
+ def test_technical_profile_release_uses_default_anchor_not_workflow_commit(self):
+  create_lines = [line.strip() for line in WORKFLOW.splitlines() if 'gh release create' in line]
+  self.assertEqual(len(create_lines),1)
+  self.assertNotIn('--target',create_lines[0])
+  self.assertIn('--prerelease',create_lines[0]); self.assertIn('--latest=false',create_lines[0])
+  self.assertIn('default branch',create_lines[0])
+  self.assertIn('profile registry binds the exact build and training inputs',create_lines[0])
  def test_baseline_remains_non_pgo_control(self):
   self.assertNotIn('profile-generate',BASELINE); self.assertNotIn('pgo-generate',BASELINE)
   self.assertIn('make mullvadbrowser-alpha-windows-x86_64', (ROOT/'scripts/run-baseline-build.sh').read_text())
@@ -57,7 +70,7 @@ class Stage4ATests(unittest.TestCase):
  def test_training_is_native_windows_exact_profileserver(self):
   self.assertIn('runs-on: windows-2025',WORKFLOW)
   self.assertIn('build\\pgo\\profileserver.py',TRAIN)
-  self.assertIn('git -C $source fetch --depth=1 origin',TRAIN)
+  self.assertIn("'-C', $source, 'fetch', '--depth=1', 'origin'",TRAIN)
   self.assertIn('$env:FIREFOX_REF',TRAIN)
   self.assertNotIn('wine', (WORKFLOW+TRAIN).lower())
   self.assertNotIn('speedometer', (WORKFLOW+TRAIN).lower())
@@ -65,15 +78,55 @@ class Stage4ATests(unittest.TestCase):
   self.assertIn("'*.profraw'",TRAIN); self.assertIn('Length -gt 0',TRAIN)
   self.assertIn('no non-empty jarlog was produced',TRAIN)
  def test_merge_uses_restored_matching_profdata_and_rejects_empty(self):
-  self.assertIn('restore-required --upstream "$UPSTREAM" --stage mingw-w64-clang',WORKFLOW)
+  self.assertIn('--stage mingw-w64-clang',WORKFLOW)
   self.assertIn('LLVM_PROFDATA=$profdata',WORKFLOW)
-  self.assertIn("-name '*.profraw' -size +0c",WORKFLOW)
-  self.assertIn("test -s \"$RUNNER_TEMP/training/jarlog\"",WORKFLOW)
-  self.assertIn('show --summary-only',WORKFLOW)
+  self.assertIn('.toolchains.clang.sha256',WORKFLOW)
+  self.assertIn('sha256sum --check --strict',WORKFLOW)
+  self.assertIn('Merge and verify C++ AND Rust profile counters',WORKFLOW)
+  self.assertNotIn('--summary-only',WORKFLOW)
+  self.assertNotIn('"--summary-only"',MERGE)
+  self.assertIn('--training-directory',WORKFLOW)
  def test_publication_registry_is_commit_marker_uploaded_last(self):
-  self.assertIn("payload=[d/'merged.profdata',d/'jarlog',d/'provenance.json']",PUBLISH)
-  self.assertLess(PUBLISH.index("for f in payload:"),PUBLISH.rindex("str(registry)"))
-  self.assertIn("if 'profile-registry.json' in current",PUBLISH)
-  self.assertIn('conflicting verified profile already committed',PUBLISH)
-  self.assertIn('committed:true',WORKFLOW)
+  self.assertIn('profile-artifacts.py release-tag',WORKFLOW)
+  self.assertIn('profile-artifacts.py identity',WORKFLOW)
+  self.assertIn('Publish verified payloads with registry last',WORKFLOW)
+  self.assertIn('Technical C++/Rust profile checkpoint',WORKFLOW)
+  self.assertIn('--latest=false',WORKFLOW)
+  self.assertIn('artifacts.publish(args.repository, args.release, args.directory)',PUBLISH)
+ def test_pgo_target_alone_selects_distinct_profiler_rust(self):
+  self.assertIn('pgo-generate:',PATCH)
+  self.assertIn('filename_targets: "[% c(\'var/platform\') %]-profiler"',PATCH)
+  self.assertIn('--set target.x86_64-pc-windows-gnullvm.profiler=true',PATCH)
+  self.assertNotIn('--set build.profiler=true',PATCH)
+  self.assertNotIn('build.profiler',BASELINE)
+  self.assertIn("normal == pgo",RUST_IDENTITY)
+ def test_official_rust_release_is_never_used_for_pgo_publication(self):
+  self.assertIn('pgo-toolchains-$(jq -r .tag upstream.lock.json)-$sha',TOOLCHAIN)
+  self.assertIn('--release "$PGO_TOOLCHAIN_RELEASE" --stage rust-pgo',WORKFLOW+TOOLCHAIN)
+  self.assertNotIn('publish --upstream "$UPSTREAM" --release "$RBM_RELEASE" --stage rust-pgo',WORKFLOW)
+  self.assertIn('conflicting existing RBM output',RELEASES)
+ def test_pgo_rust_registry_has_separate_bound_provenance(self):
+  for field in ('upstream','rust','overlay','mingw_w64_clang','sha256','size'):
+   self.assertIn(field,RUST_IDENTITY)
+  self.assertIn('"identity": identity',RELEASES)
+  self.assertIn('expected_identity',RELEASES)
+  self.assertLess(RELEASES.index('for path, artifact in zip(paths, artifacts):'),
+                  RELEASES.rindex('upload_asset(args, registry)'))
+ def test_committed_pgo_rust_is_restored_and_build_skipped(self):
+  self.assertIn("stage-complete",TOOLCHAIN); self.assertIn("complete=true",TOOLCHAIN)
+  self.assertIn("steps.cache.outputs.complete == 'true'",TOOLCHAIN)
+  self.assertIn("steps.cache.outputs.complete != 'true'",TOOLCHAIN)
+  self.assertIn('rust-native-check',TOOLCHAIN)
+ def test_profile_generate_link_preflight_is_fatal_before_firefox(self):
+  self.assertIn('-C "profile-generate=$profile"',PREFLIGHT)
+  self.assertIn('--target "$target"',PREFLIGHT)
+  self.assertIn('rustc sysroot:',PREFLIGHT); self.assertIn('--print target-libdir',PREFLIGHT)
+  self.assertIn('pgo-rust-runtime-inventory.log',PREFLIGHT)
+  self.assertLess(WORKFLOW.index('./scripts/preflight-pgo-rust.sh'),
+                  WORKFLOW.index('Build only instrumented Firefox'))
+ def test_no_rust_pgo_workaround(self):
+  combined=WORKFLOW+PATCH+RUN+PREFLIGHT
+  self.assertNotIn('MOZ_PGO_RUST=0',combined)
+  self.assertNotIn('--disable-profile-generate',combined)
+  self.assertIn('--enable-profile-generate=cross',combined)
 if __name__=='__main__': unittest.main()
