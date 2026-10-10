@@ -32,6 +32,18 @@ else
   git -C "$UPSTREAM" apply "$patch_file"
 fi
 git -C "$UPSTREAM" diff --check
+python3 - "$UPSTREAM/projects/firefox/config" <<'PY_FIX'
+import pathlib, sys
+config_path = pathlib.Path(sys.argv[1])
+if config_path.is_file():
+    text = config_path.read_text(encoding="utf-8")
+    fixed = text.replace("    name: pgo-profdata\n    sha256sum: '[% c(\"var/pgo_profile_sha256\") %]'\n    refresh_input: 1\n",
+                         "    name: pgo-profdata\n    sha256sum: '[% c(\"var/pgo_profile_sha256\") %]'\n")
+    fixed = fixed.replace("    name: pgo-jarlog\n    sha256sum: '[% c(\"var/pgo_jarlog_sha256\") %]'\n    refresh_input: 1\n",
+                          "    name: pgo-jarlog\n    sha256sum: '[% c(\"var/pgo_jarlog_sha256\") %]'\n")
+    if fixed != text:
+        config_path.write_text(fixed, encoding="utf-8")
+PY_FIX
 python3 - "$work/profile" "$UPSTREAM/projects/firefox" <<'PY_INPUTS'
 import hashlib, pathlib, shutil, sys
 profile, destination = map(pathlib.Path, sys.argv[1:])
