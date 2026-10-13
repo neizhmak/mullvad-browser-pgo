@@ -43,6 +43,19 @@ if config_path.is_file():
                           "    name: pgo-jarlog\n    sha256sum: '[% c(\"var/pgo_jarlog_sha256\") %]'\n")
     if fixed != text:
         config_path.write_text(fixed, encoding="utf-8")
+
+build_path = config_path.with_name("build")
+if build_path.is_file():
+    b_text = build_path.read_text(encoding="utf-8")
+    old_code = 'cp "$rootdir/[% c(\'input_files_by_name/pgo-jarlog\') %]" /var/tmp/dist/pgo/jarlog\n[% END -%]'
+    new_code = (
+        'cp "$rootdir/[% c(\'input_files_by_name/pgo-jarlog\') %]" /var/tmp/dist/pgo/jarlog\n'
+        '  # Fix AttributeError in lto-pgo.configure on Windows MinGW where select_linker is None\n'
+        '  sed -i \'s/linker\\.KIND/(linker and linker.KIND)/g\' build/moz.configure/lto-pgo.configure 2>/dev/null || true\n'
+        '[% END -%]'
+    )
+    if old_code in b_text:
+        build_path.write_text(b_text.replace(old_code, new_code, 1), encoding="utf-8")
 PY_FIX
 python3 - "$work/profile" "$UPSTREAM/projects/firefox" <<'PY_INPUTS'
 import hashlib, pathlib, shutil, sys
