@@ -56,6 +56,14 @@ if build_path.is_file():
     )
     if old_code in b_text:
         build_path.write_text(b_text.replace(old_code, new_code, 1), encoding="utf-8")
+
+browser_config_path = config_path.parent.parent / "browser/config"
+if browser_config_path.is_file():
+    br_text = browser_config_path.read_text(encoding="utf-8")
+    fixed_br = br_text.replace("    name: firefox\n    sha256sum: '[% c(\"var/pgo_firefox_sha256\") %]'\n    refresh_input: 1\n",
+                               "    name: firefox\n    sha256sum: '[% c(\"var/pgo_firefox_sha256\") %]'\n")
+    if fixed_br != br_text:
+        browser_config_path.write_text(fixed_br, encoding="utf-8")
 PY_FIX
 python3 - "$work/profile" "$UPSTREAM/projects/firefox" <<'PY_INPUTS'
 import hashlib, pathlib, shutil, sys
