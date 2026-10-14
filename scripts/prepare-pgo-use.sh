@@ -64,6 +64,16 @@ if browser_config_path.is_file():
                                "    name: firefox\n    sha256sum: '[% c(\"var/pgo_firefox_sha256\") %]'\n")
     if fixed_br != br_text:
         browser_config_path.write_text(fixed_br, encoding="utf-8")
+
+import os
+arch = os.environ.get("PGO_TARGET_ARCH", "x86-64-v3")
+mozconfig_in = config_path.parent / "mozconfig.in"
+if mozconfig_in.is_file() and arch and arch != "baseline":
+    mc_text = mozconfig_in.read_text(encoding="utf-8")
+    old_cflags = '  CFLAGS="-include _mingw.h"\n  CXXFLAGS="-fms-extensions -include _mingw.h"'
+    new_cflags = f'  CFLAGS="-march={arch} -include _mingw.h"\n  CXXFLAGS="-march={arch} -fms-extensions -include _mingw.h"\n  export RUSTFLAGS="-C target-cpu={arch}"'
+    if old_cflags in mc_text:
+        mozconfig_in.write_text(mc_text.replace(old_cflags, new_cflags, 1), encoding="utf-8")
 PY_FIX
 python3 - "$work/profile" "$UPSTREAM/projects/firefox" <<'PY_INPUTS'
 import hashlib, pathlib, shutil, sys
