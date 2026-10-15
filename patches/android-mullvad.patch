@@ -1,0 +1,105 @@
+diff --git a/projects/browser/build.android b/projects/browser/build.android
+index 51cbeb4..ed3ba46 100644
+--- a/projects/browser/build.android
++++ b/projects/browser/build.android
+@@ -24,6 +24,18 @@ unzip $rootdir/[% c('input_files_by_name/noscript') %]
+   }) %]
+ popd
+ 
++[% IF c("var/mullvad-browser") -%]
++  ublock_path="$ext_dir/uBlock0@raymondhill.net.xpi"
++  mkdir ublock
++  pushd ublock
++  unzip $rootdir/[% c('input_files_by_name/ublock-origin') %]
++  [% c('zip', {
++      zip_src  => [ '.' ],
++      zip_args => '-0 ../$ublock_path',
++    }) %]
++  popd
++[% END -%]
++
+ [%IF c("var/tor-browser") -%]
+   tar -xaf "$rootdir/[% c('input_files_by_name/tor-expert-bundle') %]/tor-expert-bundle.tar.gz" tor/pluggable_transports/pt_config.json
+   tar -xf "$rootdir/[% c('input_files_by_name/moat-settings') %]"
+diff --git a/projects/geckoview/config b/projects/geckoview/config
+index 4b24e84..1cbc05d 100644
+--- a/projects/geckoview/config
++++ b/projects/geckoview/config
+@@ -1,7 +1,7 @@
+ # vim: filetype=yaml sw=2
+ version: '[% c("abbrev") %]'
+ filename: 'geckoview-[% c("version") %]-[% c("var/osname") %]-[% c("var/build_id") %]'
+-git_hash: 'tor-browser-[% c("var/geckoview_version") %]-[% c("var/browser_branch") %]-build[% c("var/browser_build") %]'
++git_hash: '[% c("var/project-name") %]-[% c("var/geckoview_version") %]-[% c("var/browser_branch") %]-build[% c("var/browser_build") %]'
+ tag_gpg_id: 1
+ git_url: https://gitlab.torproject.org/tpo/applications/tor-browser.git
+ gpg_keyring:
+@@ -64,6 +64,14 @@ targets:
+       online_build: 1
+       has_l10n: 0
+ 
++  mullvadbrowser:
++    git_hash: 'mullvad-browser-[% c("var/geckoview_version") %]-[% c("var/browser_branch") %]-build[% c("var/browser_build") %]'
++    git_url: https://gitlab.torproject.org/tpo/applications/mullvad-browser.git
++    tag_gpg_id: 1
++    var:
++      gitlab_project: https://gitlab.torproject.org/tpo/applications/mullvad-browser
++      has_l10n: 0
++
+   # Run `make generate_gradle_dependencies_list-geckoview` to
+   # generate the gradle dependencies file. You can them move the file
+   # `out/geckoview/gradle-dependencies-list-$version.txt`
+diff --git a/rbm.conf b/rbm.conf
+index 148e1f5..6e5ff9c 100644
+--- a/rbm.conf
++++ b/rbm.conf
+@@ -102,7 +102,7 @@ var:
+     # enable/disable all android or desktop platforms. If you want to
+     # check whether a release includes some android or desktop platforms
+     # see signing_android and signing_desktop below.
+-    is_android_release: '[% c("var/tor-browser") || c("var/tor-vpn") %]'
++    is_android_release: '[% c("var/tor-browser") || c("var/tor-vpn") || c("var/mullvad-browser") %]'
+     is_desktop_release: '[% ! c("var/tor-vpn") %]'
+ 
+     # signing_android is used in signing scripts to check if at least
+@@ -379,6 +379,7 @@ targets:
+   mullvadbrowser:
+     var:
+       mullvad-browser: 1
++      android_single_arch: 1
+       project-name: mullvad-browser
+       projectname: mullvadbrowser
+       Project_Name: 'Mullvad Browser'
+@@ -434,6 +435,10 @@ targets:
+     - android-armv7
+     - android
+     - firefoxbrowser
++  mullvadbrowser-android-armv7:
++    - android-armv7
++    - android
++    - mullvadbrowser
+   android-armv7:
+     arch: armv7
+     var:
+@@ -450,6 +455,10 @@ targets:
+     - android-x86_64
+     - android
+     - firefoxbrowser
++  mullvadbrowser-android-x86_64:
++    - android-x86_64
++    - android
++    - mullvadbrowser
+   android-x86_64:
+     arch: x86_64
+     var:
+@@ -466,6 +475,10 @@ targets:
+     - android-aarch64
+     - android
+     - firefoxbrowser
++  mullvadbrowser-android-aarch64:
++    - android-aarch64
++    - android
++    - mullvadbrowser
+   android-aarch64:
+     arch: aarch64
+     var:
