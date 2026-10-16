@@ -22,10 +22,44 @@ index 51cbeb4..ed3ba46 100644
    tar -xaf "$rootdir/[% c('input_files_by_name/tor-expert-bundle') %]/tor-expert-bundle.tar.gz" tor/pluggable_transports/pt_config.json
    tar -xf "$rootdir/[% c('input_files_by_name/moat-settings') %]"
 diff --git a/projects/geckoview/build_common.sh b/projects/geckoview/build_common.sh
-index 37c090c..3b44c6e 100644
+index 37c090c..a8f28b3 100644
 --- a/projects/geckoview/build_common.sh
 +++ b/projects/geckoview/build_common.sh
-@@ -82,6 +82,27 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
+@@ -38,7 +38,7 @@ export JAVA_HOME=/usr/lib/jvm/java-1.17.0-openjdk-amd64
+ 
+ [% IF !c('var/online_build') -%]
+   gradle_repo=/var/tmp/dist/gradle-dependencies
+-  export GRADLE_MAVEN_REPOSITORIES="file://$gradle_repo","file://$gradle_repo/maven2"
++  export GRADLE_MAVEN_REPOSITORIES="file://$gradle_repo","file://$gradle_repo/maven2","file://$APPLICATION_SERVICES"
+   # Set the Maven local repository because Gradle ignores our overriding of $HOME.
+   # It is only used for the local pubblication of single-arch AARs.
+   export GRADLE_FLAGS="--no-daemon --offline -Dmaven.repo.local=$distdir/[% project %]"
+@@ -54,6 +54,24 @@ export JAVA_HOME=/usr/lib/jvm/java-1.17.0-openjdk-amd64
+   cp -rl $gradle_repo/m2/* $gradle_repo || true
+   cp -rl $gradle_repo/maven2/* $gradle_repo || true
+ 
++  if [ -d "$APPLICATION_SERVICES" ]; then
++    # Populate version 153.0 compatibility aliases alongside 153.0-TORBROWSER
++    if [ -d "$APPLICATION_SERVICES/org/mozilla/appservices" ]; then
++      for as_dep in "$APPLICATION_SERVICES/org/mozilla/appservices"/*; do
++        if [ -d "$as_dep/153.0-TORBROWSER" ] && [ ! -d "$as_dep/153.0" ]; then
++          cp -r "$as_dep/153.0-TORBROWSER" "$as_dep/153.0"
++          for f in "$as_dep/153.0"/*-153.0-TORBROWSER*; do
++            if [ -f "$f" ]; then
++              mv "$f" "$(echo "$f" | sed 's/153\.0-TORBROWSER/153.0/g')"
++            fi
++          done
++          sed -i -e 's/153\.0-TORBROWSER/153.0/g' "$as_dep/153.0"/*.pom "$as_dep/153.0"/*.module 2>/dev/null || true
++        fi
++      done
++    fi
++    cp -r "$APPLICATION_SERVICES"/* "$gradle_repo/" || true
++  fi
++
+   tar -xf [% c('input_files_by_name/glean-wheels') %]
+   export GLEAN_PYTHON_WHEELS_DIR=$rootdir/glean-wheels
+ [% ELSE -%]
+@@ -82,6 +100,32 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
    mobile/android/android-components/gradle.properties \
    mobile/android/fenix/gradle.properties
  
@@ -47,6 +81,11 @@ index 37c090c..3b44c6e 100644
 +    if [ -f browser/branding/mb-alpha/content/icon64.png ]; then
 +      cp browser/branding/mb-alpha/content/icon64.png "$branding_dir/content/favicon64.png" || true
 +    fi
++  fi
++
++  as_kt="mobile/android/android-components/plugins/dependencies/src/main/java/ApplicationServices.kt"
++  if [ -f "$as_kt" ]; then
++    sed -i -e 's/val VERSION = "153.0"/val VERSION = "153.0-TORBROWSER"/' "$as_kt"
 +  fi
 +[% END -%]
 +
