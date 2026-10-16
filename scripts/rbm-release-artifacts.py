@@ -372,7 +372,7 @@ def restore_required(args, root):
 
 def snapshot(args):
     upstream = Path(args.upstream)
-    paths = sorted(str(path.relative_to(upstream)) for path in (upstream / "out").glob("**/*")
+    paths = sorted(str(path.relative_to(upstream)) for path in (upstream / "out").glob("*/*")
                    if path.is_file())
     for relative in paths:
         safe_output(upstream, relative)
@@ -412,7 +412,7 @@ def verify_committed_stage(args, root, assets, registry_name, registry, paths):
 def publish(args, root):
     upstream = Path(args.upstream)
     before = set(Path(args.before).read_text(encoding="utf-8").splitlines())
-    paths = sorted(path for path in (upstream / "out").glob("**/*")
+    paths = sorted(path for path in (upstream / "out").glob("*/*")
                    if path.is_file() and str(path.relative_to(upstream)) not in before)
     if args.project:
         safe_name(args.project)
