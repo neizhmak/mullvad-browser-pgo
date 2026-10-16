@@ -66,9 +66,21 @@ else
   git -C "$destination" remote set-url origin "$repository"
 fi
 
-# Force the locked tag ref so a reusable checkout cannot retain a different object.
-git -C "$destination" fetch --depth=1 --force --no-tags origin \
-  "+refs/tags/$tag:refs/tags/$tag"
+# Force the locked tag ref with retries against transient server/transport errors.
+fetch_success=false
+for attempt in {1..5}; do
+  if git -C "$destination" fetch --depth=1 --force --no-tags origin \
+    "+refs/tags/$tag:refs/tags/$tag"; then
+    fetch_success=true
+    break
+  fi
+  echo "Fetch failed (attempt $attempt/5); retrying in 10s..." >&2
+  sleep 10
+done
+if [[ "$fetch_success" != true ]]; then
+  echo "error: failed to fetch $tag after 5 attempts" >&2
+  exit 1
+fi
 
 actual_tag_object="$(git -C "$destination" rev-parse "refs/tags/$tag")"
 actual_commit="$(git -C "$destination" rev-parse "refs/tags/$tag^{}")"
