@@ -7,6 +7,32 @@ patch_file="$root/patches/android-mullvad.patch"
 # Force HTTP/1.1 and large buffer to prevent GitLab HTTP/2 stream errors (curl 92)
 git config --global http.version HTTP/1.1 || true
 git config --global http.postBuffer 524288000 || true
+git config --global http.lowSpeedLimit 1000 || true
+git config --global http.lowSpeedTime 60 || true
+
+# Pre-clone git dependencies with retries to protect against transient GitLab connection timeouts
+preclone_repo() {
+  local project="$1" url="$2" extra_opts="${3:-}"
+  local target_dir="$UPSTREAM/git_clones/$project"
+  if [[ ! -d "$target_dir/.git" ]]; then
+    mkdir -p "$UPSTREAM/git_clones"
+    for attempt in {1..6}; do
+      echo "Pre-cloning $project from $url (attempt $attempt/6)..."
+      if git clone $extra_opts "$url" "$target_dir"; then
+        echo "Successfully pre-cloned $project."
+        return 0
+      fi
+      echo "Clone of $project failed; retrying in 15s..."
+      rm -rf "$target_dir"
+      sleep 15
+    done
+    echo "Warning: pre-clone of $project failed after 6 attempts; RBM will retry during build." >&2
+  fi
+}
+
+preclone_repo "application-services" "https://gitlab.torproject.org/tpo/applications/application-services.git" "--recurse-submodules"
+preclone_repo "translation" "https://gitlab.torproject.org/tpo/translation.git"
+
 
 # Clean up pre-installed runner software to free ~35-40 GB on root filesystem (/)
 if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
