@@ -21,6 +21,38 @@ index 51cbeb4..ed3ba46 100644
  [%IF c("var/tor-browser") -%]
    tar -xaf "$rootdir/[% c('input_files_by_name/tor-expert-bundle') %]/tor-expert-bundle.tar.gz" tor/pluggable_transports/pt_config.json
    tar -xf "$rootdir/[% c('input_files_by_name/moat-settings') %]"
+diff --git a/projects/geckoview/build_common.sh b/projects/geckoview/build_common.sh
+index 37c090c..3b44c6e 100644
+--- a/projects/geckoview/build_common.sh
++++ b/projects/geckoview/build_common.sh
+@@ -82,6 +82,27 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
+   mobile/android/android-components/gradle.properties \
+   mobile/android/fenix/gradle.properties
+ 
++[% IF c("var/mullvad-browser") -%]
++  if [ ! -d "$branding_dir" ]; then
++    mkdir -p "$(dirname "$branding_dir")"
++    cp -a mobile/android/branding/beta "$branding_dir"
++    sed -i -e 's/Mozilla Firefox Beta/Mullvad Browser Alpha/g' \
++           -e 's/Firefox Beta/Mullvad Browser Alpha/g' \
++           -e 's/brand-product-name = Firefox/brand-product-name = Mullvad Browser/g' \
++           -e 's/vendor-short-name = Mozilla/vendor-short-name = Mullvad/g' \
++           "$branding_dir/configure.sh" \
++           "$branding_dir/locales/en-US/brand.ftl" \
++           "$branding_dir/locales/en-US/brand.properties"
++    echo 'ANDROID_PACKAGE_NAME=net.mullvad.mullvadbrowser_alpha' >> "$branding_dir/configure.sh"
++    if [ -f browser/branding/mb-alpha/content/icon32.png ]; then
++      cp browser/branding/mb-alpha/content/icon32.png "$branding_dir/content/favicon32.png" || true
++    fi
++    if [ -f browser/branding/mb-alpha/content/icon64.png ]; then
++      cp browser/branding/mb-alpha/content/icon64.png "$branding_dir/content/favicon64.png" || true
++    fi
++  fi
++[% END -%]
++
+ echo "Starting ./mach configure $(date)"
+ # We still need to specify --base-browser-version due to bug 34005.
+ ./mach configure \
 diff --git a/projects/geckoview/config b/projects/geckoview/config
 index 4b24e84..1cbc05d 100644
 --- a/projects/geckoview/config
