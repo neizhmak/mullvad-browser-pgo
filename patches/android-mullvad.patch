@@ -22,7 +22,7 @@ index 51cbeb4..ed3ba46 100644
    tar -xaf "$rootdir/[% c('input_files_by_name/tor-expert-bundle') %]/tor-expert-bundle.tar.gz" tor/pluggable_transports/pt_config.json
    tar -xf "$rootdir/[% c('input_files_by_name/moat-settings') %]"
 diff --git a/projects/geckoview/build_common.sh b/projects/geckoview/build_common.sh
-index 37c090c..7b82793 100644
+index 37c090c..a49e96d 100644
 --- a/projects/geckoview/build_common.sh
 +++ b/projects/geckoview/build_common.sh
 @@ -38,7 +38,7 @@ export JAVA_HOME=/usr/lib/jvm/java-1.17.0-openjdk-amd64
@@ -59,7 +59,7 @@ index 37c090c..7b82793 100644
    tar -xf [% c('input_files_by_name/glean-wheels') %]
    export GLEAN_PYTHON_WHEELS_DIR=$rootdir/glean-wheels
  [% ELSE -%]
-@@ -82,6 +100,54 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
+@@ -82,6 +100,117 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
    mobile/android/android-components/gradle.properties \
    mobile/android/fenix/gradle.properties
  
@@ -109,6 +109,69 @@ index 37c090c..7b82793 100644
 +    path.write_text(text.replace(old, new, 1), encoding="utf-8")
 +PY_NIMBUS
 +  fi
++
++  # Fix exhaustive when errors for custom no-op application-services bindings (TB 42669)
++  python3 - << 'PY_AS_NOOP'
++from pathlib import Path
++
++# 1. RustLog.kt
++p_rustlog = Path("mobile/android/android-components/components/support/appservices/src/main/java/mozilla/components/support/rustlog/RustLog.kt")
++if p_rustlog.is_file():
++    t = p_rustlog.read_text(encoding="utf-8")
++    p_rustlog.write_text(t.replace("Level.ERROR -> Log.Priority.ERROR", "else -> Log.Priority.ERROR"), encoding="utf-8")
++
++# 2. AccountEvent.kt
++p_acct = Path("mobile/android/android-components/components/concept/sync/src/main/java/mozilla/components/concept/sync/AccountEvent.kt")
++if p_acct.is_file():
++    t = p_acct.read_text(encoding="utf-8")
++    p_acct.write_text(t.replace("sealed class DeviceCommandOutgoing {", "sealed class DeviceCommandOutgoing {\n    /** A command to do nothing */\n    class Noop() : DeviceCommandOutgoing()\n", 1), encoding="utf-8")
++
++# 3. RemoteTabsStorage.kt
++p_rts = Path("mobile/android/android-components/components/browser/storage-sync/src/main/java/mozilla/components/browser/storage/sync/RemoteTabsStorage.kt")
++if p_rts.is_file():
++    t = p_rts.read_text(encoding="utf-8")
++    t = t.replace("is RemoteCommand.CloseTab -> PendingCommandGroup.Key.CloseTab(it.deviceId)", "is RemoteCommand.CloseTab -> PendingCommandGroup.Key.CloseTab(it.deviceId)\n                    else -> PendingCommandGroup.Key.Noop(it.deviceId)")
++    t = t.replace("sealed interface Key {\n            data class CloseTab(val deviceId: String) : Key", "sealed interface Key {\n            data class CloseTab(val deviceId: String) : Key\n            data class Noop(val deviceId: String) : Key")
++    old_grp = '''                            pendingCommands = pendingCommands,
++                        )
++                    }
++                    // Add `is ... ->` branches for future pending command grouping keys here...'''
++    new_grp = '''                            pendingCommands = pendingCommands,
++                        )
++                    }
++                    is PendingCommandGroup.Key.Noop -> {
++                        PendingCommandGroup(
++                            deviceId = key.deviceId,
++                            command = DeviceCommandOutgoing.Noop(),
++                            pendingCommands = pendingCommands,
++                        )
++                    }
++                    // Add `is ... ->` branches for future pending command grouping keys here...'''
++    p_rts.write_text(t.replace(old_grp, new_grp, 1), encoding="utf-8")
++
++# 4. FxaDeviceConstellation.kt
++p_fxa = Path("mobile/android/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/FxaDeviceConstellation.kt")
++if p_fxa.is_file():
++    t = p_fxa.read_text(encoding="utf-8")
++    t = t.replace("Result.failure(SendCommandException.TabsNotClosed(closeTabsResult.urls))", "Result.failure(SendCommandException.TabsNotClosed(closeTabsResult.urls))\n                        else -> Result.success(false)")
++    p_fxa.write_text(t, encoding="utf-8")
++
++# 5. Types.kt
++p_types = Path("mobile/android/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/Types.kt")
++if p_types.is_file():
++    t = p_types.read_text(encoding="utf-8")
++    t = t.replace("RustDeviceType.UNKNOWN -> DeviceType.UNKNOWN", "else -> DeviceType.UNKNOWN")
++    t = t.replace("RustDeviceCapability.CLOSE_TABS -> DeviceCapability.CLOSE_TABS", "else -> DeviceCapability.CLOSE_TABS")
++    t = t.replace("is AccountEvent.Unknown -> mozilla.components.concept.sync.AccountEvent.Unknown", "else -> mozilla.components.concept.sync.AccountEvent.Unknown")
++    t = t.replace("is IncomingDeviceCommand.TabsClosed -> this.into()", "is IncomingDeviceCommand.TabsClosed -> this.into()\n        else -> this.into()")
++    p_types.write_text(t, encoding="utf-8")
++
++# 6. WorkManagerSyncManager.kt
++p_wmsm = Path("mobile/android/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/sync/WorkManagerSyncManager.kt")
++if p_wmsm.is_file():
++    t = p_wmsm.read_text(encoding="utf-8")
++    p_wmsm.write_text(t.replace("return when (syncResult.status) {", "return when (syncResult.status) {\n            ServiceStatus.__NOOP -> Result.success()", 1), encoding="utf-8")
++PY_AS_NOOP
 +[% END -%]
 +
  echo "Starting ./mach configure $(date)"
