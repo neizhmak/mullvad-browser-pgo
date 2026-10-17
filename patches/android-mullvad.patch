@@ -21,6 +21,162 @@ index 51cbeb4..ed3ba46 100644
  [%IF c("var/tor-browser") -%]
    tar -xaf "$rootdir/[% c('input_files_by_name/tor-expert-bundle') %]/tor-expert-bundle.tar.gz" tor/pluggable_transports/pt_config.json
    tar -xf "$rootdir/[% c('input_files_by_name/moat-settings') %]"
+diff --git a/projects/geckoview/build_ac_fenix.sh b/projects/geckoview/build_ac_fenix.sh
+index 04b0b34..94e066b 100644
+--- a/projects/geckoview/build_ac_fenix.sh
++++ b/projects/geckoview/build_ac_fenix.sh
+@@ -20,6 +20,151 @@ pushd mobile/android/fenix
+ # Use the Android Components we have just built
+ echo autoPublish.android-components.dir=../android-components > local.properties
+ 
++[% IF c("var/mullvad-browser") -%]
++  # Strip non-offline telemetry/tracking dependencies (Adjust, Sentry) from Fenix
++  python3 - << 'PY_FENIX_TELEMETRY'
++from pathlib import Path
++
++# 1. app/build.gradle
++p_bg = Path("app/build.gradle")
++if p_bg.is_file():
++    t = p_bg.read_text(encoding="utf-8")
++    t = t.replace("    implementation libs.adjust\n", "")
++    t = t.replace("    implementation libs.sentry\n", "")
++    t = t.replace("    implementation project(':components:lib-crash-sentry')\n", "")
++    p_bg.write_text(t, encoding="utf-8")
++
++# 2. AdjustMetricsService.kt
++p_ams = Path("app/src/main/java/org/mozilla/fenix/components/metrics/AdjustMetricsService.kt")
++if p_ams.is_file():
++    p_ams.write_text('''/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.components.metrics
++
++import android.app.Application
++import androidx.annotation.VisibleForTesting
++import kotlinx.coroutines.CoroutineDispatcher
++import kotlinx.coroutines.Dispatchers
++import mozilla.components.lib.crash.CrashReporter
++import mozilla.components.support.base.log.logger.Logger
++
++class AdjustMetricsService(
++    private val application: Application,
++    private val storage: MetricsStorage,
++    private val crashReporter: CrashReporter,
++    private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
++) : MetricsService {
++    override val type = MetricServiceType.Marketing
++    private val logger = Logger("AdjustMetricsService")
++
++    override fun start() { /* noop */ }
++    override fun stop() { /* noop */ }
++    override fun track(event: Event) { /* noop */ }
++    override fun shouldTrack(event: Event): Boolean = false
++
++    companion object {
++        const val CONVERSION_EVENT_1 = 1
++        const val CONVERSION_EVENT_2 = 2
++        const val CONVERSION_EVENT_3 = 3
++        const val CONVERSION_EVENT_4 = 4
++        const val CONVERSION_EVENT_5 = 5
++        const val CONVERSION_EVENT_6 = 6
++        const val CONVERSION_EVENT_7 = 7
++        const val CONVERSION_EVENT_8 = 8
++        const val CONVERSION_EVENT_9 = 9
++        const val CONVERSION_EVENT_10 = 10
++    }
++}
++''', encoding="utf-8")
++
++# 3. AdjustThirdPartySharingController.kt
++p_atpsc = Path("app/src/main/java/org/mozilla/fenix/components/metrics/AdjustThirdPartySharingController.kt")
++if p_atpsc.is_file():
++    p_atpsc.write_text('''/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.components.metrics
++
++interface ThirdPartySharingController {
++    fun enableThirdPartySharingForPartner(partnerId: String)
++    fun disableAllThirdPartySharing()
++}
++
++class AdjustThirdPartySharingController : ThirdPartySharingController {
++    override fun enableThirdPartySharingForPartner(partnerId: String) { /* noop */ }
++    override fun disableAllThirdPartySharing() { /* noop */ }
++
++    companion object {
++        const val META_PARTNER_ID = "34"
++        const val AURA_PARTNER_ID = "802"
++        const val GOOGLE_PARTNER_ID = "254"
++        const val TIKTOK_PARTNER_ID = "2337"
++        const val REDDIT_PARTNER_ID = "375"
++        const val X_TWITTER_PARTNER_ID = "32"
++    }
++}
++''', encoding="utf-8")
++
++# 4. Analytics.kt
++p_ana = Path("app/src/main/java/org/mozilla/fenix/components/Analytics.kt")
++if p_ana.is_file():
++    t = p_ana.read_text(encoding="utf-8")
++    t = t.replace("import mozilla.components.lib.crash.sentry.SentryService\n", "")
++    t = t.replace("import mozilla.components.lib.crash.sentry.eventprocessors.CrashMetadataEventProcessor\n", "")
++    old_if = '''        if (isSentryEnabled()) {
++            // We treat caught exceptions similar to debug logging.
++            // On the release channel volume of these is too high for our Sentry instances, and
++            // we get most value out of nightly/beta logging anyway.
++            val shouldSendCaughtExceptions = when (Config.channel) {
++                ReleaseChannel.Release -> false
++                else -> true
++            }
++            val sentryService = SentryService(
++                context,
++                BuildConfig.SENTRY_TOKEN,
++                tags = mapOf(
++                    "geckoview" to "$MOZ_APP_VERSION-$MOZ_APP_BUILDID",
++                    "fenix.git" to BuildConfig.VCS_HASH,
++                ),
++                environment = BuildConfig.BUILD_TYPE,
++                sendEventForNativeCrashes = false, // Do not send native crashes to Sentry
++                sendCaughtExceptions = shouldSendCaughtExceptions,
++                sentryProjectUrl = getSentryProjectUrl(),
++                crashMetadataEventProcessor = CrashMetadataEventProcessor(),
++            )
++
++            // We only want to initialize Sentry on startup on the main process.
++            if (context.isMainProcess()) {
++                runWhenReadyQueue.runIfReadyOrQueue {
++                    sentryService.initIfNeeded()
++                }
++            }
++
++            services.add(sentryService)
++        }'''
++    t = t.replace(old_if, "// Sentry disabled for privacy build")
++    p_ana.write_text(t, encoding="utf-8")
++
++# 5. AndroidManifest.xml
++p_man = Path("app/src/main/AndroidManifest.xml")
++if p_man.is_file():
++    t = p_man.read_text(encoding="utf-8")
++    old_rec = '''        <receiver
++            android:name="com.adjust.sdk.AdjustPreinstallReferrerReceiver"
++            android:permission="android.permission.INSTALL_PACKAGES"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="com.android.vending.INSTALL_REFERRER" />
++            </intent-filter>
++        </receiver>'''
++    t = t.replace(old_rec, "")
++    p_man.write_text(t, encoding="utf-8")
++PY_FENIX_TELEMETRY
++[% END -%]
++
+ [% IF c('var/has_l10n') -%]
+   tar -C $distdir -xf $rootdir/[% c('input_files_by_name/translation-fenix') %]
+   # Add our localized strings
 diff --git a/projects/geckoview/build_common.sh b/projects/geckoview/build_common.sh
 index 37c090c..c9a3e24 100644
 --- a/projects/geckoview/build_common.sh
