@@ -38,15 +38,15 @@ index 51cbeb4..b970672 100644
  [%IF c("var/tor-browser") -%]
      tor_expert_bundle_src="[% c('input_files_by_name/tor-expert-bundle') %]"
 diff --git a/projects/geckoview/build_ac_fenix.sh b/projects/geckoview/build_ac_fenix.sh
-index 04b0b34..2e0fe08 100644
+index 04b0b34..3628583 100644
 --- a/projects/geckoview/build_ac_fenix.sh
 +++ b/projects/geckoview/build_ac_fenix.sh
-@@ -20,6 +20,193 @@ pushd mobile/android/fenix
+@@ -20,6 +20,223 @@ pushd mobile/android/fenix
  # Use the Android Components we have just built
  echo autoPublish.android-components.dir=../android-components > local.properties
  
 +[% IF c("var/mullvad-browser") -%]
-+  # Strip non-offline telemetry/tracking dependencies (Adjust, Sentry, Google Ads ID) from Fenix
++  # Strip non-offline telemetry/tracking dependencies and provide TorSecurityLevel for Fenix
 +  python3 - << 'PY_FENIX_TELEMETRY'
 +from pathlib import Path
 +
@@ -172,8 +172,9 @@ index 04b0b34..2e0fe08 100644
 +
 +            services.add(sentryService)
 +        }'''
-+    t = t.replace(old_if, "// Sentry disabled for privacy build")
-+    p_ana.write_text(t, encoding="utf-8")
++    if old_if in t:
++        t = t.replace(old_if, "// Sentry disabled for privacy build")
++        p_ana.write_text(t, encoding="utf-8")
 +
 +# 5. AndroidManifest.xml
 +p_man = Path("app/src/main/AndroidManifest.xml")
@@ -187,8 +188,9 @@ index 04b0b34..2e0fe08 100644
 +                <action android:name="com.android.vending.INSTALL_REFERRER" />
 +            </intent-filter>
 +        </receiver>'''
-+    t = t.replace(old_rec, "")
-+    p_man.write_text(t, encoding="utf-8")
++    if old_rec in t:
++        t = t.replace(old_rec, "")
++        p_man.write_text(t, encoding="utf-8")
 +
 +# 6. ActivationPing.kt
 +p_ap = Path("app/src/main/java/org/mozilla/fenix/components/metrics/ActivationPing.kt")
@@ -202,9 +204,9 @@ index 04b0b34..2e0fe08 100644
 +            )'''
 +    new_hashed = '''        CoroutineScope(backgroundDispatcher).launch {
 +            val hashedId: String? = null'''
-+    assert old_hashed in t, "old_hashed not found in ActivationPing.kt"
-+    t = t.replace(old_hashed, new_hashed)
-+    p_ap.write_text(t, encoding="utf-8")
++    if old_hashed in t:
++        t = t.replace(old_hashed, new_hashed)
++        p_ap.write_text(t, encoding="utf-8")
 +
 +# 7. MetricsUtils.kt
 +p_mu = Path("app/src/main/java/org/mozilla/fenix/components/metrics/MetricsUtils.kt")
@@ -226,16 +228,44 @@ index 04b0b34..2e0fe08 100644
 +        return try {
 +            null
 +        } catch (e: IllegalStateException) {'''
-+    assert old_get_adv in t, "old_get_adv not found in MetricsUtils.kt"
-+    t = t.replace(old_get_adv, new_get_adv)
-+    p_mu.write_text(t, encoding="utf-8")
++    if old_get_adv in t:
++        t = t.replace(old_get_adv, new_get_adv)
++        p_mu.write_text(t, encoding="utf-8")
++
++# 8. TorSecurityLevel.kt
++p_tsl = Path("app/src/main/java/org/mozilla/fenix/tor/TorSecurityLevel.kt")
++p_tsl.parent.mkdir(parents=True, exist_ok=True)
++p_tsl.write_text('''/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++package org.mozilla.fenix.tor
++
++import android.os.Parcelable
++import kotlinx.parcelize.Parcelize
++
++@Parcelize
++@Suppress("EnumEntryName")
++enum class TorSecurityLevel(val level: Int) : Parcelable {
++    standard(4), safer(2), safest(1), custom(-1)
++}
++''', encoding="utf-8")
++
++# 9. Settings.kt (torSecurityLevel property)
++p_set = Path("app/src/main/java/org/mozilla/fenix/utils/Settings.kt")
++if p_set.is_file():
++    t = p_set.read_text(encoding="utf-8")
++    old_h = ") : PreferencesHolder {"
++    if old_h in t and "var torSecurityLevel" not in t:
++        new_h = ") : PreferencesHolder {\n    var torSecurityLevel: Int = 4"
++        p_set.write_text(t.replace(old_h, new_h, 1), encoding="utf-8")
 +PY_FENIX_TELEMETRY
 +[% END -%]
 +
  [% IF c('var/has_l10n') -%]
    tar -C $distdir -xf $rootdir/[% c('input_files_by_name/translation-fenix') %]
    # Add our localized strings
-@@ -44,6 +231,7 @@ gradle $GRADLE_FLAGS -PversionName="$version_name" "assemble$variant" [% IF c('v
+@@ -44,6 +261,7 @@ gradle $GRADLE_FLAGS -PversionName="$version_name" "assemble$variant" [% IF c('v
    mv $objdir/gradle/build/mobile/android/fenix/app/outputs/apk/$variant/*.apk $outdir/[% project %]
  [% END -%]
  
@@ -243,7 +273,7 @@ index 04b0b34..2e0fe08 100644
  echo "Building non optimized $variant Fenix APK for testing"
  gradle $GRADLE_FLAGS -PversionName="$version_name" -PdisableOptimization "assemble$variant"
  
-@@ -61,5 +249,6 @@ echo "Test build finished, copying the APKs to the destination directory $(date)
+@@ -61,5 +279,6 @@ echo "Test build finished, copying the APKs to the destination directory $(date)
  mkdir -p $outdir/[% project %]/tests
  mv $objdir/gradle/build/mobile/android/fenix/app/outputs/apk/$variant/*.apk $outdir/[% project %]/tests
  mv $objdir/gradle/build/mobile/android/fenix/app/outputs/apk/androidTest/$variant/*.apk $outdir/[% project %]/tests
