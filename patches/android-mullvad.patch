@@ -251,7 +251,7 @@ index 04b0b34..2e0fe08 100644
  
  popd
 diff --git a/projects/geckoview/build_common.sh b/projects/geckoview/build_common.sh
-index 37c090c..c9a3e24 100644
+index 37c090c..491c0bc 100644
 --- a/projects/geckoview/build_common.sh
 +++ b/projects/geckoview/build_common.sh
 @@ -38,7 +38,7 @@ export JAVA_HOME=/usr/lib/jvm/java-1.17.0-openjdk-amd64
@@ -288,7 +288,7 @@ index 37c090c..c9a3e24 100644
    tar -xf [% c('input_files_by_name/glean-wheels') %]
    export GLEAN_PYTHON_WHEELS_DIR=$rootdir/glean-wheels
  [% ELSE -%]
-@@ -82,6 +100,125 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
+@@ -82,6 +100,161 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
    mobile/android/android-components/gradle.properties \
    mobile/android/fenix/gradle.properties
  
@@ -382,8 +382,24 @@ index 37c090c..c9a3e24 100644
 +p_fxa = Path("mobile/android/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/FxaDeviceConstellation.kt")
 +if p_fxa.is_file():
 +    t = p_fxa.read_text(encoding="utf-8")
-+    t = t.replace("Result.failure(SendCommandException.TabsNotClosed(closeTabsResult.urls))", "Result.failure(SendCommandException.TabsNotClosed(closeTabsResult.urls))\n                        else -> Result.success(false)")
-+    p_fxa.write_text(t, encoding="utf-8")
++    old_cmd = '''                is DeviceCommandOutgoing.CloseTab -> {
++                    when (val closeTabsResult = account.closeTabs(targetDeviceId, outgoingCommand.urls)) {
++                        is RustCloseTabsResult.Ok -> Result.success(true)
++                        is RustCloseTabsResult.TabsNotClosed ->
++                            Result.failure(SendCommandException.TabsNotClosed(closeTabsResult.urls))
++                    }
++                }'''
++    new_cmd = '''                is DeviceCommandOutgoing.CloseTab -> {
++                    when (val closeTabsResult = account.closeTabs(targetDeviceId, outgoingCommand.urls)) {
++                        is RustCloseTabsResult.Ok -> Result.success(true)
++                        is RustCloseTabsResult.TabsNotClosed ->
++                            Result.failure(SendCommandException.TabsNotClosed(closeTabsResult.urls))
++                        else -> Result.success(false)
++                    }
++                }
++                else -> Result.success(false)'''
++    if old_cmd in t:
++        p_fxa.write_text(t.replace(old_cmd, new_cmd, 1), encoding="utf-8")
 +
 +# 5. Types.kt
 +p_types = Path("mobile/android/android-components/components/service/firefox-accounts/src/main/java/mozilla/components/service/fxa/Types.kt")
@@ -408,6 +424,26 @@ index 37c090c..c9a3e24 100644
 +    old = 'is BulkResultEntry.Error -> Result.failure(BulkInsertionError(this.message))'
 +    new = 'is BulkResultEntry.Error -> Result.failure(BulkInsertionError(this.message))\n    else -> Result.failure(BulkInsertionError("No-op bulk insertion"))'
 +    p_logins.write_text(t.replace(old, new, 1), encoding="utf-8")
++
++# 8. NimbusGeckoUtils.kt (PrefBranch.__NOOP)
++p_ngu = Path("mobile/android/fenix/app/src/main/java/org/mozilla/fenix/experiments/prefhandling/NimbusGeckoUtils.kt")
++if p_ngu.is_file():
++    t = p_ngu.read_text(encoding="utf-8")
++    old_b = '''fun PrefBranch.toBrowserPrefBranch(): Branch {
++    return when (this) {
++        PrefBranch.DEFAULT -> Branch.DEFAULT
++        PrefBranch.USER -> Branch.USER
++    }
++}'''
++    new_b = '''fun PrefBranch.toBrowserPrefBranch(): Branch {
++    return when (this) {
++        PrefBranch.DEFAULT -> Branch.DEFAULT
++        PrefBranch.USER -> Branch.USER
++        else -> Branch.DEFAULT
++    }
++}'''
++    if old_b in t:
++        p_ngu.write_text(t.replace(old_b, new_b, 1), encoding="utf-8")
 +PY_AS_NOOP
 +[% END -%]
 +
