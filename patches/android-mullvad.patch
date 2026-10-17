@@ -22,7 +22,7 @@ index 51cbeb4..ed3ba46 100644
    tar -xaf "$rootdir/[% c('input_files_by_name/tor-expert-bundle') %]/tor-expert-bundle.tar.gz" tor/pluggable_transports/pt_config.json
    tar -xf "$rootdir/[% c('input_files_by_name/moat-settings') %]"
 diff --git a/projects/geckoview/build_common.sh b/projects/geckoview/build_common.sh
-index 37c090c..a8f28b3 100644
+index 37c090c..7b82793 100644
 --- a/projects/geckoview/build_common.sh
 +++ b/projects/geckoview/build_common.sh
 @@ -38,7 +38,7 @@ export JAVA_HOME=/usr/lib/jvm/java-1.17.0-openjdk-amd64
@@ -59,7 +59,7 @@ index 37c090c..a8f28b3 100644
    tar -xf [% c('input_files_by_name/glean-wheels') %]
    export GLEAN_PYTHON_WHEELS_DIR=$rootdir/glean-wheels
  [% ELSE -%]
-@@ -82,6 +100,32 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
+@@ -82,6 +100,54 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
    mobile/android/android-components/gradle.properties \
    mobile/android/fenix/gradle.properties
  
@@ -86,6 +86,28 @@ index 37c090c..a8f28b3 100644
 +  as_kt="mobile/android/android-components/plugins/dependencies/src/main/java/ApplicationServices.kt"
 +  if [ -f "$as_kt" ]; then
 +    sed -i -e 's/val VERSION = "153.0"/val VERSION = "153.0-TORBROWSER"/' "$as_kt"
++  fi
++
++  natt="mobile/android/gradle/plugins/nimbus-gradle-plugin/src/main/kotlin/org/mozilla/appservices/tooling/nimbus/NimbusAssembleToolsTask.kt"
++  if [ -f "$natt" ]; then
++    python3 - << 'PY_NIMBUS'
++from pathlib import Path
++path = Path("mobile/android/gradle/plugins/nimbus-gradle-plugin/src/main/kotlin/org/mozilla/appservices/tooling/nimbus/NimbusAssembleToolsTask.kt")
++text = path.read_text(encoding="utf-8")
++old = "    fun assembleTools() {"
++new = '''    fun assembleTools() {
++        val nimbusFml = System.getenv("NIMBUS_FML") ?: System.getProperty("nimbusFml")
++        if (!nimbusFml.isNullOrEmpty()) {
++            val source = java.io.File(nimbusFml).toPath()
++            val dest = fmlBinary.get().asFile.toPath()
++            dest.parent?.toFile()?.mkdirs()
++            java.nio.file.Files.copy(source, dest, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
++            dest.toFile().setExecutable(true, false)
++            return
++        }'''
++if old in text and "System.getenv(\"NIMBUS_FML\")" not in text:
++    path.write_text(text.replace(old, new, 1), encoding="utf-8")
++PY_NIMBUS
 +  fi
 +[% END -%]
 +
