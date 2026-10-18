@@ -99,10 +99,10 @@ index 453d297..c3a84a9 100644
      var:
        pt_path: ./TorBrowser/Tor/PluggableTransports/
 diff --git a/projects/geckoview/build_ac_fenix.sh b/projects/geckoview/build_ac_fenix.sh
-index 04b0b34..e242958 100644
+index 04b0b34..0afbd27 100644
 --- a/projects/geckoview/build_ac_fenix.sh
 +++ b/projects/geckoview/build_ac_fenix.sh
-@@ -20,6 +20,232 @@ pushd mobile/android/fenix
+@@ -20,6 +20,237 @@ pushd mobile/android/fenix
  # Use the Android Components we have just built
  echo autoPublish.android-components.dir=../android-components > local.properties
  
@@ -126,10 +126,15 @@ index 04b0b34..e242958 100644
 +    p_bg.write_text(t, encoding="utf-8")
 +
 +# 10. Mullvad Browser app name in static_strings.xml
-+for ss_path in ["app/src/beta/res/values/static_strings.xml", "app/src/main/res/values/static_strings.xml"]:
-+    p_ss = Path(ss_path)
-+    if p_ss.is_file():
-+        p_ss.write_text('<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n<resources>\n    <string name="app_name" translatable="false">Mullvad Browser Alpha</string>\n</resources>\n', encoding="utf-8")
++p_beta_ss = Path("app/src/beta/res/values/static_strings.xml")
++if p_beta_ss.is_file():
++    p_beta_ss.write_text('<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n<resources>\n    <string name="app_name" translatable="false">Mullvad Browser Alpha</string>\n</resources>\n', encoding="utf-8")
++
++p_main_ss = Path("app/src/main/res/values/static_strings.xml")
++if p_main_ss.is_file():
++    t_ss = p_main_ss.read_text(encoding="utf-8")
++    t_ss = t_ss.replace("Firefox Fenix", "Mullvad Browser Alpha")
++    p_main_ss.write_text(t_ss, encoding="utf-8")
 +
 +# 2. AdjustMetricsService.kt
 +p_ams = Path("app/src/main/java/org/mozilla/fenix/components/metrics/AdjustMetricsService.kt")
@@ -335,7 +340,7 @@ index 04b0b34..e242958 100644
  [% IF c('var/has_l10n') -%]
    tar -C $distdir -xf $rootdir/[% c('input_files_by_name/translation-fenix') %]
    # Add our localized strings
-@@ -44,6 +270,7 @@ gradle $GRADLE_FLAGS -PversionName="$version_name" "assemble$variant" [% IF c('v
+@@ -44,6 +275,7 @@ gradle $GRADLE_FLAGS -PversionName="$version_name" "assemble$variant" [% IF c('v
    mv $objdir/gradle/build/mobile/android/fenix/app/outputs/apk/$variant/*.apk $outdir/[% project %]
  [% END -%]
  
@@ -343,7 +348,7 @@ index 04b0b34..e242958 100644
  echo "Building non optimized $variant Fenix APK for testing"
  gradle $GRADLE_FLAGS -PversionName="$version_name" -PdisableOptimization "assemble$variant"
  
-@@ -61,5 +288,6 @@ echo "Test build finished, copying the APKs to the destination directory $(date)
+@@ -61,5 +293,6 @@ echo "Test build finished, copying the APKs to the destination directory $(date)
  mkdir -p $outdir/[% project %]/tests
  mv $objdir/gradle/build/mobile/android/fenix/app/outputs/apk/$variant/*.apk $outdir/[% project %]/tests
  mv $objdir/gradle/build/mobile/android/fenix/app/outputs/apk/androidTest/$variant/*.apk $outdir/[% project %]/tests
