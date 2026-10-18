@@ -76,7 +76,13 @@ jobs:
       - name: Collect and stage instrumented APK
         run: |
           mkdir -p "$RUNNER_TEMP/instrumented-apk"
-          find "$UPSTREAM/out" -type f -name "*arm64-v8a*.apk" -exec cp -v {} "$RUNNER_TEMP/instrumented-apk/app-instrumented.apk" \;
+          apk_cand=$(find "$UPSTREAM/out" -type f \( -name "*mullvad*qa*.apk" -o -name "*arm64*.apk" \) | head -n 1)
+          if [[ -z "$apk_cand" ]]; then
+            echo "Error: No instrumented APK found in $UPSTREAM/out" >&2
+            find "$UPSTREAM/out" -type f || true
+            exit 1
+          fi
+          cp -v "$apk_cand" "$RUNNER_TEMP/instrumented-apk/app-instrumented.apk"
           ls -lh "$RUNNER_TEMP/instrumented-apk/"
       - name: Upload instrumented APK artifact
         uses: actions/upload-artifact@v4

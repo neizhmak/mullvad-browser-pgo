@@ -120,11 +120,16 @@ adb -s "$target_dev" pull /data/local/tmp/training_screen.png "$output_dir/train
 
 # 9. Stop browser gracefully to flush profile counters
 echo "Stopping browser to flush profile buffers..."
+# Send Back keyevents to let Activities finish cleanly
+for k in 1 2 3; do
+  adb -s "$target_dev" shell input keyevent 4 || true
+  sleep 1
+done
 pids=$(adb -s "$target_dev" shell pidof "$pkg_name" || true)
 for pid in $pids; do
   adb -s "$target_dev" shell kill -15 "$pid" || true
 done
-sleep 5
+sleep 8
 adb -s "$target_dev" shell am force-stop "$pkg_name" || true
 sleep 2
 

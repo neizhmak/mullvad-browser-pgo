@@ -351,7 +351,7 @@ index 04b0b34..e242958 100644
  
  popd
 diff --git a/projects/geckoview/build_common.sh b/projects/geckoview/build_common.sh
-index 37c090c..772609a 100644
+index 37c090c..0202e85 100644
 --- a/projects/geckoview/build_common.sh
 +++ b/projects/geckoview/build_common.sh
 @@ -38,7 +38,7 @@ export JAVA_HOME=/usr/lib/jvm/java-1.17.0-openjdk-amd64
@@ -562,9 +562,9 @@ index 37c090c..772609a 100644
  echo "Starting ./mach configure $(date)"
  # We still need to specify --base-browser-version due to bug 34005.
  ./mach configure \
-+  [% IF c("var/pgo_generate") -%]--enable-profile-generate=cross[% END %] \
++  [% IF c("var/pgo_generate") -%]--enable-profile-generate[% END %] \
 +  [% IF c("var/pgo_use") -%]
-+  --enable-profile-use=cross \
++  --enable-profile-use \
 +  --with-pgo-profile-path=/var/tmp/dist/pgo/merged.profdata \
 +  [% IF c("var/pgo_jarlog_sha256") -%]--with-pgo-jarlog=/var/tmp/dist/pgo/jarlog[% END %] \
 +  [% END -%] \
