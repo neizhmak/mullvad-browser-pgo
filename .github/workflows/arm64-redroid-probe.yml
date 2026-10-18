@@ -63,7 +63,7 @@ jobs:
           # Check if binder devices exist
           if [[ -c /dev/binder ]]; then
             echo "Binder devices are present, starting redroid..."
-            docker run -d --rm --privileged               --name redroid               -p 5555:5555               -v /data:/data               redroid/redroid:12.0.0-arm64               androidboot.redroid_width=1080               androidboot.redroid_height=1920               androidboot.redroid_dpi=480               androidboot.redroid_gpu_mode=guest
+            docker run -d --rm --privileged               --name redroid               -p 5555:5555               -v /data:/data               redroid/redroid:12.0.0-latest               androidboot.redroid_width=1080               androidboot.redroid_height=1920               androidboot.redroid_dpi=480               androidboot.redroid_gpu_mode=guest
             
             sleep 15
             docker ps
