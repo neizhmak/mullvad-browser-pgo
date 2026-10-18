@@ -40,16 +40,29 @@ jobs:
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
       - name: Configure swap on runner
         run: |
-          sudo fallocate -l 20G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=20480
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
-      - name: Fetch exact upstream
-        run: ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
-      - name: Apply Android overlay
-        run: |
           set -euo pipefail
-          ./scripts/prepare-android.sh --upstream "$UPSTREAM"
+          swap_file=""
+          if [[ -d /mnt && -w /mnt ]]; then
+            swap_file="/mnt/swapfile"
+          elif [[ -d /var/tmp && -w /var/tmp ]]; then
+            swap_file="/var/tmp/swapfile"
+          else
+            swap_file="/tmp/swapfile"
+          fi
+          if [[ -n "$swap_file" ]]; then
+            if sudo fallocate -l 20G "$swap_file" 2>/dev/null || sudo dd if=/dev/zero of="$swap_file" bs=1M count=20480 2>/dev/null; then
+              sudo chmod 600 "$swap_file"
+              sudo mkswap "$swap_file" >/dev/null
+              sudo swapon "$swap_file" >/dev/null 2>&1 || true
+            fi
+          fi
+      - name: Fetch exact upstream
+        run: |
+          ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
+          git -C "$UPSTREAM" submodule update --init rbm
+          "$UPSTREAM/rbm/container" run -- /bin/true
+      - name: Apply Android overlay
+        run: ./scripts/prepare-android.sh
       - name: Restore verified Android dependencies
         env:
           GH_TOKEN: ${{ github.token }}
