@@ -30,15 +30,23 @@ jobs:
           echo "=== Starting ReDroid ==="
           docker run -d --rm --privileged             --name redroid             -p 5555:5555             -v /tmp/redroid-data:/data             redroid/redroid:12.0.0-latest             androidboot.redroid_width=1080             androidboot.redroid_height=1920             androidboot.redroid_dpi=480             androidboot.redroid_gpu_mode=guest
 
-          echo "Waiting for ADB connection..."
-          for i in $(seq 1 30); do
-            adb connect localhost:5555 && break || sleep 2
-          done
+          echo "Sleeping 10s for container initialization..."
+          sleep 10
+          docker ps
+          docker logs redroid | head -n 30 || true
 
-          echo "Waiting for Android boot to complete..."
-          adb wait-for-device
-          for i in $(seq 1 60); do
-            boot_status=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+          echo "Connecting via ADB..."
+          adb connect 127.0.0.1:5555 || true
+          sleep 2
+          adb devices
+
+          # Find exact target device serial
+          target_dev=$(adb devices | grep -E "5555|device$" | head -n 1 | awk '{print $1}')
+          echo "Target device: $target_dev"
+
+          echo "Waiting for Android boot to complete on $target_dev..."
+          for i in $(seq 1 40); do
+            boot_status=$(adb -s "$target_dev" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
             echo "Boot status check $i: '$boot_status'"
             if [[ "$boot_status" == "1" ]]; then
               echo "Android booted successfully!"
@@ -48,14 +56,15 @@ jobs:
           done
 
           echo "=== Android System Properties ==="
-          adb shell getprop ro.build.version.release
-          adb shell getprop ro.product.cpu.abi
-          adb shell uname -a
-          adb shell getprop ro.build.description
+          adb -s "$target_dev" shell getprop ro.build.version.release
+          adb -s "$target_dev" shell getprop ro.product.cpu.abi
+          adb -s "$target_dev" shell uname -a
+          adb -s "$target_dev" shell getprop ro.build.description
 
       - name: Test APK installation and basic execution in ReDroid
         run: |
           set -euo pipefail
-          echo "=== Testing basic command execution in Android ==="
-          adb shell pm list packages | head -n 15
+          target_dev=$(adb devices | grep -E "5555|device$" | head -n 1 | awk '{print $1}')
+          echo "=== Testing basic command execution in Android on $target_dev ==="
+          adb -s "$target_dev" shell pm list packages | head -n 15
           echo "ReDroid is 100% operational on ubuntu-24.04-arm!"
