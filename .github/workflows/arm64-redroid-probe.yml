@@ -1,0 +1,79 @@
+name: Probe ARM64 Runner and ReDroid Environment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Check system architecture and kernel info
+        run: |
+          set -euo pipefail
+          echo "=== Host Architecture ==="
+          uname -a
+          uname -m
+          lscpu
+          free -h
+          df -h
+
+      - name: Check /dev/kvm and virtualization
+        run: |
+          echo "=== Virtualization check ==="
+          ls -la /dev/kvm || true
+          lsmod | grep -i kvm || true
+
+      - name: Check existing binder and ashmem modules
+        run: |
+          echo "=== Checking binder / ashmem ==="
+          ls -la /dev/binder* || true
+          grep -i binder /proc/filesystems || true
+          find /lib/modules/$(uname -r) -name "*binder*" || true
+          sudo modprobe binder_linux || true
+          ls -la /dev/binder* || true
+
+      - name: Test compiling binder module from anbox-modules
+        run: |
+          set -euo pipefail
+          echo "=== Testing binder compilation via DKMS/source ==="
+          sudo apt-get update
+          sudo apt-get install -y git dkms linux-headers-$(uname -r) build-essential
+          cd /tmp
+          git clone https://github.com/choff/anbox-modules.git || git clone https://github.com/fatalfeel/binderubuntu.git
+          if [[ -d anbox-modules/binder ]]; then
+            cd anbox-modules/binder
+            make -j$(nproc)
+            sudo insmod binder_linux.ko devices="binder,hwbinder,vndbinder" || true
+          elif [[ -d binderubuntu ]]; then
+            cd binderubuntu
+            make -j$(nproc) || true
+          fi
+          ls -la /dev/binder* || true
+
+      - name: Test Docker and ReDroid container startup
+        run: |
+          set -euo pipefail
+          echo "=== Docker info ==="
+          docker info | grep -E "Architecture|Operating System|Server Version"
+          
+          # Check if binder devices exist
+          if [[ -c /dev/binder ]]; then
+            echo "Binder devices are present, starting redroid..."
+            docker run -d --rm --privileged               --name redroid               -p 5555:5555               -v /data:/data               redroid/redroid:12.0.0-arm64               androidboot.redroid_width=1080               androidboot.redroid_height=1920               androidboot.redroid_dpi=480               androidboot.redroid_gpu_mode=guest
+            
+            sleep 15
+            docker ps
+            docker logs redroid || true
+            
+            # Install adb and test connection
+            sudo apt-get install -y adb
+            adb connect localhost:5555 || true
+            adb devices
+            adb shell getprop ro.build.version.release || true
+          else
+            echo "No binder device available, testing fallback options..."
+          fi
