@@ -351,7 +351,7 @@ index 04b0b34..e242958 100644
  
  popd
 diff --git a/projects/geckoview/build_common.sh b/projects/geckoview/build_common.sh
-index 37c090c..0202e85 100644
+index 37c090c..58332e1 100644
 --- a/projects/geckoview/build_common.sh
 +++ b/projects/geckoview/build_common.sh
 @@ -38,7 +38,7 @@ export JAVA_HOME=/usr/lib/jvm/java-1.17.0-openjdk-amd64
@@ -388,7 +388,34 @@ index 37c090c..0202e85 100644
    tar -xf [% c('input_files_by_name/glean-wheels') %]
    export GLEAN_PYTHON_WHEELS_DIR=$rootdir/glean-wheels
  [% ELSE -%]
-@@ -82,9 +100,182 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
+@@ -74,6 +92,26 @@ chmod +x $HOME/.mozbuild/android-device/avd
+ 
+ [% INCLUDE 'browser-localization' %]
+ 
++# Populate compiler-rt profile libraries from Android NDK for Clang PGO instrumentation
++if [[ -d "${ANDROID_NDK_HOME:-}/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/lib/linux" ]]; then
++  clang_rt_base="/var/tmp/dist/clang-linux/lib/clang/21/lib"
++  mkdir -p "$clang_rt_base/linux"
++  cp -a "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/lib/linux"/* "$clang_rt_base/linux/" || true
++  for arch in aarch64 arm i686 x86_64; do
++    tgt_arch="$arch"
++    src_a="$clang_rt_base/linux/libclang_rt.profile-${tgt_arch}-android.a"
++    if [[ -f "$src_a" ]]; then
++      for api in "" 21 24 26 27 28 29 30 31 32 33 34 35; do
++        for prefix in "${arch}-unknown-linux-android" "${arch}-linux-android"; do
++          tgt_dir="$clang_rt_base/${prefix}${api}"
++          mkdir -p "$tgt_dir"
++          cp -a "$src_a" "$tgt_dir/libclang_rt.profile.a"
++        done
++      done
++    fi
++  done
++fi
++
+ cd $builddir/[% project %]-[% c("version") %]
+ cp $rootdir/mozconfig ./
+ 
+@@ -82,9 +120,182 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
    mobile/android/android-components/gradle.properties \
    mobile/android/fenix/gradle.properties
  
