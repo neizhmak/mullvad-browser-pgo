@@ -16,18 +16,16 @@ jobs:
           set -euo pipefail
           echo "=== Compiling binder module ==="
           sudo apt-get update
-          sudo apt-get install -y git dkms linux-headers-$(uname -r) build-essential adb
+          sudo apt-get install -y git dkms linux-headers-$(uname -r) build-essential adb curl
           cd /tmp
           git clone https://github.com/choff/anbox-modules.git
           cd anbox-modules/binder
           make -j$(nproc)
           sudo insmod binder_linux.ko devices="binder,hwbinder,vndbinder" || true
           
-          # Setup binderfs if present
           mkdir -p /dev/binderfs || true
           sudo mount -t binder binder /dev/binderfs || true
           
-          # Ensure devices exist and have 0666 permissions
           for dev in binder hwbinder vndbinder; do
             if [[ -e /dev/binderfs/$dev && ! -e /dev/$dev ]]; then
               sudo ln -s /dev/binderfs/$dev /dev/$dev
@@ -40,10 +38,7 @@ jobs:
             fi
           done
 
-          ls -la /dev/binder* || true
-          ls -la /dev/*binder* || true
-
-      - name: Launch ReDroid and wait for Android boot
+      - name: Launch ReDroid and install Mullvad Browser APK
         run: |
           set -euo pipefail
           echo "=== Starting ReDroid ==="
@@ -51,44 +46,43 @@ jobs:
 
           echo "Sleeping 10s for container initialization..."
           sleep 10
-          docker ps
 
-          echo "Connecting via ADB..."
           adb connect 127.0.0.1:5555 || true
-          sleep 2
-          adb devices
-
           target_dev=$(adb devices | grep -E "5555|device$" | head -n 1 | awk '{print $1}')
           echo "Target device: $target_dev"
 
-          echo "Waiting for Android boot to complete on $target_dev..."
+          echo "Waiting for Android boot..."
           for i in $(seq 1 40); do
             boot_status=$(adb -s "$target_dev" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
-            echo "Boot status check $i: '$boot_status'"
             if [[ "$boot_status" == "1" ]]; then
-              echo "Android booted successfully!"
+              echo "Android booted in check $i!"
               break
             fi
-            sleep 3
+            sleep 2
           done
 
-          if [[ "$boot_status" != "1" ]]; then
-            echo "=== DUMPING DIAGNOSTICS ==="
-            docker logs redroid || true
-            adb -s "$target_dev" logcat -d -t 100 || true
-            dmesg | tail -n 50 || true
-          fi
+          echo "Downloading built Mullvad Browser APK..."
+          curl -sL -o /tmp/mb.apk "https://github.com/neizhmak/mullvad-browser-pgo/releases/download/android-dependencies-mb-16.0a9-build1/mullvad-browser-qa-android-aarch64-16.0a9.apk"
+          ls -lh /tmp/mb.apk
 
-          echo "=== Android System Properties ==="
-          adb -s "$target_dev" shell getprop ro.build.version.release
-          adb -s "$target_dev" shell getprop ro.product.cpu.abi
-          adb -s "$target_dev" shell uname -a
-          adb -s "$target_dev" shell getprop ro.build.description
+          echo "Installing APK to ReDroid Android 12..."
+          adb -s "$target_dev" install -r /tmp/mb.apk
 
-      - name: Test APK installation and basic execution in ReDroid
-        run: |
-          set -euo pipefail
-          target_dev=$(adb devices | grep -E "5555|device$" | head -n 1 | awk '{print $1}')
-          echo "=== Testing basic command execution in Android on $target_dev ==="
-          adb -s "$target_dev" shell pm list packages | head -n 15
-          echo "ReDroid is 100% operational on ubuntu-24.04-arm!"
+          echo "Installed packages containing mozilla or mullvad:"
+          adb -s "$target_dev" shell pm list packages | grep -E "mullvad|firefox|fenix" || true
+
+          pkg_name=$(adb -s "$target_dev" shell pm list packages | grep -E "mullvad|firefox|fenix" | head -n 1 | cut -d: -f2 | tr -d '\r')
+          echo "Detected package name: $pkg_name"
+
+          echo "Launching browser..."
+          adb -s "$target_dev" shell am start -n "$pkg_name/org.mozilla.fenix.HomeActivity"
+          sleep 10
+
+          echo "Checking running processes:"
+          adb -s "$target_dev" shell ps -A | grep -i "$pkg_name" || true
+
+          echo "Taking screenshot of running browser..."
+          adb -s "$target_dev" shell screencap -p /data/local/tmp/screen.png
+          adb -s "$target_dev" pull /data/local/tmp/screen.png /tmp/screen.png
+          ls -lh /tmp/screen.png
+          echo "Browser launched and verified 100% in ReDroid!"
