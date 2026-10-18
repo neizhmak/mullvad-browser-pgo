@@ -1,0 +1,133 @@
+name: Android Stage 4A - Generate AArch64 PGO Profile
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-pgo-stage4a-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RBM_NO_DEBUG: "1"
+
+jobs:
+  build-instrumented-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize environment
+        run: |
+          echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
+          tag="$(jq -r .tag upstream.lock.json)"
+          echo "ANDROID_RELEASE=android-dependencies-$tag" >> "$GITHUB_ENV"
+      - name: Install RBM and Android host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdata-dump-perl libdata-uuid-perl libdatetime-perl \
+            libdigest-sha-perl libfile-copy-recursive-perl libfile-slurp-perl \
+            libio-all-perl libcapture-tiny-perl libio-handle-util-perl libjson-perl \
+            libparallel-forkmanager-perl libpath-tiny-perl libsort-versions-perl \
+            libstring-shellquote-perl libtemplate-perl libxml-libxml-perl \
+            libxml-writer-perl libyaml-libyaml-perl git uidmap zstd
+      - name: Prepare and validate RBM user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+      - name: Configure swap on runner
+        run: |
+          sudo fallocate -l 20G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=20480
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+      - name: Fetch exact upstream
+        run: ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
+      - name: Apply Android overlay
+        run: |
+          set -euo pipefail
+          ./scripts/prepare-android.sh --upstream "$UPSTREAM"
+      - name: Restore verified Android dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/rbm-release-artifacts.py restore --upstream "$UPSTREAM" --release "$ANDROID_RELEASE"
+      - name: Build instrumented GeckoView and Fenix APK
+        run: |
+          set -euo pipefail
+          echo "Building instrumented Android AArch64 package (pgo-generate)..."
+          cd "$UPSTREAM"
+          ./rbm/rbm build browser --target alpha --target mullvadbrowser-android-aarch64 --target pgo-generate
+      - name: Collect and stage instrumented APK
+        run: |
+          mkdir -p "$RUNNER_TEMP/instrumented-apk"
+          find "$UPSTREAM/out" -type f -name "*arm64-v8a*.apk" -exec cp -v {} "$RUNNER_TEMP/instrumented-apk/app-instrumented.apk" \;
+          ls -lh "$RUNNER_TEMP/instrumented-apk/"
+      - name: Upload instrumented APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-instrumented-apk
+          path: ${{ runner.temp }}/instrumented-apk/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Upload build logs on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-instrumented-build-logs
+          path: ${{ runner.temp }}/tor-browser-build/logs/
+          if-no-files-found: warn
+
+  train-android-pgo:
+    needs: build-instrumented-apk
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-instrumented-apk
+          path: ${{ runner.temp }}/instrumented
+      - name: Run automated PGO training in ReDroid ARM64 container
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pgo-output"
+          chmod +x ./scripts/train-android-pgo.sh
+          ./scripts/train-android-pgo.sh "$RUNNER_TEMP/instrumented/app-instrumented.apk" "$RUNNER_TEMP/pgo-output"
+      - name: Upload PGO profile artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-pgo-profile
+          path: ${{ runner.temp }}/pgo-output/
+          retention-days: 14
+          if-no-files-found: error
+
+  publish-pgo-profile:
+    needs: train-android-pgo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize environment
+        run: |
+          tag="$(jq -r .tag upstream.lock.json)"
+          echo "ANDROID_RELEASE=android-dependencies-$tag" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-pgo-profile
+          path: ${{ runner.temp }}/pgo-output
+      - name: Publish PGO profile to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/pgo-output"
+          ls -lh
+          for f in *; do
+            if [[ -f "$f" ]]; then
+              echo "Uploading $f to release $ANDROID_RELEASE..."
+              gh release upload "$ANDROID_RELEASE" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+            fi
+          done

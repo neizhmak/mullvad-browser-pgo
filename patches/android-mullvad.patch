@@ -79,11 +79,30 @@ index 51cbeb4..3667733 100644
  
  [%IF c("var/tor-browser") -%]
      tor_expert_bundle_src="[% c('input_files_by_name/tor-expert-bundle') %]"
+diff --git a/projects/browser/config b/projects/browser/config
+index 453d297..c3a84a9 100644
+--- a/projects/browser/config
++++ b/projects/browser/config
+@@ -17,6 +17,14 @@ var:
+ 
+ targets:
+ 
++  pgo-use:
++    var:
++      pgo_use: 1
++
++  pgo-generate:
++    var:
++      pgo_generate: 1
++
+   linux:
+     var:
+       pt_path: ./TorBrowser/Tor/PluggableTransports/
 diff --git a/projects/geckoview/build_ac_fenix.sh b/projects/geckoview/build_ac_fenix.sh
-index 04b0b34..3628583 100644
+index 04b0b34..e242958 100644
 --- a/projects/geckoview/build_ac_fenix.sh
 +++ b/projects/geckoview/build_ac_fenix.sh
-@@ -20,6 +20,223 @@ pushd mobile/android/fenix
+@@ -20,6 +20,232 @@ pushd mobile/android/fenix
  # Use the Android Components we have just built
  echo autoPublish.android-components.dir=../android-components > local.properties
  
@@ -101,7 +120,16 @@ index 04b0b34..3628583 100644
 +    t = t.replace("    implementation project(':components:lib-crash-sentry')\n", "")
 +    t = t.replace("    implementation libs.play.services.ads.id\n", "")
 +    t = t.replace("    androidTestUtil libs.androidx.test.orchestrator\n", "")
++    t = t.replace('applicationId "org.mozilla"', 'applicationId "net.mullvad"')
++    t = t.replace('applicationIdSuffix ".firefox_beta"', 'applicationIdSuffix ".mullvadbrowser_alpha"')
++    t = t.replace('"sharedUserId": "org.mozilla.firefox.sharedID"', '"sharedUserId": "net.mullvad.mullvadbrowser.sharedID"')
 +    p_bg.write_text(t, encoding="utf-8")
++
++# 10. Mullvad Browser app name in static_strings.xml
++for ss_path in ["app/src/beta/res/values/static_strings.xml", "app/src/main/res/values/static_strings.xml"]:
++    p_ss = Path(ss_path)
++    if p_ss.is_file():
++        p_ss.write_text('<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n<resources>\n    <string name="app_name" translatable="false">Mullvad Browser Alpha</string>\n</resources>\n', encoding="utf-8")
 +
 +# 2. AdjustMetricsService.kt
 +p_ams = Path("app/src/main/java/org/mozilla/fenix/components/metrics/AdjustMetricsService.kt")
@@ -307,7 +335,7 @@ index 04b0b34..3628583 100644
  [% IF c('var/has_l10n') -%]
    tar -C $distdir -xf $rootdir/[% c('input_files_by_name/translation-fenix') %]
    # Add our localized strings
-@@ -44,6 +261,7 @@ gradle $GRADLE_FLAGS -PversionName="$version_name" "assemble$variant" [% IF c('v
+@@ -44,6 +270,7 @@ gradle $GRADLE_FLAGS -PversionName="$version_name" "assemble$variant" [% IF c('v
    mv $objdir/gradle/build/mobile/android/fenix/app/outputs/apk/$variant/*.apk $outdir/[% project %]
  [% END -%]
  
@@ -315,7 +343,7 @@ index 04b0b34..3628583 100644
  echo "Building non optimized $variant Fenix APK for testing"
  gradle $GRADLE_FLAGS -PversionName="$version_name" -PdisableOptimization "assemble$variant"
  
-@@ -61,5 +279,6 @@ echo "Test build finished, copying the APKs to the destination directory $(date)
+@@ -61,5 +288,6 @@ echo "Test build finished, copying the APKs to the destination directory $(date)
  mkdir -p $outdir/[% project %]/tests
  mv $objdir/gradle/build/mobile/android/fenix/app/outputs/apk/$variant/*.apk $outdir/[% project %]/tests
  mv $objdir/gradle/build/mobile/android/fenix/app/outputs/apk/androidTest/$variant/*.apk $outdir/[% project %]/tests
@@ -323,7 +351,7 @@ index 04b0b34..3628583 100644
  
  popd
 diff --git a/projects/geckoview/build_common.sh b/projects/geckoview/build_common.sh
-index 37c090c..491c0bc 100644
+index 37c090c..772609a 100644
 --- a/projects/geckoview/build_common.sh
 +++ b/projects/geckoview/build_common.sh
 @@ -38,7 +38,7 @@ export JAVA_HOME=/usr/lib/jvm/java-1.17.0-openjdk-amd64
@@ -360,7 +388,7 @@ index 37c090c..491c0bc 100644
    tar -xf [% c('input_files_by_name/glean-wheels') %]
    export GLEAN_PYTHON_WHEELS_DIR=$rootdir/glean-wheels
  [% ELSE -%]
-@@ -82,6 +100,161 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
+@@ -82,9 +100,182 @@ sed -i -e 's/-Xmx7g/-Xmx32g/' gradle.properties \
    mobile/android/android-components/gradle.properties \
    mobile/android/fenix/gradle.properties
  
@@ -519,11 +547,32 @@ index 37c090c..491c0bc 100644
 +PY_AS_NOOP
 +[% END -%]
 +
++[% IF c("var/pgo_use") -%]
++  [% IF c("var/pgo_generate") -%]
++    echo 'PGO generation and profile use are mutually exclusive' >&2
++    exit 1
++  [% END -%]
++  mkdir -p /var/tmp/dist/pgo
++  cp "$rootdir/[% c('input_files_by_name/pgo-profdata') %]" /var/tmp/dist/pgo/merged.profdata
++  [% IF c("var/pgo_jarlog_sha256") -%]
++  cp "$rootdir/[% c('input_files_by_name/pgo-jarlog') %]" /var/tmp/dist/pgo/jarlog
++  [% END -%]
++[% END -%]
++
  echo "Starting ./mach configure $(date)"
  # We still need to specify --base-browser-version due to bug 34005.
  ./mach configure \
++  [% IF c("var/pgo_generate") -%]--enable-profile-generate=cross[% END %] \
++  [% IF c("var/pgo_use") -%]
++  --enable-profile-use=cross \
++  --with-pgo-profile-path=/var/tmp/dist/pgo/merged.profdata \
++  [% IF c("var/pgo_jarlog_sha256") -%]--with-pgo-jarlog=/var/tmp/dist/pgo/jarlog[% END %] \
++  [% END -%] \
+   [% IF !c("var/firefox-browser") %]--with-base-browser-version=[% c("var/torbrowser_version") %][% END %] \
+   [% IF !c("var/firefox-browser") %]--with-branding=$branding_dir[% END %] \
+   [% IF !c("var/rlbox") -%]--without-wasm-sandboxed-libraries[% END %]
 diff --git a/projects/geckoview/config b/projects/geckoview/config
-index 4b24e84..1cbc05d 100644
+index 4b24e84..7d2186d 100644
 --- a/projects/geckoview/config
 +++ b/projects/geckoview/config
 @@ -1,7 +1,7 @@
@@ -535,7 +584,24 @@ index 4b24e84..1cbc05d 100644
  tag_gpg_id: 1
  git_url: https://gitlab.torproject.org/tpo/applications/tor-browser.git
  gpg_keyring:
-@@ -64,6 +64,14 @@ targets:
+@@ -49,6 +49,16 @@ var:
+   mozconfig_file: 'mozconfig-[% c("var/osname") %]'
+ 
+ targets:
++  pgo-generate:
++    var:
++      pgo_generate: 1
++
++  pgo-use:
++    var:
++      pgo_use: 1
++      pgo_profile_sha256: '[% ENV.PGO_PROFILE_SHA256 %]'
++      pgo_jarlog_sha256: '[% ENV.PGO_JARLOG_SHA256 %]'
++
+   release:
+     var:
+       variant: release
+@@ -64,6 +74,14 @@ targets:
        online_build: 1
        has_l10n: 0
  
@@ -550,6 +616,21 @@ index 4b24e84..1cbc05d 100644
    # Run `make generate_gradle_dependencies_list-geckoview` to
    # generate the gradle dependencies file. You can them move the file
    # `out/geckoview/gradle-dependencies-list-$version.txt`
+@@ -158,6 +176,14 @@ steps:
+         sha256sum: '[% c("var/bundletool_hash") %]'
+ 
+ input_files:
++  - filename: 'pgo-[% c("var/pgo_profile_sha256") %].profdata'
++    name: pgo-profdata
++    sha256sum: '[% c("var/pgo_profile_sha256") %]'
++    enable: '[% c("var/pgo_use") %]'
++  - filename: 'pgo-[% c("var/pgo_jarlog_sha256") %].jarlog'
++    name: pgo-jarlog
++    sha256sum: '[% c("var/pgo_jarlog_sha256") %]'
++    enable: '[% c("var/pgo_use") && c("var/pgo_jarlog_sha256") %]'
+   - project: container-image
+   - filename: 'mozconfig'
+     content: '[% INCLUDE "mozconfig.in" %]'
 diff --git a/rbm.conf b/rbm.conf
 index 148e1f5..6e5ff9c 100644
 --- a/rbm.conf

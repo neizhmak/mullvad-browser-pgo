@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mullvad Browser Android PGO Training Workload</title>
+<style>
+  body { font-family: sans-serif; margin: 20px; background: #111; color: #eee; }
+  #status { font-weight: bold; color: #4af; margin-bottom: 10px; }
+  #log { font-family: monospace; font-size: 12px; height: 150px; overflow-y: scroll; background: #222; padding: 10px; border-radius: 4px; }
+  .box { display: inline-block; width: 8px; height: 8px; margin: 1px; background: #555; }
+  .active { background: #4caf50; }
+  canvas { border: 1px solid #444; margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>Mullvad Browser Android PGO Training</h1>
+<div id="status">Starting benchmark suite...</div>
+<div id="log"></div>
+<canvas id="c" width="400" height="200"></canvas>
+<div id="container"></div>
+
+<script>
+function log(msg) {
+  const l = document.getElementById("log");
+  const d = document.createElement("div");
+  d.textContent = "[" + new Date().toISOString().substring(11, 19) + "] " + msg;
+  l.appendChild(d);
+  l.scrollTop = l.scrollHeight;
+}
+
+function updateStatus(msg) {
+  document.getElementById("status").textContent = msg;
+  log(msg);
+}
+
+// 1. DOM Stress & Reflow (exercises Stylo CSS engine in Rust and Gecko Layout)
+function runDomBenchmark(iterations) {
+  updateStatus("Running DOM & Layout benchmark (" + iterations + " iterations)...");
+  const container = document.getElementById("container");
+  container.innerHTML = "";
+  const nodes = [];
+  for (let i = 0; i < 2000; i++) {
+    const el = document.createElement("div");
+    el.className = "box";
+    el.textContent = (i % 10).toString();
+    container.appendChild(el);
+    nodes.push(el);
+  }
+  
+  for (let it = 0; it < iterations; it++) {
+    for (let i = 0; i < nodes.length; i += 2) {
+      nodes[i].classList.toggle("active");
+      nodes[i].style.transform = (it % 2 === 0) ? "scale(1.2)" : "scale(1.0)";
+    }
+    // Force synchronous layout / reflow
+    const h = container.offsetHeight;
+    const r = container.getBoundingClientRect();
+  }
+  log("DOM benchmark complete.");
+}
+
+// 2. JavaScript Engine Stress (SpiderMonkey Ion/Warp JIT & GC)
+function runJsBenchmark(iterations) {
+  updateStatus("Running JavaScript Engine benchmark (" + iterations + " iterations)...");
+  
+  for (let it = 0; it < iterations; it++) {
+    // Array operations & sorting
+    const arr = [];
+    for (let i = 0; i < 10000; i++) {
+      arr.push({ id: i, val: Math.sin(i) * 10000, str: "item_" + (i % 100) });
+    }
+    arr.sort((a, b) => a.val - b.val);
+    const filtered = arr.filter(x => x.id % 2 === 0).map(x => x.val * 2);
+    
+    // JSON serialization / deserialization
+    const jsonStr = JSON.stringify(arr.slice(0, 500));
+    const parsed = JSON.parse(jsonStr);
+    
+    // Regular expression operations
+    const text = jsonStr;
+    const matches = text.match(/item_[0-9]+/g);
+    
+    // TypedArray numerical computing
+    const fa = new Float64Array(10000);
+    for (let i = 0; i < fa.length; i++) {
+      fa[i] = Math.sqrt(i) * Math.cos(i);
+    }
+  }
+  log("JavaScript engine benchmark complete.");
+}
+
+// 3. Canvas 2D & WebRender Graphics Stress
+function runCanvasBenchmark(frames) {
+  updateStatus("Running Canvas 2D & WebRender benchmark (" + frames + " frames)...");
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  
+  for (let f = 0; f < frames; f++) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (let i = 0; i < 200; i++) {
+      ctx.fillStyle = "rgba(" + (i * 3 % 255) + "," + (i * 7 % 255) + "," + (i * 11 % 255) + ", 0.7)";
+      ctx.beginPath();
+      ctx.arc((i * 17 + f * 5) % canvas.width, (i * 23 + f * 3) % canvas.height, (i % 20) + 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = "#fff";
+    ctx.font = "14px monospace";
+    ctx.fillText("Frame " + f + "/" + frames, 10, 20);
+  }
+  log("Canvas benchmark complete.");
+}
+
+async function runFullPgoWorkload() {
+  log("Initializing Mullvad PGO training suite...");
+  await new Promise(r => setTimeout(r, 1000));
+  
+  // Run cycles of workload to collect dense branch execution profiles
+  for (let cycle = 1; cycle <= 5; cycle++) {
+    log("=== Training Cycle " + cycle + "/5 ===");
+    runDomBenchmark(15);
+    await new Promise(r => setTimeout(r, 200));
+    runJsBenchmark(10);
+    await new Promise(r => setTimeout(r, 200));
+    runCanvasBenchmark(30);
+    await new Promise(r => setTimeout(r, 200));
+  }
+  
+  updateStatus("ALL PGO WORKLOADS COMPLETED SUCCESSFULLY!");
+  log("Training finished. Browser ready for profile flush.");
+  
+  // Set title to signal completion to external watcher
+  document.title = "PGO_TRAINING_FINISHED";
+}
+
+window.addEventListener("load", () => {
+  setTimeout(runFullPgoWorkload, 1500);
+});
+</script>
+</body>
+</html>

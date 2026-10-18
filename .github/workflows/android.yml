@@ -614,11 +614,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/rbm-release-artifacts.py restore --upstream "$UPSTREAM" --release "$ANDROID_RELEASE"
       - name: Build Mullvad Browser Android APK
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           echo "Starting RBM build for mullvadbrowser-android-$TARGET_ARCH..."
           cd "$UPSTREAM"
-          ./rbm/rbm build browser --target alpha --target "mullvadbrowser-android-$TARGET_ARCH"
+
+          PGO_ARGS=()
+          if gh release view "$ANDROID_RELEASE" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null | grep -q "android-$TARGET_ARCH-pgo.profdata"; then
+            echo "Found verified PGO profile for Android $TARGET_ARCH in release, enabling PGO use..."
+            mkdir -p "$UPSTREAM/out/geckoview"
+            gh release download "$ANDROID_RELEASE" --repo "$GITHUB_REPOSITORY" -p "android-$TARGET_ARCH-pgo.profdata" -D "$UPSTREAM/out/geckoview" || true
+            if [[ -f "$UPSTREAM/out/geckoview/android-$TARGET_ARCH-pgo.profdata" ]]; then
+              prof_sha=$(sha256sum "$UPSTREAM/out/geckoview/android-$TARGET_ARCH-pgo.profdata" | awk '{print $1}')
+              cp "$UPSTREAM/out/geckoview/android-$TARGET_ARCH-pgo.profdata" "$UPSTREAM/out/geckoview/pgo-$prof_sha.profdata"
+              export PGO_PROFILE_SHA256="$prof_sha"
+              PGO_ARGS+=(--target pgo-use)
+              echo "Activated PGO-use profile with SHA256: $prof_sha"
+            fi
+          fi
+
+          ./rbm/rbm build browser --target alpha --target "mullvadbrowser-android-$TARGET_ARCH" "${PGO_ARGS[@]}
       - name: Collect and stage APK artifacts
         if: always()
         run: |
