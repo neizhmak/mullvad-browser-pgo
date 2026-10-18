@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - name: Setup DKMS binder module
+      - name: Setup DKMS binder module and permissions
         run: |
           set -euo pipefail
           echo "=== Compiling binder module ==="
@@ -21,8 +21,27 @@ jobs:
           git clone https://github.com/choff/anbox-modules.git
           cd anbox-modules/binder
           make -j$(nproc)
-          sudo insmod binder_linux.ko devices="binder,hwbinder,vndbinder"
-          ls -la /dev/binder*
+          sudo insmod binder_linux.ko devices="binder,hwbinder,vndbinder" || true
+          
+          # Setup binderfs if present
+          mkdir -p /dev/binderfs || true
+          sudo mount -t binder binder /dev/binderfs || true
+          
+          # Ensure devices exist and have 0666 permissions
+          for dev in binder hwbinder vndbinder; do
+            if [[ -e /dev/binderfs/$dev && ! -e /dev/$dev ]]; then
+              sudo ln -s /dev/binderfs/$dev /dev/$dev
+            fi
+            if [[ -e /dev/$dev ]]; then
+              sudo chmod 666 /dev/$dev
+            fi
+            if [[ -e /dev/binderfs/$dev ]]; then
+              sudo chmod 666 /dev/binderfs/$dev
+            fi
+          done
+
+          ls -la /dev/binder* || true
+          ls -la /dev/*binder* || true
 
       - name: Launch ReDroid and wait for Android boot
         run: |
@@ -33,14 +52,12 @@ jobs:
           echo "Sleeping 10s for container initialization..."
           sleep 10
           docker ps
-          docker logs redroid | head -n 30 || true
 
           echo "Connecting via ADB..."
           adb connect 127.0.0.1:5555 || true
           sleep 2
           adb devices
 
-          # Find exact target device serial
           target_dev=$(adb devices | grep -E "5555|device$" | head -n 1 | awk '{print $1}')
           echo "Target device: $target_dev"
 
@@ -54,6 +71,13 @@ jobs:
             fi
             sleep 3
           done
+
+          if [[ "$boot_status" != "1" ]]; then
+            echo "=== DUMPING DIAGNOSTICS ==="
+            docker logs redroid || true
+            adb -s "$target_dev" logcat -d -t 100 || true
+            dmesg | tail -n 50 || true
+          fi
 
           echo "=== Android System Properties ==="
           adb -s "$target_dev" shell getprop ro.build.version.release
