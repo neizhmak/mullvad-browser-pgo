@@ -635,7 +635,7 @@ jobs:
             fi
           fi
 
-          ./rbm/rbm build browser --target alpha --target "mullvadbrowser-android-$TARGET_ARCH" "${PGO_ARGS[@]}
+          ./rbm/rbm build browser --target alpha --target "mullvadbrowser-android-$TARGET_ARCH" "${PGO_ARGS[@]}"
       - name: Collect and stage APK artifacts
         if: always()
         run: |
