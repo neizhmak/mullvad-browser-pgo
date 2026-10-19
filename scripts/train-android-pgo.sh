@@ -22,9 +22,10 @@ mkdir -p /tmp/pgo_raw
 
 # 1. Setup DKMS binder if not already present
 if [[ ! -c /dev/binder ]]; then
-  echo "Setting up binder_linux kernel module..."
+  echo "Setting up binder_linux kernel module and host tools..."
   sudo apt-get update
-  sudo apt-get install -y git dkms linux-headers-$(uname -r) build-essential adb curl llvm python3-pip
+  sudo apt-get install -y git dkms linux-headers-$(uname -r) build-essential adb curl python3-pip
+  sudo apt-get install -y llvm-19 llvm-19-tools || true
   pip3 install --break-system-packages marionette-driver || true
   cd /tmp
   if [[ ! -d anbox-modules ]]; then
@@ -50,7 +51,8 @@ if [[ ! -c /dev/binder ]]; then
   done
 else
   sudo apt-get update
-  sudo apt-get install -y adb curl llvm python3-pip || true
+  sudo apt-get install -y adb curl python3-pip || true
+  sudo apt-get install -y llvm-19 llvm-19-tools || true
   pip3 install --break-system-packages marionette-driver || true
 fi
 
@@ -193,11 +195,39 @@ raw_files=( $(find /tmp/pgo_raw/ -type f -name "*.profraw") )
 profraw_count="${#raw_files[@]}"
 echo "Found $profraw_count raw profile files in /tmp/pgo_raw/."
 
-# Detect llvm-profdata binary
-LLVM_PROFDATA="llvm-profdata"
-if ! command -v "$LLVM_PROFDATA" >/dev/null 2>&1; then
-  LLVM_PROFDATA=$(command -v llvm-profdata-* 2>/dev/null | head -n 1 || true)
+# Detect llvm-profdata binary supporting format version 10 (LLVM 19+)
+LLVM_PROFDATA=""
+for cand in llvm-profdata-21 llvm-profdata-20 llvm-profdata-19 /usr/lib/llvm-19/bin/llvm-profdata /usr/lib/llvm-20/bin/llvm-profdata llvm-profdata; do
+  if command -v "$cand" >/dev/null 2>&1; then
+    ver=$("$cand" --version 2>&1 || true)
+    if [[ "$ver" != *"version 18."* && "$ver" != *"version 17."* ]]; then
+      LLVM_PROFDATA=$(command -v "$cand")
+      break
+    fi
+  fi
+done
+
+if [[ -z "$LLVM_PROFDATA" ]]; then
+  echo "Modern llvm-profdata not found, installing llvm-19 from package manager..."
+  sudo apt-get update || true
+  sudo apt-get install -y llvm-19 llvm-19-tools || true
+  for cand in llvm-profdata-19 /usr/lib/llvm-19/bin/llvm-profdata llvm-profdata; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      LLVM_PROFDATA=$(command -v "$cand")
+      break
+    fi
+  done
 fi
+
+if [[ -z "$LLVM_PROFDATA" ]] || [[ "$("$LLVM_PROFDATA" --version 2>&1)" == *"version 18."* ]]; then
+  echo "Attempting to install LLVM 19 from apt.llvm.org..."
+  curl -s https://apt.llvm.org/llvm.sh | sudo bash -s 19 || true
+  if command -v llvm-profdata-19 >/dev/null 2>&1; then
+    LLVM_PROFDATA=$(command -v llvm-profdata-19)
+  fi
+fi
+
+echo "Using LLVM_PROFDATA: $LLVM_PROFDATA ($("$LLVM_PROFDATA" --version 2>&1 | head -n 1))"
 
 if [[ "$profraw_count" -gt 0 ]]; then
   echo "Merging raw profiles into android-aarch64-pgo.profdata using $LLVM_PROFDATA..."
