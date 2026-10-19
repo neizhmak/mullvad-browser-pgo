@@ -2,12 +2,17 @@
 # Automated Android AArch64 PGO Training Script using ReDroid container on ARM64
 set -euo pipefail
 
-apk_path="${1:-/tmp/instrumented.apk}"
-output_dir="${2:-/tmp/android-pgo-output}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+workload_file="$SCRIPT_DIR/android-pgo-workload.html"
+
+apk_path="$(realpath "${1:-/tmp/instrumented.apk}")"
+output_dir="$(realpath -m "${2:-/tmp/android-pgo-output}")"
 
 echo "=========================================================="
 echo "Starting Android AArch64 PGO Training Pipeline"
-echo "APK Path: $apk_path"
+echo "SCRIPT_DIR: $SCRIPT_DIR"
+echo "Workload:   $workload_file"
+echo "APK Path:   $apk_path"
 echo "Output Dir: $output_dir"
 echo "=========================================================="
 
@@ -27,7 +32,7 @@ if [[ ! -c /dev/binder ]]; then
   make -j$(nproc)
   sudo insmod binder_linux.ko devices="binder,hwbinder,vndbinder" || true
   
-  mkdir -p /dev/binderfs || true
+  sudo mkdir -p /dev/binderfs || true
   sudo mount -t binder binder /dev/binderfs || true
   
   for dev in binder hwbinder vndbinder; do
@@ -69,15 +74,13 @@ for i in $(seq 1 60); do
 done
 
 # 4. Install instrumented APK
-echo "Installing instrumented APK..."
+echo "Installing instrumented APK: $apk_path..."
 adb -s "$target_dev" install -r "$apk_path"
 
 pkg_name=$(adb -s "$target_dev" shell pm list packages | grep -E "mullvad|firefox|fenix" | head -n 1 | cut -d: -f2 | tr -d '\r')
 echo "Installed package: $pkg_name"
 
 # 5. Push training workload
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-workload_file="$SCRIPT_DIR/android-pgo-workload.html"
 echo "Pushing training workload: $workload_file..."
 adb -s "$target_dev" shell "mkdir -p /data/local/tmp/workload"
 adb -s "$target_dev" push "$workload_file" /data/local/tmp/workload/index.html
@@ -130,6 +133,11 @@ for pid in $pids; do
   adb -s "$target_dev" shell kill -15 "$pid" || true
 done
 sleep 8
+
+# Scan app internal data directories in case profiles were written there
+adb -s "$target_dev" shell "su 0 cp -r /data/data/$pkg_name/*.profraw /data/local/tmp/pgo_profile/ 2>/dev/null || true"
+adb -s "$target_dev" shell "su 0 cp -r /data/user/0/$pkg_name/*.profraw /data/local/tmp/pgo_profile/ 2>/dev/null || true"
+
 adb -s "$target_dev" shell am force-stop "$pkg_name" || true
 sleep 2
 
@@ -137,26 +145,34 @@ sleep 2
 echo "Pulling profile data..."
 adb -s "$target_dev" pull /data/local/tmp/pgo_profile/ /tmp/pgo_raw/ || true
 
-ls -la /tmp/pgo_raw/pgo_profile/ || true
-
-# 11. Merge profiles with llvm-profdata
-profraw_count=$(find /tmp/pgo_raw/pgo_profile/ -type f -name "*.profraw" | wc -l)
+# Find all profraw files pulled
+mkdir -p "$output_dir"
+raw_files=( $(find /tmp/pgo_raw/ -type f -name "*.profraw") )
+profraw_count="${#raw_files[@]}"
 echo "Found $profraw_count raw profile files."
 
+# Detect llvm-profdata binary
+LLVM_PROFDATA="llvm-profdata"
+if ! command -v "$LLVM_PROFDATA" >/dev/null 2>&1; then
+  LLVM_PROFDATA=$(command -v llvm-profdata-* 2>/dev/null | head -n 1 || true)
+fi
+
 if [[ "$profraw_count" -gt 0 ]]; then
-  echo "Merging raw profiles into android-aarch64-pgo.profdata..."
-  llvm-profdata merge -output="$output_dir/android-aarch64-pgo.profdata" /tmp/pgo_raw/pgo_profile/*.profraw
+  echo "Merging raw profiles into android-aarch64-pgo.profdata using $LLVM_PROFDATA..."
+  "$LLVM_PROFDATA" merge -output="$output_dir/android-aarch64-pgo.profdata" "${raw_files[@]}"
   
-  if [[ -f /tmp/pgo_raw/pgo_profile/en-US.log ]]; then
-    cp /tmp/pgo_raw/pgo_profile/en-US.log "$output_dir/en-US.log"
+  jarlog_cand=$(find /tmp/pgo_raw/ -type f -name "en-US.log" | head -n 1)
+  if [[ -n "$jarlog_cand" && -f "$jarlog_cand" ]]; then
+    cp "$jarlog_cand" "$output_dir/en-US.log"
   fi
   
   echo "Validating merged profile..."
-  llvm-profdata show --counts "$output_dir/android-aarch64-pgo.profdata" | head -n 20
+  "$LLVM_PROFDATA" show --counts "$output_dir/android-aarch64-pgo.profdata" | head -n 25
   echo "SUCCESS: Merged profile generated at $output_dir/android-aarch64-pgo.profdata"
 else
-  echo "WARNING: No .profraw files collected directly from wrapper; searching data dir..."
+  echo "WARNING: No .profraw files found in /tmp/pgo_raw/; checking entire Android /data filesystem..."
   adb -s "$target_dev" shell "find /data -name '*.profraw' 2>/dev/null" || true
+  exit 1
 fi
 
 echo "PGO Training completed."

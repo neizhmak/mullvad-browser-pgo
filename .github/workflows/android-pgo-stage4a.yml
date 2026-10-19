@@ -19,7 +19,29 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize environment
+        run: |
+          echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
+          tag="$(jq -r .tag upstream.lock.json)"
+          echo "ANDROID_RELEASE=android-dependencies-$tag" >> "$GITHUB_ENV"
+      - name: Check cached instrumented APK in release
+        id: cache-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/instrumented-apk"
+          if gh release view "$ANDROID_RELEASE" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null | grep -E -q "(app-instrumented\.apk|android-aarch64-instrumented\.apk)"; then
+            echo "Downloading cached instrumented APK from release $ANDROID_RELEASE..."
+            gh release download "$ANDROID_RELEASE" --repo "$GITHUB_REPOSITORY" -p "*instrumented.apk" -D "$RUNNER_TEMP/instrumented-apk"
+            inst_f=$(find "$RUNNER_TEMP/instrumented-apk" -name "*instrumented.apk" | head -n 1)
+            cp -v "$inst_f" "$RUNNER_TEMP/instrumented-apk/app-instrumented.apk"
+            echo "cached=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cached=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Free disk space on runner
+        if: steps.cache-check.outputs.cached != 'true'
         run: |
           set -euo pipefail
           echo "=== Disk space before cleanup ==="
@@ -36,12 +58,8 @@ jobs:
           docker image prune -a -f 2>/dev/null || true
           echo "=== Disk space after cleanup ==="
           df -h
-      - name: Initialize environment
-        run: |
-          echo "UPSTREAM=$RUNNER_TEMP/tor-browser-build" >> "$GITHUB_ENV"
-          tag="$(jq -r .tag upstream.lock.json)"
-          echo "ANDROID_RELEASE=android-dependencies-$tag" >> "$GITHUB_ENV"
       - name: Install RBM and Android host tools
+        if: steps.cache-check.outputs.cached != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -52,10 +70,12 @@ jobs:
             libstring-shellquote-perl libtemplate-perl libxml-libxml-perl \
             libxml-writer-perl libyaml-libyaml-perl git uidmap zstd
       - name: Prepare and validate RBM user namespaces
+        if: steps.cache-check.outputs.cached != 'true'
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
       - name: Configure swap on runner
+        if: steps.cache-check.outputs.cached != 'true'
         run: |
           set -euo pipefail
           swap_file=""
@@ -74,17 +94,21 @@ jobs:
             fi
           fi
       - name: Fetch exact upstream
+        if: steps.cache-check.outputs.cached != 'true'
         run: |
           ./scripts/fetch-upstream.sh --destination "$UPSTREAM"
           git -C "$UPSTREAM" submodule update --init rbm
           "$UPSTREAM/rbm/container" run -- /bin/true
       - name: Apply Android overlay
+        if: steps.cache-check.outputs.cached != 'true'
         run: ./scripts/prepare-android.sh
       - name: Restore verified Android dependencies
+        if: steps.cache-check.outputs.cached != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/rbm-release-artifacts.py restore --upstream "$UPSTREAM" --release "$ANDROID_RELEASE"
       - name: Build instrumented GeckoView and Fenix APK
+        if: steps.cache-check.outputs.cached != 'true'
         run: |
           set -euo pipefail
           echo "=== Disk space before RBM build ==="
@@ -95,6 +119,7 @@ jobs:
           echo "=== Disk space after RBM build ==="
           df -h
       - name: Collect and stage instrumented APK
+        if: steps.cache-check.outputs.cached != 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/instrumented-apk"
           apk_cand=$(find "$UPSTREAM/out" -type f \( -name "*mullvad*qa*.apk" -o -name "*arm64*.apk" \) | head -n 1)
@@ -113,7 +138,7 @@ jobs:
           retention-days: 7
           if-no-files-found: error
       - name: Upload build logs on failure
-        if: always()
+        if: failure() && steps.cache-check.outputs.cached != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: android-instrumented-build-logs
