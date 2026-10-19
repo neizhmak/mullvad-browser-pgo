@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 workload_file="$SCRIPT_DIR/android-pgo-workload.html"
+runner_py="$SCRIPT_DIR/train-runner.py"
 
 apk_path="$(realpath "${1:-/tmp/instrumented.apk}")"
 output_dir="$(realpath -m "${2:-/tmp/android-pgo-output}")"
@@ -23,7 +24,8 @@ mkdir -p /tmp/pgo_raw
 if [[ ! -c /dev/binder ]]; then
   echo "Setting up binder_linux kernel module..."
   sudo apt-get update
-  sudo apt-get install -y git dkms linux-headers-$(uname -r) build-essential adb curl llvm
+  sudo apt-get install -y git dkms linux-headers-$(uname -r) build-essential adb curl llvm python3-pip
+  pip3 install --break-system-packages marionette-driver || true
   cd /tmp
   if [[ ! -d anbox-modules ]]; then
     git clone https://github.com/choff/anbox-modules.git
@@ -46,6 +48,10 @@ if [[ ! -c /dev/binder ]]; then
       sudo chmod 666 /dev/binderfs/$dev
     fi
   done
+else
+  sudo apt-get update
+  sudo apt-get install -y adb curl llvm python3-pip || true
+  pip3 install --break-system-packages marionette-driver || true
 fi
 
 ls -la /dev/binder*
@@ -97,10 +103,27 @@ adb -s "$target_dev" shell "mkdir -p /data/local/tmp/workload && chmod 777 /data
 adb -s "$target_dev" push "$workload_file" /data/local/tmp/workload/index.html
 adb -s "$target_dev" shell "chmod 666 /data/local/tmp/workload/index.html"
 
-# 6. Configure environment and wrapper for LLVM profile writing
+# 6. Configure environment and GeckoView debug config
 echo "Configuring LLVM profiling environment..."
 adb -s "$target_dev" shell "rm -rf /data/local/tmp/pgo_profile && mkdir -p /data/local/tmp/pgo_profile && chmod 777 /data/local/tmp /data/local/tmp/pgo_profile"
 adb -s "$target_dev" shell "mkdir -p /sdcard/pgo_profile && chmod 777 /sdcard/pgo_profile"
+
+# Push official GeckoView config YAML for automation
+cat << EOF > /tmp/geckoview-config.yaml
+env:
+  LLVM_PROFILE_FILE: "/data/local/tmp/pgo_profile/default_%p_%m.profraw"
+  MOZ_JAR_LOG_FILE: "/data/local/tmp/pgo_profile/en-US.log"
+  MOZ_IN_AUTOMATION: "1"
+  XPCOM_DEBUG_BREAK: "warn"
+args:
+  - "--marionette"
+prefs:
+  marionette.defaultPrefs.enabled: true
+  marionette.port: 2828
+EOF
+adb -s "$target_dev" push /tmp/geckoview-config.yaml "/data/local/tmp/${pkg_name}-geckoview-config.yaml"
+adb -s "$target_dev" shell "chmod 666 /data/local/tmp/${pkg_name}-geckoview-config.yaml"
+adb -s "$target_dev" shell am set-debug-app --persistent "$pkg_name"
 
 cat << 'EOF' > /tmp/android_pgo_wrap.sh
 #!/system/bin/sh
@@ -113,59 +136,62 @@ EOF
 chmod 755 /tmp/android_pgo_wrap.sh
 adb -s "$target_dev" push /tmp/android_pgo_wrap.sh /data/local/tmp/wrap.sh
 adb -s "$target_dev" shell chmod 755 /data/local/tmp/wrap.sh
-
 adb -s "$target_dev" shell setprop wrap."$pkg_name" /data/local/tmp/wrap.sh
-echo "Wrapper configured for $pkg_name."
+
+# Forward Marionette port
+adb -s "$target_dev" forward tcp:2828 tcp:2828 || true
 
 # 7. Start browser with training workload and explicit GeckoView env extras
 echo "Launching browser with training workload..."
 adb -s "$target_dev" shell am start -n "$pkg_name/org.mozilla.fenix.HomeActivity"   -a android.intent.action.VIEW   -d "file:///data/local/tmp/workload/index.html"   --es env0 "LLVM_PROFILE_FILE=/data/local/tmp/pgo_profile/default_%p_%m.profraw"   --es env1 "MOZ_JAR_LOG_FILE=/data/local/tmp/pgo_profile/en-US.log"   --es env2 "MOZ_IN_AUTOMATION=1"   --es env3 "XPCOM_DEBUG_BREAK=warn"
 
-# 8. Let training workload run
-echo "Running PGO training workload for 120 seconds..."
-for t in $(seq 1 12); do
-  echo "Training in progress ($((t * 10))s / 120s)..."
-  sleep 10
-  # Simulate user interaction: scrolling
-  adb -s "$target_dev" shell input swipe 500 1200 500 400 300 || true
-done
+# 8. Run automated training session
+echo "Running Marionette automation session..."
+if ! python3 "$runner_py"; then
+  echo "Fallback: running manual timed workload..."
+  for t in $(seq 1 12); do
+    echo "Training in progress ($((t * 10))s / 120s)..."
+    sleep 10
+    adb -s "$target_dev" shell input swipe 500 1200 500 400 300 || true
+  done
+
+  # Send clean Back keyevents to let Activities and Gecko shut down naturally
+  for k in 1 2 3; do
+    adb -s "$target_dev" shell input keyevent 4 || true
+    sleep 1
+  done
+fi
 
 # Take screenshot to verify training execution
 adb -s "$target_dev" shell screencap -p /data/local/tmp/training_screen.png || true
 adb -s "$target_dev" pull /data/local/tmp/training_screen.png "$output_dir/training_screen.png" || true
 
-# 9. Stop browser gracefully to flush profile counters
-echo "Stopping browser to flush profile buffers..."
-for k in 1 2 3; do
-  adb -s "$target_dev" shell input keyevent 4 || true
-  sleep 1
-done
-
-pids=$(adb -s "$target_dev" shell pidof "$pkg_name" || true)
-echo "Running browser PIDs: $pids"
-for pid in $pids; do
-  echo "Sending SIGTERM to PID $pid..."
-  adb -s "$target_dev" shell "kill -15 $pid" 2>/dev/null || adb -s "$target_dev" shell "su 0 kill -15 $pid" || true
-done
+# Wait for Gecko to complete profile buffer flushing
 sleep 10
 
-# Scan app internal data directories in case profiles were written there
+pids=$(adb -s "$target_dev" shell pidof "$pkg_name" || true)
+if [[ -n "$pids" ]]; then
+  echo "Closing remaining browser processes: $pids..."
+  for pid in $pids; do
+    adb -s "$target_dev" shell "kill -15 $pid" 2>/dev/null || true
+  done
+  sleep 5
+  adb -s "$target_dev" shell am force-stop "$pkg_name" || true
+fi
+
+# 9. Scan for profile files across the system
+echo "Searching and collecting .profraw files..."
 adb -s "$target_dev" shell "cp -r /data/data/$pkg_name/*.profraw /data/local/tmp/pgo_profile/ 2>/dev/null || true"
 adb -s "$target_dev" shell "cp -r /data/user/0/$pkg_name/*.profraw /data/local/tmp/pgo_profile/ 2>/dev/null || true"
 adb -s "$target_dev" shell "cp -r /sdcard/pgo_profile/*.profraw /data/local/tmp/pgo_profile/ 2>/dev/null || true"
 
-adb -s "$target_dev" shell am force-stop "$pkg_name" || true
-sleep 2
-
-# 10. Pull raw profiles
-echo "Pulling profile data..."
 adb -s "$target_dev" pull /data/local/tmp/pgo_profile/ /tmp/pgo_raw/ || true
 
 # Find all profraw files pulled
 mkdir -p "$output_dir"
 raw_files=( $(find /tmp/pgo_raw/ -type f -name "*.profraw") )
 profraw_count="${#raw_files[@]}"
-echo "Found $profraw_count raw profile files."
+echo "Found $profraw_count raw profile files in /tmp/pgo_raw/."
 
 # Detect llvm-profdata binary
 LLVM_PROFDATA="llvm-profdata"
@@ -187,7 +213,7 @@ if [[ "$profraw_count" -gt 0 ]]; then
   echo "SUCCESS: Merged profile generated at $output_dir/android-aarch64-pgo.profdata"
 else
   echo "Searching entire Android filesystem for *.profraw..."
-  all_profraws=$(adb -s "$target_dev" shell "find / -name '*.profraw' 2>/dev/null" || true)
+  all_profraws=$(adb -s "$target_dev" shell "find /data -name '*.profraw' 2>/dev/null" || true)
   echo "Found files on device: $all_profraws"
   for f in $all_profraws; do
     echo "Pulling $f..."
