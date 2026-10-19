@@ -148,28 +148,31 @@ echo "Launching browser with training workload..."
 adb -s "$target_dev" shell am start -n "$pkg_name/org.mozilla.fenix.HomeActivity"   -a android.intent.action.VIEW   -d "file:///data/local/tmp/workload/index.html"   --es env0 "LLVM_PROFILE_FILE=/data/local/tmp/pgo_profile/default_%p_%m.profraw"   --es env1 "MOZ_JAR_LOG_FILE=/data/local/tmp/pgo_profile/en-US.log"   --es env2 "MOZ_IN_AUTOMATION=1"   --es env3 "XPCOM_DEBUG_BREAK=warn"
 
 # 8. Run automated training session
-echo "Running Marionette automation session..."
-if ! python3 "$runner_py"; then
-  echo "Fallback: running manual timed workload..."
-  for t in $(seq 1 12); do
-    echo "Training in progress ($((t * 10))s / 120s)..."
-    sleep 10
-    adb -s "$target_dev" shell input swipe 500 1200 500 400 300 || true
-  done
+echo "Attempting Marionette navigation..."
+python3 -u "$runner_py" || true
 
-  # Send clean Back keyevents to let Activities and Gecko shut down naturally
-  for k in 1 2 3; do
-    adb -s "$target_dev" shell input keyevent 4 || true
-    sleep 1
-  done
-fi
+echo "Running interactive workload loop for 120 seconds..."
+for t in $(seq 1 12); do
+  echo "Training in progress ($((t * 10))s / 120s)..."
+  sleep 10
+  adb -s "$target_dev" shell input swipe 500 1200 500 400 300 || true
+  adb -s "$target_dev" shell input tap 540 960 || true
+done
 
 # Take screenshot to verify training execution
 adb -s "$target_dev" shell screencap -p /data/local/tmp/training_screen.png || true
 adb -s "$target_dev" pull /data/local/tmp/training_screen.png "$output_dir/training_screen.png" || true
 
+# Send clean Back keyevents to let Activities, tabs, and child content processes shut down naturally
+echo "Sending Back keyevents to close tabs and flush child profile buffers..."
+for k in 1 2 3 4 5; do
+  adb -s "$target_dev" shell input keyevent 4 || true
+  sleep 2
+done
+
 # Wait for Gecko to complete profile buffer flushing
-sleep 10
+echo "Waiting for Gecko profile buffer flush..."
+sleep 15
 
 pids=$(adb -s "$target_dev" shell pidof "$pkg_name" || true)
 if [[ -n "$pids" ]]; then
