@@ -57,11 +57,18 @@ if ! docker ps | grep -q redroid; then
   sleep 10
 fi
 
-# 3. Connect ADB and wait for boot
+# 3. Connect ADB, switch to root, and wait for boot
 echo "Connecting to ADB..."
 adb connect 127.0.0.1:5555 || true
 target_dev=$(adb devices | grep -E "5555|device$" | head -n 1 | awk '{print $1}')
 echo "Target device: $target_dev"
+
+echo "Enabling ADB root and disabling SELinux..."
+adb -s "$target_dev" root || true
+sleep 3
+adb connect 127.0.0.1:5555 || true
+target_dev=$(adb devices | grep -E "5555|device$" | head -n 1 | awk '{print $1}')
+adb -s "$target_dev" shell setenforce 0 || true
 
 echo "Waiting for Android to boot..."
 for i in $(seq 1 60); do
@@ -80,14 +87,20 @@ adb -s "$target_dev" install -r "$apk_path"
 pkg_name=$(adb -s "$target_dev" shell pm list packages | grep -E "mullvad|firefox|fenix" | head -n 1 | cut -d: -f2 | tr -d '\r')
 echo "Installed package: $pkg_name"
 
+# Grant all permissions to the app
+adb -s "$target_dev" shell pm grant "$pkg_name" android.permission.WRITE_EXTERNAL_STORAGE 2>/dev/null || true
+adb -s "$target_dev" shell pm grant "$pkg_name" android.permission.READ_EXTERNAL_STORAGE 2>/dev/null || true
+
 # 5. Push training workload
 echo "Pushing training workload: $workload_file..."
-adb -s "$target_dev" shell "mkdir -p /data/local/tmp/workload"
+adb -s "$target_dev" shell "mkdir -p /data/local/tmp/workload && chmod 777 /data/local/tmp/workload"
 adb -s "$target_dev" push "$workload_file" /data/local/tmp/workload/index.html
+adb -s "$target_dev" shell "chmod 666 /data/local/tmp/workload/index.html"
 
 # 6. Configure environment and wrapper for LLVM profile writing
 echo "Configuring LLVM profiling environment..."
-adb -s "$target_dev" shell "rm -rf /data/local/tmp/pgo_profile && mkdir -p /data/local/tmp/pgo_profile && chmod -R 777 /data/local/tmp/pgo_profile"
+adb -s "$target_dev" shell "rm -rf /data/local/tmp/pgo_profile && mkdir -p /data/local/tmp/pgo_profile && chmod 777 /data/local/tmp /data/local/tmp/pgo_profile"
+adb -s "$target_dev" shell "mkdir -p /sdcard/pgo_profile && chmod 777 /sdcard/pgo_profile"
 
 cat << 'EOF' > /tmp/android_pgo_wrap.sh
 #!/system/bin/sh
@@ -104,9 +117,9 @@ adb -s "$target_dev" shell chmod 755 /data/local/tmp/wrap.sh
 adb -s "$target_dev" shell setprop wrap."$pkg_name" /data/local/tmp/wrap.sh
 echo "Wrapper configured for $pkg_name."
 
-# 7. Start browser with training workload
+# 7. Start browser with training workload and explicit GeckoView env extras
 echo "Launching browser with training workload..."
-adb -s "$target_dev" shell am start -n "$pkg_name/org.mozilla.fenix.HomeActivity" -a android.intent.action.VIEW -d "file:///data/local/tmp/workload/index.html"
+adb -s "$target_dev" shell am start -n "$pkg_name/org.mozilla.fenix.HomeActivity"   -a android.intent.action.VIEW   -d "file:///data/local/tmp/workload/index.html"   --es env0 "LLVM_PROFILE_FILE=/data/local/tmp/pgo_profile/default_%p_%m.profraw"   --es env1 "MOZ_JAR_LOG_FILE=/data/local/tmp/pgo_profile/en-US.log"   --es env2 "MOZ_IN_AUTOMATION=1"   --es env3 "XPCOM_DEBUG_BREAK=warn"
 
 # 8. Let training workload run
 echo "Running PGO training workload for 120 seconds..."
@@ -123,20 +136,23 @@ adb -s "$target_dev" pull /data/local/tmp/training_screen.png "$output_dir/train
 
 # 9. Stop browser gracefully to flush profile counters
 echo "Stopping browser to flush profile buffers..."
-# Send Back keyevents to let Activities finish cleanly
 for k in 1 2 3; do
   adb -s "$target_dev" shell input keyevent 4 || true
   sleep 1
 done
+
 pids=$(adb -s "$target_dev" shell pidof "$pkg_name" || true)
+echo "Running browser PIDs: $pids"
 for pid in $pids; do
-  adb -s "$target_dev" shell kill -15 "$pid" || true
+  echo "Sending SIGTERM to PID $pid..."
+  adb -s "$target_dev" shell "kill -15 $pid" 2>/dev/null || adb -s "$target_dev" shell "su 0 kill -15 $pid" || true
 done
-sleep 8
+sleep 10
 
 # Scan app internal data directories in case profiles were written there
-adb -s "$target_dev" shell "su 0 cp -r /data/data/$pkg_name/*.profraw /data/local/tmp/pgo_profile/ 2>/dev/null || true"
-adb -s "$target_dev" shell "su 0 cp -r /data/user/0/$pkg_name/*.profraw /data/local/tmp/pgo_profile/ 2>/dev/null || true"
+adb -s "$target_dev" shell "cp -r /data/data/$pkg_name/*.profraw /data/local/tmp/pgo_profile/ 2>/dev/null || true"
+adb -s "$target_dev" shell "cp -r /data/user/0/$pkg_name/*.profraw /data/local/tmp/pgo_profile/ 2>/dev/null || true"
+adb -s "$target_dev" shell "cp -r /sdcard/pgo_profile/*.profraw /data/local/tmp/pgo_profile/ 2>/dev/null || true"
 
 adb -s "$target_dev" shell am force-stop "$pkg_name" || true
 sleep 2
@@ -170,9 +186,23 @@ if [[ "$profraw_count" -gt 0 ]]; then
   "$LLVM_PROFDATA" show --counts "$output_dir/android-aarch64-pgo.profdata" | head -n 25
   echo "SUCCESS: Merged profile generated at $output_dir/android-aarch64-pgo.profdata"
 else
-  echo "WARNING: No .profraw files found in /tmp/pgo_raw/; checking entire Android /data filesystem..."
-  adb -s "$target_dev" shell "find /data -name '*.profraw' 2>/dev/null" || true
-  exit 1
+  echo "Searching entire Android filesystem for *.profraw..."
+  all_profraws=$(adb -s "$target_dev" shell "find / -name '*.profraw' 2>/dev/null" || true)
+  echo "Found files on device: $all_profraws"
+  for f in $all_profraws; do
+    echo "Pulling $f..."
+    adb -s "$target_dev" pull "$f" /tmp/pgo_raw/ || true
+  done
+  raw_files=( $(find /tmp/pgo_raw/ -type f -name "*.profraw") )
+  if [[ "${#raw_files[@]}" -gt 0 ]]; then
+    echo "Merging discovered raw profiles..."
+    "$LLVM_PROFDATA" merge -output="$output_dir/android-aarch64-pgo.profdata" "${raw_files[@]}"
+    "$LLVM_PROFDATA" show --counts "$output_dir/android-aarch64-pgo.profdata" | head -n 25
+    echo "SUCCESS: Merged profile generated at $output_dir/android-aarch64-pgo.profdata"
+  else
+    echo "Error: No .profraw profiles were generated during the run." >&2
+    exit 1
+  fi
 fi
 
-echo "PGO Training completed."
+echo "PGO Training completed successfully."
