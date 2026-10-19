@@ -34,8 +34,10 @@ jobs:
           if gh release view "$ANDROID_RELEASE" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null | grep -E -q "(app-instrumented\.apk|android-aarch64-instrumented\.apk)"; then
             echo "Downloading cached instrumented APK from release $ANDROID_RELEASE..."
             gh release download "$ANDROID_RELEASE" --repo "$GITHUB_REPOSITORY" -p "*instrumented.apk" -D "$RUNNER_TEMP/instrumented-apk"
-            inst_f=$(find "$RUNNER_TEMP/instrumented-apk" -name "*instrumented.apk" | head -n 1)
-            cp -v "$inst_f" "$RUNNER_TEMP/instrumented-apk/app-instrumented.apk"
+            if [[ ! -f "$RUNNER_TEMP/instrumented-apk/app-instrumented.apk" ]]; then
+              inst_f=$(find "$RUNNER_TEMP/instrumented-apk" -name "*instrumented.apk" | head -n 1)
+              cp -v "$inst_f" "$RUNNER_TEMP/instrumented-apk/app-instrumented.apk"
+            fi
             echo "cached=true" >> "$GITHUB_OUTPUT"
           else
             echo "cached=false" >> "$GITHUB_OUTPUT"
