@@ -633,6 +633,15 @@ jobs:
               PGO_ARGS+=(--target pgo-use)
               echo "Activated PGO-use profile with SHA256: $prof_sha"
             fi
+            if gh release view "$ANDROID_RELEASE" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null | grep -q "en-US.log"; then
+              gh release download "$ANDROID_RELEASE" --repo "$GITHUB_REPOSITORY" -p "en-US.log" -D "$UPSTREAM/out/geckoview" || true
+              if [[ -f "$UPSTREAM/out/geckoview/en-US.log" ]]; then
+                jarlog_sha=$(sha256sum "$UPSTREAM/out/geckoview/en-US.log" | awk '{print $1}')
+                cp "$UPSTREAM/out/geckoview/en-US.log" "$UPSTREAM/out/geckoview/pgo-$jarlog_sha.jarlog"
+                export PGO_JARLOG_SHA256="$jarlog_sha"
+                echo "Activated PGO jarlog with SHA256: $jarlog_sha"
+              fi
+            fi
           fi
 
           ./rbm/rbm build browser --target alpha --target "mullvadbrowser-android-$TARGET_ARCH" "${PGO_ARGS[@]}"
