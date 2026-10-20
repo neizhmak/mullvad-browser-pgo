@@ -1,0 +1,130 @@
+name: Android Mullvad Browser PrivacyTests.org Evaluation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-privacytests-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  privacytests-android:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize environment
+        run: |
+          tag="$(jq -r .tag upstream.lock.json)"
+          echo "ANDROID_RELEASE=android-dependencies-$tag" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/apk" "$RUNNER_TEMP/privacytests"
+
+      - name: Setup binder_linux and host requirements
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y git dkms linux-headers-$(uname -r) build-essential adb curl
+          
+          if [[ ! -c /dev/binder ]]; then
+            cd /tmp
+            if [[ ! -d anbox-modules ]]; then
+              git clone https://github.com/choff/anbox-modules.git
+            fi
+            cd anbox-modules/binder
+            make -j$(nproc)
+            sudo insmod binder_linux.ko devices="binder,hwbinder,vndbinder" || true
+            sudo mkdir -p /dev/binderfs || true
+            sudo mount -t binder binder /dev/binderfs || true
+            
+            for dev in binder hwbinder vndbinder; do
+              if [[ -e /dev/binderfs/$dev && ! -e /dev/$dev ]]; then
+                sudo ln -s /dev/binderfs/$dev /dev/$dev
+              fi
+              if [[ -e /dev/$dev ]]; then
+                sudo chmod 666 /dev/$dev
+              fi
+              if [[ -e /dev/binderfs/$dev ]]; then
+                sudo chmod 666 /dev/binderfs/$dev
+              fi
+            done
+          fi
+          ls -la /dev/binder*
+
+      - name: Launch ReDroid Android 12 ARM64 container
+        run: |
+          set -euo pipefail
+          docker run -d --rm --privileged             --name redroid             -p 5555:5555             -v /tmp/redroid-data:/data             redroid/redroid:12.0.0-latest             androidboot.redroid_width=1080             androidboot.redroid_height=1920             androidboot.redroid_dpi=480             androidboot.redroid_gpu_mode=guest
+          sleep 10
+
+      - name: Connect ADB and wait for Android boot
+        run: |
+          set -euo pipefail
+          adb connect 127.0.0.1:5555 || true
+          target_dev=$(adb devices | grep -E "5555|device$" | head -n 1 | awk '{print $1}')
+          echo "TARGET_DEV=$target_dev" >> "$GITHUB_ENV"
+          
+          adb -s "$target_dev" root || true
+          sleep 3
+          adb connect 127.0.0.1:5555 || true
+          adb -s "$target_dev" shell setenforce 0 || true
+          
+          echo "Waiting for Android boot completion..."
+          for i in $(seq 1 60); do
+            boot_status=$(adb -s "$target_dev" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+            if [[ "$boot_status" == "1" ]]; then
+              echo "Android booted in check $i."
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Download PGO-optimized Mullvad Browser APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "Downloading Mullvad Browser PGO APK from release $ANDROID_RELEASE..."
+          gh release download "$ANDROID_RELEASE" --repo "$GITHUB_REPOSITORY" -p "mullvad-browser-qa-android-aarch64-*.apk" -D "$RUNNER_TEMP/apk"
+          apk_file=$(find "$RUNNER_TEMP/apk" -name "*.apk" | head -n 1)
+          echo "APK_PATH=$apk_file" >> "$GITHUB_ENV"
+          ls -lh "$apk_file"
+          sha256sum "$apk_file"
+
+      - name: Install Mullvad Browser on ReDroid
+        run: |
+          set -euo pipefail
+          echo "Installing $APK_PATH..."
+          adb -s "$TARGET_DEV" install -r "$APK_PATH"
+          pkg_name=$(adb -s "$TARGET_DEV" shell pm list packages | grep -E "mullvad|firefox|fenix" | head -n 1 | cut -d: -f2 | tr -d '\r')
+          echo "PKG_NAME=$pkg_name" >> "$GITHUB_ENV"
+          echo "Installed package: $pkg_name"
+          
+          adb -s "$TARGET_DEV" shell pm grant "$pkg_name" android.permission.WRITE_EXTERNAL_STORAGE 2>/dev/null || true
+          adb -s "$TARGET_DEV" shell pm grant "$pkg_name" android.permission.READ_EXTERNAL_STORAGE 2>/dev/null || true
+
+      - name: Run PrivacyTests.org Evaluation Suite
+        run: |
+          set -euo pipefail
+          export ADB_DEVICE="$TARGET_DEV"
+          export PKG_NAME="$PKG_NAME"
+          export OUTPUT_DIR="$RUNNER_TEMP/privacytests"
+          node ./scripts/run-privacytests-android.mjs
+
+      - name: Publish Test Report to Summary
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/privacytests/privacytests-report.md" ]]; then
+            cat "$RUNNER_TEMP/privacytests/privacytests-report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload PrivacyTests Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: privacytests-results
+          path: ${{ runner.temp }}/privacytests/
+          retention-days: 14
