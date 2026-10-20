@@ -27,7 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y git dkms linux-headers-$(uname -r) build-essential adb curl
+          sudo apt-get install -y git dkms "linux-headers-$(uname -r)" build-essential adb curl
           
           if [[ ! -c /dev/binder ]]; then
             cd /tmp
@@ -35,7 +35,7 @@ jobs:
               git clone https://github.com/choff/anbox-modules.git
             fi
             cd anbox-modules/binder
-            make -j$(nproc)
+            make -j"$(nproc)"
             sudo insmod binder_linux.ko devices="binder,hwbinder,vndbinder" || true
             sudo mkdir -p /dev/binderfs || true
             sudo mount -t binder binder /dev/binderfs || true
