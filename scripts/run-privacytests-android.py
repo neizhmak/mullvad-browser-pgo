@@ -148,57 +148,47 @@ class PrivacyTester:
             write_url = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=write&thirdparty=same&sessionId={self.session_id}"
             self.navigate(write_url)
             await asyncio.sleep(2)
-            write_signal = await self.next_value(timeout=90)
-            log(f"Write signal: {str(write_signal)[:100]}")
+            try:
+                write_signal = await self.next_value(timeout=90)
+                log(f"Write signal: {str(write_signal)[:100]}")
+            except Exception as e:
+                log(f"Write signal warning: {e}")
             self.take_screenshot("02_supercookies_write")
 
-            # 2. Supercookies: read phase (same 1st-party)
-            log("=== Phase 2: Supercookies Read ===")
+            # 2. Supercookies & Navigation: read phase
+            log("=== Phase 2: Supercookies & Navigation Read ===")
             read_url = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=read&thirdparty=same&sessionId={self.session_id}"
             self.navigate(read_url)
             await asyncio.sleep(2)
-            sc_res = await self.next_value(timeout=90)
-            log("Supercookies results received!")
+            try:
+                sc_res = await self.next_value(timeout=90)
+                log("Supercookies & Navigation results received!")
+                if isinstance(sc_res, dict):
+                    if "supercookies" in sc_res:
+                        results["categories"]["supercookies"].update(sc_res["supercookies"])
+                    if "navigation" in sc_res:
+                        results["categories"]["navigation"].update(sc_res["navigation"])
+                    if "fingerprinting" in sc_res:
+                        results["categories"]["fingerprinting"].update(sc_res["fingerprinting"])
+            except Exception as e:
+                log(f"Read results warning: {e}")
             self.take_screenshot("03_supercookies_read")
 
-            if "supercookies" in sc_res:
-                results["categories"]["supercookies"].update(sc_res["supercookies"])
-            if "fingerprinting" in sc_res:
-                results["categories"]["fingerprinting"].update(sc_res["fingerprinting"])
-
-            # 3. Navigation State Partitioning
-            log("=== Phase 3: Navigation State Partitioning ===")
-            nav_write_url = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=write&thirdparty=same&sessionId={self.session_id}"
-            self.navigate(nav_write_url)
-            await asyncio.sleep(2)
-            nav_write_signal = await self.next_value(timeout=60)
-            log(f"Nav write signal: {str(nav_write_signal)[:100]}")
-
-            nav_read_url = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=read&thirdparty=same&sessionId={self.session_id}"
-            self.navigate(nav_read_url)
-            await asyncio.sleep(2)
-            nav_read_res = await self.next_value(timeout=60)
-            log("Navigation read results received!")
-            self.take_screenshot("04_navigation_read")
-
-            if "navigation" in nav_read_res:
-                results["categories"]["navigation"].update(nav_read_res["navigation"])
-
-            # 4. Tracker Blocking (tracking_content.html)
-            log("=== Phase 4: Tracker Blocking ===")
+            # 3. Tracker Blocking (tracking_content.html)
+            log("=== Phase 3: Tracker Blocking ===")
             trackers_url = f"{FIRST_PARTY_ROOT_SAME}/tracking_content.html?sessionId={self.session_id}"
             self.navigate(trackers_url)
             try:
-                trackers_res = await self.next_value(timeout=45)
+                trackers_res = await self.next_value(timeout=40)
                 log("Trackers test results received!")
                 if isinstance(trackers_res, dict):
                     results["categories"]["trackers"].update(trackers_res)
             except Exception as e:
                 log(f"Trackers test warning: {e}")
-            self.take_screenshot("05_trackers")
+            self.take_screenshot("04_trackers")
 
-            # 5. Tracking Query Parameters (query.html)
-            log("=== Phase 5: Tracking Query Parameter Stripping ===")
+            # 4. Tracking Query Parameter Stripping (query.html)
+            log("=== Phase 4: Tracking Query Parameter Stripping ===")
             secret = str(random.randint(1000000000000000, 9999999999999999))
             query_test_params = "&".join([f"{p}={secret}" for p in TRACKING_QUERY_PARAMETERS.keys()])
             query_url = f"{FIRST_PARTY_ROOT_DIFF}/query.html?controlParam=controlValue&{query_test_params}&sessionId={self.session_id}"
@@ -206,22 +196,21 @@ class PrivacyTester:
             try:
                 query_res = await self.next_value(timeout=30)
                 log(f"Query test response: {query_res}")
-                # Score each parameter: if not present in query_res (stripped), passed = True!
-                for param, desc in TRACKING_QUERY_PARAMETERS.items():
-                    val = query_res.get(param)
-                    # If param is None, stripped, or empty, the parameter was successfully stripped!
-                    passed = (val is None) or (val == "")
-                    results["categories"]["query"][param] = {
-                        "value": val,
-                        "passed": passed,
-                        "description": desc,
-                    }
+                if isinstance(query_res, dict):
+                    for param, desc in TRACKING_QUERY_PARAMETERS.items():
+                        val = query_res.get(param)
+                        passed = (val is None) or (val == "")
+                        results["categories"]["query"][param] = {
+                            "value": val,
+                            "passed": passed,
+                            "description": desc,
+                        }
             except Exception as e:
                 log(f"Query test warning: {e}")
-            self.take_screenshot("06_query")
+            self.take_screenshot("05_query")
 
-            # 6. HTTPS Subresource Upgrades (https.html)
-            log("=== Phase 6: HTTPS Subresource Upgrades ===")
+            # 5. HTTPS Subresource Upgrades (https.html)
+            log("=== Phase 5: HTTPS Subresource Upgrades ===")
             https_url = f"{FIRST_PARTY_ROOT_SAME}/https.html?sessionId={self.session_id}"
             self.navigate(https_url)
             try:
@@ -231,10 +220,10 @@ class PrivacyTester:
                     results["categories"]["https"].update(https_res)
             except Exception as e:
                 log(f"HTTPS test warning: {e}")
-            self.take_screenshot("07_https_subresources")
+            self.take_screenshot("06_https_subresources")
 
-            # 7. HTTPS Upgradable Hyperlink / Address
-            log("=== Phase 7: HTTPS Upgradable Address / Link ===")
+            # 6. HTTPS Upgradable Address / Link
+            log("=== Phase 6: HTTPS Upgradable Address / Link ===")
             up_url = f"{UPGRADABLE_ROOT}/upgradable.html?source=address&sessionId={self.session_id}"
             self.navigate(up_url)
             try:
@@ -244,10 +233,10 @@ class PrivacyTester:
                     results["categories"]["https"].update(up_res)
             except Exception as e:
                 log(f"Upgradable test warning: {e}")
-            self.take_screenshot("08_https_upgradable")
+            self.take_screenshot("07_https_upgradable")
 
-            # 8. Insecure Website Warning (insecure.html)
-            log("=== Phase 8: Insecure Website Warning ===")
+            # 7. Insecure Website Warning (insecure.html)
+            log("=== Phase 7: Insecure Website Warning ===")
             insec_url = f"{INSECURE_ROOT}/insecure.html?sessionId={self.session_id}"
             self.navigate(insec_url)
             try:
@@ -265,10 +254,10 @@ class PrivacyTester:
                     "result": "Insecure website blocked / never loaded",
                     "description": "Checks to see if the browser stops loading an insecure website and warns the user before giving them the option to continue. Known as HTTPS-Only Mode in some browsers."
                 }
-            self.take_screenshot("09_insecure_check")
+            self.take_screenshot("08_insecure_check")
 
-            # 9. Supplementary Fingerprinting
-            log("=== Phase 9: Supplementary Fingerprinting ===")
+            # 8. Supplementary Fingerprinting
+            log("=== Phase 8: Supplementary Fingerprinting ===")
             supp_url = f"{FIRST_PARTY_ROOT_SAME}/supplementary.html?sessionId={self.session_id}"
             self.navigate(supp_url)
             try:
@@ -278,8 +267,8 @@ class PrivacyTester:
             except Exception as e:
                 log(f"Supplementary test warning: {e}")
 
-            # 10. Top-Level Misc & GPC
-            log("=== Phase 10: Top-Level Misc & GPC ===")
+            # 9. Top-Level Misc & GPC
+            log("=== Phase 9: Top-Level Misc & GPC ===")
             tl_url = f"{LIVE_ROOT}/toplevel.html?sessionId={self.session_id}"
             self.navigate(tl_url)
             try:
