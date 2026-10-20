@@ -82,7 +82,7 @@ class PrivacyTestsOrchestrator:
                 addon_id = addons.install(path=cand)
                 log(f"uBlock Origin extension installed with ID: {addon_id}")
                 return True
-            except Exception as e:
+            except Exception:
                 pass
         log("Note: Running with extensions pre-installed in APK profile.")
         return False
@@ -124,6 +124,10 @@ class PrivacyTestsOrchestrator:
         except Exception as e:
             log(f"Navigation warning: {e}")
 
+    async def navigate_and_wait(self, url, wait_seconds=5):
+        self.navigate(url)
+        await asyncio.sleep(wait_seconds)
+
     def take_screenshot(self, name):
         try:
             screen_data = self.client.screenshot(format="binary")
@@ -133,38 +137,19 @@ class PrivacyTestsOrchestrator:
         except Exception as e:
             log(f"Screenshot error: {e}")
 
-    def get_server_step(self):
-        try:
-            cmd = ["curl", "-s", "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                   f"{RESULTS_HOST}/step?sessionId={self.session_id}"]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
-            data = json.loads(res.stdout)
-            return data.get("step", 0)
-        except Exception:
-            return -1
-
-    async def wait_for_server_step(self, expected_step, timeout_sec=40):
-        start = time.time()
-        while time.time() - start < timeout_sec:
-            step = self.get_server_step()
-            if step >= expected_step:
-                log(f"Server reached step {step} (>= {expected_step})")
-                return True
-            await asyncio.sleep(2.0)
-        log(f"Wait for step {expected_step} timed out (current: {self.get_server_step()})")
-        return False
-
     def fetch_final_results_api(self):
-        for attempt in range(5):
+        for attempt in range(8):
             try:
                 cmd = ["curl", "-s", "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                        f"{RESULTS_HOST}/results?sessionId={self.session_id}"]
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
                 if res.stdout and res.stdout.strip().startswith("{"):
-                    return json.loads(res.stdout)
+                    data = json.loads(res.stdout)
+                    if any(k in data for k in ["supercookies", "trackers", "query"]):
+                        return data
             except Exception as e:
                 log(f"REST fetch attempt {attempt+1} error: {e}")
-            time.sleep(2)
+            time.sleep(2.5)
         return None
 
     async def run_suite(self):
@@ -177,89 +162,75 @@ class PrivacyTestsOrchestrator:
         # Step 0: supercookies write
         log("=== Step 0: Supercookies write ===")
         url0 = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=write&thirdparty=same&sessionId={self.session_id}"
-        self.navigate(url0)
-        await self.wait_for_server_step(1, timeout_sec=40)
+        await self.navigate_and_wait(url0, wait_seconds=10)
         self.take_screenshot("02_supercookies_write")
 
-        # Step 1: supercookies read (same)
+        # Step 1: supercookies read (same origin)
         log("=== Step 1: Supercookies read (same origin) ===")
         url1 = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=read&thirdparty=same&sessionId={self.session_id}"
-        self.navigate(url1)
-        await self.wait_for_server_step(2, timeout_sec=40)
+        await self.navigate_and_wait(url1, wait_seconds=10)
 
-        # Step 2: supercookies read (different)
+        # Step 2: supercookies read (different origin)
         log("=== Step 2: Supercookies read (different origin) ===")
         url2 = f"{FIRST_PARTY_ROOT_DIFF}/supercookies.html?mode=read&thirdparty=different&sessionId={self.session_id}"
-        self.navigate(url2)
-        await self.wait_for_server_step(3, timeout_sec=40)
+        await self.navigate_and_wait(url2, wait_seconds=10)
         self.take_screenshot("03_supercookies_diff")
 
         # Step 3: navigation write
         log("=== Step 3: Navigation write ===")
         url3 = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=write&thirdparty=same&sessionId={self.session_id}"
-        self.navigate(url3)
-        await self.wait_for_server_step(4, timeout_sec=30)
+        await self.navigate_and_wait(url3, wait_seconds=6)
 
         # Step 4: navigation read same
         log("=== Step 4: Navigation read (same origin) ===")
         url4 = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=read&thirdparty=same&sessionId={self.session_id}"
-        self.navigate(url4)
-        await self.wait_for_server_step(5, timeout_sec=30)
+        await self.navigate_and_wait(url4, wait_seconds=6)
 
         # Step 5: navigation read different
         log("=== Step 5: Navigation read (different origin) ===")
         url5 = f"{FIRST_PARTY_ROOT_DIFF}/navigation.html?mode=read&thirdparty=different&sessionId={self.session_id}"
-        self.navigate(url5)
-        await self.wait_for_server_step(6, timeout_sec=30)
+        await self.navigate_and_wait(url5, wait_seconds=6)
         self.take_screenshot("04_navigation_diff")
 
-        # Step 6: tracker blocking (tracking_content.html)
+        # Step 6: tracker blocking (tracking_content.html - all 19 trackers)
         log("=== Step 6: Tracker blocking (uBlock Origin / ETP) ===")
         url6 = f"{FIRST_PARTY_ROOT_SAME}/tracking_content.html?sessionId={self.session_id}"
-        self.navigate(url6)
-        # Give trackers time to be blocked or fire errors
-        await self.wait_for_server_step(7, timeout_sec=60)
+        await self.navigate_and_wait(url6, wait_seconds=35)
         self.take_screenshot("05_trackers")
 
-        # Step 7: misc
-        log("=== Step 7: Misc & GPC ===")
+        # Step 7: misc (Tor, ECH, GPC)
+        log("=== Step 7: Misc (ECH & GPC) ===")
         url7 = f"{FIRST_PARTY_ROOT_SAME}/misc.html?sessionId={self.session_id}"
-        self.navigate(url7)
-        await self.wait_for_server_step(8, timeout_sec=30)
+        await self.navigate_and_wait(url7, wait_seconds=8)
 
-        # Step 8: query parameters stripping
+        # Step 8: query parameters stripping (all 23 tracking parameters)
         log("=== Step 8: Tracking query parameter stripping ===")
         secret = str(random.randint(1000000000000000, 9999999999999999))
         query_params = "&".join([f"{p}={secret}" for p in TRACKING_QUERY_PARAMETERS.keys()])
         url8 = f"{FIRST_PARTY_ROOT_DIFF}/query.html?controlParam=controlValue&{query_params}&sessionId={self.session_id}"
-        self.navigate(url8)
-        await self.wait_for_server_step(9, timeout_sec=30)
+        await self.navigate_and_wait(url8, wait_seconds=8)
         self.take_screenshot("06_query")
 
         # Step 9: https subresource upgrades
         log("=== Step 9: HTTPS subresource upgrades ===")
         url9 = f"{FIRST_PARTY_ROOT_SAME}/https.html?sessionId={self.session_id}"
-        self.navigate(url9)
-        await self.wait_for_server_step(10, timeout_sec=30)
+        await self.navigate_and_wait(url9, wait_seconds=8)
         self.take_screenshot("07_https_subresources")
 
         # Step 10: upgradable hyperlink
         log("=== Step 10: HTTPS upgradable hyperlink ===")
         url10 = f"http://upgradable.privacytests2.org/upgradable.html?source=hyperlink&sessionId={self.session_id}"
-        self.navigate(url10)
-        await self.wait_for_server_step(11, timeout_sec=30)
+        await self.navigate_and_wait(url10, wait_seconds=8)
 
         # Step 11: done.html
         log("=== Step 11: Done (concluding sequence) ===")
         url11 = f"{FIRST_PARTY_ROOT_SAME}/done.html?sessionId={self.session_id}"
-        self.navigate(url11)
-        await asyncio.sleep(4)
+        await self.navigate_and_wait(url11, wait_seconds=5)
 
         # Fetch the official server-calculated results
         log("Fetching complete processed results from PrivacyTests server...")
         processed_data = self.fetch_final_results_api()
         if not processed_data:
-            # Fallback to waiting for WebSocket payload
             try:
                 msg = await self.next_value(timeout=10)
                 if isinstance(msg, dict) and any(k in msg for k in ["supercookies", "trackers", "query"]):
@@ -283,7 +254,7 @@ class PrivacyTestsOrchestrator:
         url_up_addr = f"http://upgradable.privacytests2.org/upgradable.html?source=address&sessionId={self.session_id}"
         self.navigate(url_up_addr)
         try:
-            up_addr_res = await self.next_value(timeout=20)
+            up_addr_res = await self.next_value(timeout=15)
             if "https" in processed_data:
                 processed_data["https"]["Upgradable address"] = up_addr_res.get("Upgradable address", {
                     "passed": True,
@@ -321,7 +292,7 @@ class PrivacyTestsOrchestrator:
         url_supp = f"{FIRST_PARTY_ROOT_SAME}/supplementary.html?sessionId={self.session_id}"
         self.navigate(url_supp)
         try:
-            supp_res = await self.next_value(timeout=20)
+            supp_res = await self.next_value(timeout=15)
             if "fingerprinting" not in processed_data:
                 processed_data["fingerprinting"] = {}
             processed_data["fingerprinting"].update(supp_res)
