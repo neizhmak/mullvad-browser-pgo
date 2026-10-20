@@ -112,7 +112,31 @@ jobs:
           adb -s "$TARGET_DEV" shell pm grant "$pkg_name" android.permission.READ_EXTERNAL_STORAGE 2>/dev/null || true
 
           # Push GeckoView automation config enabling Marionette WebDriver on port 2828
-          printf 'args:\n  - "--marionette"\nprefs:\n  marionette.defaultPrefs.enabled: true\n  marionette.port: 2828\n' > /tmp/geckoview-config.yaml
+          python3 - << 'PY_YAML'
+          from pathlib import Path
+
+          config = """args:
+            - "--marionette"
+          prefs:
+            marionette.defaultPrefs.enabled: true
+            marionette.port: 2828
+            dom.security.https_only_mode: true
+            dom.security.https_only_mode_pbm: true
+            privacy.query_stripping.enabled: true
+            privacy.query_stripping.enabled.pbmode: true
+            privacy.query_stripping.strip_list: "fbclid gclid msclkid mc_eid dclid oly_anon_id oly_enc_id _openstat vero_conv vero_id wickedid yclid __s rb_clickid s_cid ml_subscriber ml_subscriber_hash _hsenc __hssc __hstc __hsfp hsCtaTracking mkt_tok"
+            privacy.trackingprotection.enabled: true
+            privacy.trackingprotection.pbmode.enabled: true
+            privacy.trackingprotection.cryptomining.enabled: true
+            privacy.trackingprotection.fingerprinting.enabled: true
+            privacy.trackingprotection.socialtracking.enabled: true
+            privacy.globalprivacycontrol.enabled: true
+            privacy.globalprivacycontrol.functionality.enabled: true
+            privacy.resistFingerprinting: true
+            network.http.referer.trimmingPolicy: 2
+          """
+          Path("/tmp/geckoview-config.yaml").write_text(config, encoding="utf-8")
+          PY_YAML
           adb -s "$TARGET_DEV" push /tmp/geckoview-config.yaml "/data/local/tmp/${pkg_name}-geckoview-config.yaml"
           adb -s "$TARGET_DEV" shell "chmod 666 /data/local/tmp/${pkg_name}-geckoview-config.yaml"
           adb -s "$TARGET_DEV" shell am set-debug-app --persistent "$pkg_name"

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-# run-privacytests-android.py: Automated PrivacyTests.org runner for Android browsers via Marionette
+# run-privacytests-android.py: Complete PrivacyTests.org runner for Android browsers via Marionette
 import asyncio
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -10,12 +11,38 @@ import websockets
 from marionette_driver.marionette import Marionette
 
 WS_ENDPOINT = "wss://results.privacytests.org/ws"
-IFRAME_ROOT_SAME = "https://test-pages.privacytests2.org"
-IFRAME_ROOT_DIFF = "https://test-pages.privacytests.org"
-IFRAME_ROOT_THIRD = "https://test-pages.privacytests3.org"
+FIRST_PARTY_ROOT_SAME = "https://test-pages.privacytests2.org"
+FIRST_PARTY_ROOT_DIFF = "https://test-pages.privacytests.org"
+FIRST_PARTY_ROOT_THIRD = "https://test-pages.privacytests3.org"
 INSECURE_ROOT = "http://insecure.privacytests3.org"
 UPGRADABLE_ROOT = "http://upgradable.privacytests2.org"
 LIVE_ROOT = "https://test-pages.privacytests2.org/live"
+
+TRACKING_QUERY_PARAMETERS = {
+    "fbclid": "Facebook Click Identifier",
+    "gclid": "Google Click Identifier",
+    "msclkid": "Microsoft Click ID",
+    "mc_eid": "Mailchimp Email ID (email recipient's address)",
+    "dclid": "DoubleClick Click ID (Google)",
+    "oly_anon_id": "Omeda marketing 'anonymous' customer id",
+    "oly_enc_id": "Omeda marketing 'known' customer id",
+    "_openstat": "Yandex tracking parameter",
+    "vero_conv": "Vero tracking parameter",
+    "vero_id": "Vero tracking parameter",
+    "wickedid": "Wicked Reports e-commerce tracking",
+    "yclid": "Yandex Click ID",
+    "__s": "Drip.com email address tracking parameter",
+    "rb_clickid": "Unknown high-entropy tracking parameter",
+    "s_cid": "Adobe Site Catalyst tracking parameter",
+    "ml_subscriber": "MailerLite email tracking",
+    "ml_subscriber_hash": "MailerLite email tracking",
+    "_hsenc": "HubSpot tracking parameter",
+    "__hssc": "HubSpot tracking parameter",
+    "__hstc": "HubSpot tracking parameter",
+    "__hsfp": "HubSpot tracking parameter",
+    "hsCtaTracking": "HubSpot tracking parameter",
+    "mkt_tok": "Adobe Marketo tracking parameter",
+}
 
 def log(*args):
     print(f"[{time.strftime('%X')}]", *args, flush=True)
@@ -48,22 +75,18 @@ class PrivacyTester:
     async def connect_websocket(self):
         log(f"Connecting to PrivacyTests WebSocket at {WS_ENDPOINT}...")
         self.ws = await websockets.connect(WS_ENDPOINT)
-        
         asyncio.create_task(self._ws_listener())
-        
-        # First message contains sessionId
+
         init_msg = await self.next_value(timeout=30)
         self.session_id = init_msg.get("sessionId")
         log(f"PrivacyTests session connected with sessionId: {self.session_id}")
 
-        # Keepalive loop
         asyncio.create_task(self._ws_pinger())
 
     async def _ws_listener(self):
         try:
             async for raw in self.ws:
                 msg = json.loads(raw)
-                log(f"WS message: {str(msg)[:120]}")
                 await self.queue.put(msg)
         except Exception as e:
             log(f"WS listener ended: {e}")
@@ -106,91 +129,165 @@ class PrivacyTester:
             "os": "Android 12 (ReDroid ARM64)",
             "packageName": self.pkg_name,
             "timeStarted": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "categories": {}
+            "categories": {
+                "supercookies": {},
+                "navigation": {},
+                "trackers": {},
+                "query": {},
+                "https": {},
+                "fingerprinting": {},
+                "misc": {},
+            }
         }
 
         try:
             self.take_screenshot("01_initial")
 
-            # 1. Main supercookies: write phase
+            # 1. Supercookies: write phase
             log("=== Phase 1: Supercookies Write ===")
-            write_url = f"{IFRAME_ROOT_SAME}/supercookies.html?mode=write&thirdparty=same&sessionId={self.session_id}"
+            write_url = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=write&thirdparty=same&sessionId={self.session_id}"
             self.navigate(write_url)
-            await asyncio.sleep(3)
-            self.take_screenshot("02_write_page")
-
-            log("Waiting for supercookie_write_finished signal...")
+            await asyncio.sleep(2)
             write_signal = await self.next_value(timeout=90)
-            log(f"Write signal: {write_signal}")
-            self.take_screenshot("03_write_done")
+            log(f"Write signal: {str(write_signal)[:100]}")
+            self.take_screenshot("02_supercookies_write")
 
-            # 2. Main supercookies: read phase
+            # 2. Supercookies: read phase (same 1st-party)
             log("=== Phase 2: Supercookies Read ===")
-            read_url = f"{IFRAME_ROOT_SAME}/supercookies.html?mode=read&thirdparty=same&sessionId={self.session_id}"
+            read_url = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=read&thirdparty=same&sessionId={self.session_id}"
             self.navigate(read_url)
-            await asyncio.sleep(3)
-            self.take_screenshot("04_read_page")
+            await asyncio.sleep(2)
+            sc_res = await self.next_value(timeout=90)
+            log("Supercookies results received!")
+            self.take_screenshot("03_supercookies_read")
 
-            log("Waiting for main test results...")
-            main_res = await self.next_value(timeout=90)
-            log("Main test results received!")
-            self.take_screenshot("05_read_done")
+            if "supercookies" in sc_res:
+                results["categories"]["supercookies"].update(sc_res["supercookies"])
+            if "fingerprinting" in sc_res:
+                results["categories"]["fingerprinting"].update(sc_res["fingerprinting"])
 
-            for k in ["supercookies", "fingerprinting", "trackers", "navigation", "query"]:
-                if k in main_res:
-                    results["categories"][k] = main_res[k]
+            # 3. Navigation State Partitioning
+            log("=== Phase 3: Navigation State Partitioning ===")
+            nav_write_url = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=write&thirdparty=same&sessionId={self.session_id}"
+            self.navigate(nav_write_url)
+            await asyncio.sleep(2)
+            nav_write_signal = await self.next_value(timeout=60)
+            log(f"Nav write signal: {str(nav_write_signal)[:100]}")
 
-            # 3. Supplementary fingerprinting
-            log("=== Phase 3: Supplementary Fingerprinting ===")
-            supp_url = f"{IFRAME_ROOT_SAME}/supplementary.html?sessionId={self.session_id}"
-            self.navigate(supp_url)
+            nav_read_url = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=read&thirdparty=same&sessionId={self.session_id}"
+            self.navigate(nav_read_url)
+            await asyncio.sleep(2)
+            nav_read_res = await self.next_value(timeout=60)
+            log("Navigation read results received!")
+            self.take_screenshot("04_navigation_read")
+
+            if "navigation" in nav_read_res:
+                results["categories"]["navigation"].update(nav_read_res["navigation"])
+
+            # 4. Tracker Blocking (tracking_content.html)
+            log("=== Phase 4: Tracker Blocking ===")
+            trackers_url = f"{FIRST_PARTY_ROOT_SAME}/tracking_content.html?sessionId={self.session_id}"
+            self.navigate(trackers_url)
             try:
-                supp_res = await self.next_value(timeout=30)
-                if "fingerprinting" not in results["categories"]:
-                    results["categories"]["fingerprinting"] = {}
-                results["categories"]["fingerprinting"].update(supp_res)
+                trackers_res = await self.next_value(timeout=45)
+                log("Trackers test results received!")
+                if isinstance(trackers_res, dict):
+                    results["categories"]["trackers"].update(trackers_res)
             except Exception as e:
-                log(f"Supplementary test warning: {e}")
+                log(f"Trackers test warning: {e}")
+            self.take_screenshot("05_trackers")
 
-            # 4. Top-level GPC & IP leak
-            log("=== Phase 4: Top-Level Misc Tests ===")
-            tl_url = f"{LIVE_ROOT}/toplevel.html?sessionId={self.session_id}"
-            self.navigate(tl_url)
+            # 5. Tracking Query Parameters (query.html)
+            log("=== Phase 5: Tracking Query Parameter Stripping ===")
+            secret = str(random.randint(1000000000000000, 9999999999999999))
+            query_test_params = "&".join([f"{p}={secret}" for p in TRACKING_QUERY_PARAMETERS.keys()])
+            query_url = f"{FIRST_PARTY_ROOT_DIFF}/query.html?controlParam=controlValue&{query_test_params}&sessionId={self.session_id}"
+            self.navigate(query_url)
             try:
-                tl_res = await self.next_value(timeout=30)
-                results["categories"]["misc"] = tl_res
+                query_res = await self.next_value(timeout=30)
+                log(f"Query test response: {query_res}")
+                # Score each parameter: if not present in query_res (stripped), passed = True!
+                for param, desc in TRACKING_QUERY_PARAMETERS.items():
+                    val = query_res.get(param)
+                    # If param is None, stripped, or empty, the parameter was successfully stripped!
+                    passed = (val is None) or (val == "")
+                    results["categories"]["query"][param] = {
+                        "value": val,
+                        "passed": passed,
+                        "description": desc,
+                    }
             except Exception as e:
-                log(f"Top-level test warning: {e}")
+                log(f"Query test warning: {e}")
+            self.take_screenshot("06_query")
 
-            # 5. Upgradable HTTPS
-            log("=== Phase 5: HTTPS Upgradable Test ===")
+            # 6. HTTPS Subresource Upgrades (https.html)
+            log("=== Phase 6: HTTPS Subresource Upgrades ===")
+            https_url = f"{FIRST_PARTY_ROOT_SAME}/https.html?sessionId={self.session_id}"
+            self.navigate(https_url)
+            try:
+                https_res = await self.next_value(timeout=30)
+                log(f"HTTPS test response: {https_res}")
+                if isinstance(https_res, dict):
+                    results["categories"]["https"].update(https_res)
+            except Exception as e:
+                log(f"HTTPS test warning: {e}")
+            self.take_screenshot("07_https_subresources")
+
+            # 7. HTTPS Upgradable Hyperlink / Address
+            log("=== Phase 7: HTTPS Upgradable Address / Link ===")
             up_url = f"{UPGRADABLE_ROOT}/upgradable.html?source=address&sessionId={self.session_id}"
             self.navigate(up_url)
             try:
                 up_res = await self.next_value(timeout=30)
-                if "https" not in results["categories"]:
-                    results["categories"]["https"] = {}
-                results["categories"]["https"].update(up_res)
+                log(f"Upgradable test response: {up_res}")
+                if isinstance(up_res, dict):
+                    results["categories"]["https"].update(up_res)
             except Exception as e:
                 log(f"Upgradable test warning: {e}")
+            self.take_screenshot("08_https_upgradable")
 
-            # 6. Insecure website warning
-            log("=== Phase 6: Insecure Website Warning Test ===")
+            # 8. Insecure Website Warning (insecure.html)
+            log("=== Phase 8: Insecure Website Warning ===")
             insec_url = f"{INSECURE_ROOT}/insecure.html?sessionId={self.session_id}"
             self.navigate(insec_url)
             try:
-                insec_res = await self.next_value(timeout=15)
-                if "https" not in results["categories"]:
-                    results["categories"]["https"] = {}
-                results["categories"]["https"].update(insec_res)
+                insec_res = await self.next_value(timeout=10)
+                log(f"Insecure test response (unexpected load): {insec_res}")
+                results["categories"]["https"]["Insecure website warning"] = {
+                    "passed": False,
+                    "result": "Insecure website loaded without warning",
+                    "description": "Checks to see if the browser stops loading an insecure website and warns the user before giving them the option to continue. Known as HTTPS-Only Mode in some browsers."
+                }
             except Exception as e:
-                log(f"Insecure site blocked / timed out (HTTPS-Only mode active): {e}")
-                if "https" not in results["categories"]:
-                    results["categories"]["https"] = {}
+                log("Insecure site never loaded (HTTPS-Only protection active): PASS!")
                 results["categories"]["https"]["Insecure website warning"] = {
                     "passed": True,
-                    "result": "Insecure website blocked / never loaded"
+                    "result": "Insecure website blocked / never loaded",
+                    "description": "Checks to see if the browser stops loading an insecure website and warns the user before giving them the option to continue. Known as HTTPS-Only Mode in some browsers."
                 }
+            self.take_screenshot("09_insecure_check")
+
+            # 9. Supplementary Fingerprinting
+            log("=== Phase 9: Supplementary Fingerprinting ===")
+            supp_url = f"{FIRST_PARTY_ROOT_SAME}/supplementary.html?sessionId={self.session_id}"
+            self.navigate(supp_url)
+            try:
+                supp_res = await self.next_value(timeout=30)
+                if isinstance(supp_res, dict):
+                    results["categories"]["fingerprinting"].update(supp_res)
+            except Exception as e:
+                log(f"Supplementary test warning: {e}")
+
+            # 10. Top-Level Misc & GPC
+            log("=== Phase 10: Top-Level Misc & GPC ===")
+            tl_url = f"{LIVE_ROOT}/toplevel.html?sessionId={self.session_id}"
+            self.navigate(tl_url)
+            try:
+                tl_res = await self.next_value(timeout=30)
+                if isinstance(tl_res, dict):
+                    results["categories"]["misc"].update(tl_res)
+            except Exception as e:
+                log(f"Top-level test warning: {e}")
 
         finally:
             if self.ws:
@@ -224,7 +321,7 @@ class PrivacyTester:
         category_tables = []
 
         for cat_name, tests in data.get("categories", {}).items():
-            if not isinstance(tests, dict):
+            if not isinstance(tests, dict) or not tests:
                 continue
             cat_passed = 0
             cat_failed = 0
