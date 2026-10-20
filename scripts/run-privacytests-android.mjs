@@ -21,10 +21,9 @@ const log = (...args) => {
 
 // ADB Helper
 class AdbDriver {
-  constructor(targetDev, pkgName, activity = 'org.mozilla.fenix.HomeActivity') {
+  constructor(targetDev, pkgName) {
     this.targetDev = targetDev;
     this.pkgName = pkgName;
-    this.activity = activity;
     this.devArg = targetDev ? `-s ${targetDev}` : '';
   }
 
@@ -33,14 +32,24 @@ class AdbDriver {
       const fullCmd = `adb ${this.devArg} ${cmd}`;
       return execSync(fullCmd, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     } catch (e) {
-      log(`ADB error: ${cmd}:`, e.message);
+      log(`ADB error (${cmd}):`, e.message);
       return '';
     }
   }
 
+  async setupNetworking() {
+    log('Setting up Android DNS in container...');
+    this.adb('shell setprop net.dns1 8.8.8.8');
+    this.adb('shell setprop net.dns2 1.1.1.1');
+    const dns1 = this.adb('shell getprop net.dns1');
+    log(`Configured Android DNS: ${dns1}`);
+    const pingRes = this.adb('shell ping -c 2 8.8.8.8');
+    log(`Ping check 8.8.8.8: ${pingRes.includes('bytes from') ? 'OK' : 'Warning'}`);
+  }
+
   async launch() {
     log(`Launching ${this.pkgName}...`);
-    this.adb(`shell am start -n ${this.pkgName}/${this.activity}`);
+    this.adb(`shell am start -n ${this.pkgName}/org.mozilla.fenix.HomeActivity`);
     await sleep(4000);
   }
 
@@ -50,16 +59,15 @@ class AdbDriver {
     await sleep(1000);
   }
 
-  async restart() {
-    await this.kill();
-    await this.launch();
-  }
-
   async openUrl(url) {
     log(`Opening URL: ${url}`);
-    // Open URL as an Android VIEW intent
-    const escaped = url.replace(/&/g, '\\&');
-    this.adb(`shell am start -n ${this.pkgName}/${this.activity} -a android.intent.action.VIEW -d "${escaped}"`);
+    // Use single quotes around URL so &, ?, = are preserved exactly without backslash escaping
+    // 1. Direct intent through IntentReceiverActivity
+    this.adb(`shell am start -n ${this.pkgName}/org.mozilla.fenix.IntentReceiverActivity -a android.intent.action.VIEW -d '${url}'`);
+    await sleep(1500);
+    // 2. Also broadcast VIEW intent to ensure tab is activated
+    this.adb(`shell am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d '${url}' ${this.pkgName}`);
+    await sleep(2000);
   }
 
   async getVersion() {
@@ -69,8 +77,13 @@ class AdbDriver {
   }
 
   async takeScreenshot(destPath) {
-    this.adb(`shell screencap -p /data/local/tmp/pt_screen.png`);
-    this.adb(`pull /data/local/tmp/pt_screen.png "${destPath}"`);
+    try {
+      this.adb(`shell screencap -p /data/local/tmp/pt_screen.png`);
+      this.adb(`pull /data/local/tmp/pt_screen.png "${destPath}"`);
+      log(`Saved screenshot to ${destPath}`);
+    } catch (e) {
+      log(`Screenshot warning:`, e.message);
+    }
   }
 }
 
@@ -96,6 +109,7 @@ class PrivacyTestsClient {
     this.ws.addEventListener('message', (event) => {
       try {
         const msg = JSON.parse(event.data);
+        log('WebSocket message received:', JSON.stringify(msg).slice(0, 150));
         if (this.waiters.length > 0) {
           const waiter = this.waiters.shift();
           waiter(msg);
@@ -112,7 +126,7 @@ class PrivacyTestsClient {
     });
 
     // Receive initial connection hello containing sessionId
-    const initMsg = await this.nextMessage(15000);
+    const initMsg = await this.nextMessage(20000);
     this.sessionId = initMsg.sessionId;
     log(`PrivacyTests session established with sessionId: ${this.sessionId}`);
 
@@ -124,7 +138,7 @@ class PrivacyTestsClient {
     }, 25000);
   }
 
-  nextMessage(timeoutMs = 60000) {
+  nextMessage(timeoutMs = 90000) {
     if (this.messageQueue.length > 0) {
       return Promise.resolve(this.messageQueue.shift());
     }
@@ -142,7 +156,7 @@ class PrivacyTestsClient {
     });
   }
 
-  async nextValue(timeoutMs = 60000) {
+  async nextValue(timeoutMs = 90000) {
     const msg = await this.nextMessage(timeoutMs);
     if (msg.sessionId && msg.sessionId !== this.sessionId) {
       log(`Warning: sessionId mismatch (${msg.sessionId} vs ${this.sessionId})`);
@@ -158,14 +172,17 @@ class PrivacyTestsClient {
 
 // Main Runner
 async function runPrivacyTests() {
-  const args = process.argv.slice(2);
   const targetDev = process.env.ADB_DEVICE || '';
   const pkgName = process.env.PKG_NAME || 'net.mullvad.mullvadbrowser_alpha';
   const outDir = process.env.OUTPUT_DIR || '/tmp/privacytests-output';
+  const screenshotsDir = path.join(outDir, 'screenshots');
 
   fs.mkdirSync(outDir, { recursive: true });
+  fs.mkdirSync(screenshotsDir, { recursive: true });
 
   const adb = new AdbDriver(targetDev, pkgName);
+  await adb.setupNetworking();
+
   const version = await adb.getVersion();
   log(`Detected ${pkgName} version: ${version}`);
 
@@ -185,42 +202,57 @@ async function runPrivacyTests() {
   try {
     // 1. Launch browser
     await adb.launch();
+    await adb.takeScreenshot(path.join(screenshotsDir, '01_browser_launched.png'));
 
     // 2. Stage 1: Main Supercookies, Fingerprinting, and Navigation Tracking
     log('=== Starting Main PrivacyTests (Stage 1) ===');
     const writeUrl = `${IFRAME_ROOT_SAME}/supercookies.html?mode=write&thirdparty=same&sessionId=${pt.sessionId}`;
     await adb.openUrl(writeUrl);
+    await sleep(5000);
+    await adb.takeScreenshot(path.join(screenshotsDir, '02_write_page_loading.png'));
 
     log('Waiting for supercookie_write_finished signal...');
-    const writeSignal = await pt.nextValue(120000);
-    log('Write signal received:', JSON.stringify(writeSignal));
+    let writeSignal = null;
+    try {
+      writeSignal = await pt.nextValue(90000);
+      log('Write signal received:', JSON.stringify(writeSignal));
+    } catch (e) {
+      log('Write signal warning:', e.message);
+      await adb.takeScreenshot(path.join(screenshotsDir, '02_write_timeout.png'));
+    }
 
     await sleep(2000);
-    await adb.takeScreenshot(path.join(outDir, '01_write_done.png'));
+    await adb.takeScreenshot(path.join(screenshotsDir, '03_write_done.png'));
 
     const readUrl = `${IFRAME_ROOT_SAME}/supercookies.html?mode=read&thirdparty=same&sessionId=${pt.sessionId}`;
     await adb.openUrl(readUrl);
+    await sleep(5000);
+    await adb.takeScreenshot(path.join(screenshotsDir, '04_read_page_loading.png'));
 
     log('Waiting for main test results (supercookies, fingerprinting, query)...');
-    const mainResults = await pt.nextValue(120000);
-    log('Main test results received!');
+    try {
+      const mainResults = await pt.nextValue(90000);
+      log('Main test results received!');
+      if (mainResults.supercookies) results.categories.supercookies = mainResults.supercookies;
+      if (mainResults.fingerprinting) results.categories.fingerprinting = mainResults.fingerprinting;
+      if (mainResults.query || mainResults.navigation) {
+        results.categories.query = mainResults.query || mainResults.navigation;
+      }
+      if (mainResults.trackers) results.categories.trackers = mainResults.trackers;
+    } catch (e) {
+      log('Read results warning:', e.message);
+      await adb.takeScreenshot(path.join(screenshotsDir, '04_read_timeout.png'));
+    }
 
     await sleep(2000);
-    await adb.takeScreenshot(path.join(outDir, '02_read_done.png'));
-
-    if (mainResults.supercookies) results.categories.supercookies = mainResults.supercookies;
-    if (mainResults.fingerprinting) results.categories.fingerprinting = mainResults.fingerprinting;
-    if (mainResults.query || mainResults.navigation) {
-      results.categories.query = mainResults.query || mainResults.navigation;
-    }
-    if (mainResults.trackers) results.categories.trackers = mainResults.trackers;
+    await adb.takeScreenshot(path.join(screenshotsDir, '05_read_done.png'));
 
     // 3. Stage 2: Upgradable and Insecure HTTPS tests
     log('=== Starting HTTPS Upgrade & Insecure Warning Tests ===');
     const upgradableUrl = `${UPGRADABLE_ROOT}/upgradable.html?source=address&sessionId=${pt.sessionId}`;
     await adb.openUrl(upgradableUrl);
     try {
-      const upgradableRes = await pt.nextValue(30000);
+      const upgradableRes = await pt.nextValue(25000);
       results.categories.https = { ...(results.categories.https || {}), ...upgradableRes };
     } catch (e) {
       log('Upgradable test warning:', e.message);
@@ -245,15 +277,18 @@ async function runPrivacyTests() {
     const toplevelUrl = `${LIVE_ROOT}/toplevel.html?sessionId=${pt.sessionId}`;
     await adb.openUrl(toplevelUrl);
     try {
-      const toplevelRes = await pt.nextValue(30000);
+      const toplevelRes = await pt.nextValue(25000);
       results.categories.misc = toplevelRes;
     } catch (e) {
       log('Top-level test warning:', e.message);
     }
 
     results.timeStopped = new Date().toISOString();
+  } catch (err) {
+    log('Unexpected error in test loop:', err.message);
   } finally {
     pt.close();
+    await adb.takeScreenshot(path.join(screenshotsDir, '99_final_state.png'));
     await adb.kill();
   }
 
