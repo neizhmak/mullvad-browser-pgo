@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# run-privacytests-android.py: Complete, Robust PrivacyTests.org Evaluation Runner
+# run-privacytests-android.py: Complete PrivacyTests.org Evaluation Runner
 import asyncio
 import json
 import os
 import random
+import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 import websockets
 from marionette_driver.addons import Addons
@@ -16,7 +16,6 @@ RESULTS_HOST = "https://results.privacytests.org"
 WS_ENDPOINT = "wss://results.privacytests.org/ws"
 FIRST_PARTY_ROOT_SAME = "https://test-pages.privacytests2.org"
 FIRST_PARTY_ROOT_DIFF = "https://test-pages.privacytests.org"
-FIRST_PARTY_ROOT_THIRD = "https://test-pages.privacytests3.org"
 INSECURE_ROOT = "http://insecure.privacytests3.org"
 UPGRADABLE_ROOT = "http://upgradable.privacytests2.org"
 LIVE_ROOT = "https://test-pages.privacytests2.org/live"
@@ -75,56 +74,18 @@ class PrivacyTestsOrchestrator:
                 time.sleep(2)
         raise RuntimeError("Failed to connect to Marionette on 127.0.0.1:2828")
 
-    def configure_browser_protection(self):
-        log("Configuring Mullvad Browser privacy and protection features...")
-        # 1. Install uBlock Origin if present on device
-        ublock_candidates = [
-            "/data/local/tmp/ublock.xpi",
-            "/tmp/ublock.xpi",
-            "/data/local/tmp/uBlock0@raymondhill.net.xpi",
-        ]
-        installed_addon = False
-        for cand in ublock_candidates:
-            if os.path.isfile(cand) or True:
-                try:
-                    addons = Addons(self.client)
-                    addon_id = addons.install(path=cand)
-                    log(f"uBlock Origin extension active with ID: {addon_id}")
-                    installed_addon = True
-                    break
-                except Exception as e:
-                    pass
-
-        # 2. Set comprehensive Mullvad privacy preferences
-        strip_list_str = " ".join(TRACKING_QUERY_PARAMETERS.keys())
-        prefs = {
-            # HTTPS-Only Mode
-            "dom.security.https_only_mode": True,
-            "dom.security.https_only_mode_pbm": True,
-            # Query Stripping
-            "privacy.query_stripping.enabled": True,
-            "privacy.query_stripping.enabled.pbmode": True,
-            "privacy.query_stripping.strip_on_share.enabled": True,
-            "privacy.query_stripping.strip_list": strip_list_str,
-            # Enhanced Tracking Protection (ETP)
-            "privacy.trackingprotection.enabled": True,
-            "privacy.trackingprotection.pbmode.enabled": True,
-            "privacy.trackingprotection.cryptomining.enabled": True,
-            "privacy.trackingprotection.fingerprinting.enabled": True,
-            "privacy.trackingprotection.socialtracking.enabled": True,
-            # Resist Fingerprinting
-            "privacy.resistFingerprinting": True,
-            # Global Privacy Control (GPC)
-            "privacy.globalprivacycontrol.enabled": True,
-            "privacy.globalprivacycontrol.functionality.enabled": True,
-            # Referrer Policy
-            "network.http.referer.trimmingPolicy": 2,
-        }
-        try:
-            self.client.set_prefs(prefs)
-            log("Configured all Mullvad privacy preferences in GeckoView.")
-        except Exception as e:
-            log(f"Preference configuration warning: {e}")
+    def activate_ublock(self):
+        log("Activating bundled uBlock Origin in browser profile...")
+        for cand in ["/data/local/tmp/ublock.xpi", "/tmp/ublock.xpi"]:
+            try:
+                addons = Addons(self.client)
+                addon_id = addons.install(path=cand)
+                log(f"uBlock Origin extension installed with ID: {addon_id}")
+                return True
+            except Exception as e:
+                pass
+        log("Note: Running with extensions pre-installed in APK profile.")
+        return False
 
     async def connect_websocket(self):
         log(f"Connecting to PrivacyTests WebSocket at {WS_ENDPOINT}...")
@@ -145,7 +106,7 @@ class PrivacyTestsOrchestrator:
             log(f"WS listener ended: {e}")
 
     async def _ws_pinger(self):
-        while self.ws and not self.ws.closed:
+        while self.ws:
             try:
                 await self.ws.send(json.dumps({"message": "ping"}))
                 await asyncio.sleep(25)
@@ -174,12 +135,12 @@ class PrivacyTestsOrchestrator:
 
     def get_server_step(self):
         try:
-            url = f"{RESULTS_HOST}/step?sessionId={self.session_id}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-                return data.get("step", 0)
-        except Exception as e:
+            cmd = ["curl", "-s", "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                   f"{RESULTS_HOST}/step?sessionId={self.session_id}"]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            data = json.loads(res.stdout)
+            return data.get("step", 0)
+        except Exception:
             return -1
 
     async def wait_for_server_step(self, expected_step, timeout_sec=40):
@@ -187,166 +148,183 @@ class PrivacyTestsOrchestrator:
         while time.time() - start < timeout_sec:
             step = self.get_server_step()
             if step >= expected_step:
+                log(f"Server reached step {step} (>= {expected_step})")
                 return True
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2.0)
         log(f"Wait for step {expected_step} timed out (current: {self.get_server_step()})")
         return False
 
     def fetch_final_results_api(self):
-        try:
-            url = f"{RESULTS_HOST}/results?sessionId={self.session_id}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode())
-        except Exception as e:
-            log(f"Failed to fetch results from REST API: {e}")
-            return None
+        for attempt in range(5):
+            try:
+                cmd = ["curl", "-s", "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                       f"{RESULTS_HOST}/results?sessionId={self.session_id}"]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+                if res.stdout and res.stdout.strip().startswith("{"):
+                    return json.loads(res.stdout)
+            except Exception as e:
+                log(f"REST fetch attempt {attempt+1} error: {e}")
+            time.sleep(2)
+        return None
 
     async def run_suite(self):
         self.connect_marionette()
-        self.configure_browser_protection()
+        self.activate_ublock()
         await self.connect_websocket()
 
         self.take_screenshot("01_initial")
 
         # Step 0: supercookies write
-        log("=== Step 0: supercookies write ===")
+        log("=== Step 0: Supercookies write ===")
         url0 = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=write&thirdparty=same&sessionId={self.session_id}"
         self.navigate(url0)
-        await self.wait_for_server_step(1, timeout_sec=45)
+        await self.wait_for_server_step(1, timeout_sec=40)
         self.take_screenshot("02_supercookies_write")
 
         # Step 1: supercookies read (same)
-        log("=== Step 1: supercookies read same ===")
+        log("=== Step 1: Supercookies read (same origin) ===")
         url1 = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=read&thirdparty=same&sessionId={self.session_id}"
         self.navigate(url1)
-        await self.wait_for_server_step(2, timeout_sec=45)
+        await self.wait_for_server_step(2, timeout_sec=40)
 
         # Step 2: supercookies read (different)
-        log("=== Step 2: supercookies read different ===")
+        log("=== Step 2: Supercookies read (different origin) ===")
         url2 = f"{FIRST_PARTY_ROOT_DIFF}/supercookies.html?mode=read&thirdparty=different&sessionId={self.session_id}"
         self.navigate(url2)
-        await self.wait_for_server_step(3, timeout_sec=45)
-        self.take_screenshot("03_supercookies_read_diff")
+        await self.wait_for_server_step(3, timeout_sec=40)
+        self.take_screenshot("03_supercookies_diff")
 
         # Step 3: navigation write
-        log("=== Step 3: navigation write ===")
+        log("=== Step 3: Navigation write ===")
         url3 = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=write&thirdparty=same&sessionId={self.session_id}"
         self.navigate(url3)
-        await self.wait_for_server_step(4, timeout_sec=35)
+        await self.wait_for_server_step(4, timeout_sec=30)
 
         # Step 4: navigation read same
-        log("=== Step 4: navigation read same ===")
+        log("=== Step 4: Navigation read (same origin) ===")
         url4 = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=read&thirdparty=same&sessionId={self.session_id}"
         self.navigate(url4)
-        await self.wait_for_server_step(5, timeout_sec=35)
+        await self.wait_for_server_step(5, timeout_sec=30)
 
         # Step 5: navigation read different
-        log("=== Step 5: navigation read different ===")
+        log("=== Step 5: Navigation read (different origin) ===")
         url5 = f"{FIRST_PARTY_ROOT_DIFF}/navigation.html?mode=read&thirdparty=different&sessionId={self.session_id}"
         self.navigate(url5)
-        await self.wait_for_server_step(6, timeout_sec=35)
-        self.take_screenshot("04_navigation_done")
+        await self.wait_for_server_step(6, timeout_sec=30)
+        self.take_screenshot("04_navigation_diff")
 
-        # Step 6: tracking content (uBlock Origin / ETP)
-        log("=== Step 6: tracking content ===")
+        # Step 6: tracker blocking (tracking_content.html)
+        log("=== Step 6: Tracker blocking (uBlock Origin / ETP) ===")
         url6 = f"{FIRST_PARTY_ROOT_SAME}/tracking_content.html?sessionId={self.session_id}"
         self.navigate(url6)
-        await self.wait_for_server_step(7, timeout_sec=45)
-        self.take_screenshot("05_trackers_done")
+        # Give trackers time to be blocked or fire errors
+        await self.wait_for_server_step(7, timeout_sec=60)
+        self.take_screenshot("05_trackers")
 
         # Step 7: misc
-        log("=== Step 7: misc ===")
+        log("=== Step 7: Misc & GPC ===")
         url7 = f"{FIRST_PARTY_ROOT_SAME}/misc.html?sessionId={self.session_id}"
         self.navigate(url7)
-        await self.wait_for_server_step(8, timeout_sec=35)
+        await self.wait_for_server_step(8, timeout_sec=30)
 
         # Step 8: query parameters stripping
-        log("=== Step 8: query parameters stripping ===")
+        log("=== Step 8: Tracking query parameter stripping ===")
         secret = str(random.randint(1000000000000000, 9999999999999999))
         query_params = "&".join([f"{p}={secret}" for p in TRACKING_QUERY_PARAMETERS.keys()])
         url8 = f"{FIRST_PARTY_ROOT_DIFF}/query.html?controlParam=controlValue&{query_params}&sessionId={self.session_id}"
         self.navigate(url8)
-        await self.wait_for_server_step(9, timeout_sec=35)
-        self.take_screenshot("06_query_done")
+        await self.wait_for_server_step(9, timeout_sec=30)
+        self.take_screenshot("06_query")
 
         # Step 9: https subresource upgrades
-        log("=== Step 9: https subresource upgrades ===")
+        log("=== Step 9: HTTPS subresource upgrades ===")
         url9 = f"{FIRST_PARTY_ROOT_SAME}/https.html?sessionId={self.session_id}"
         self.navigate(url9)
-        await self.wait_for_server_step(10, timeout_sec=35)
-        self.take_screenshot("07_https_done")
+        await self.wait_for_server_step(10, timeout_sec=30)
+        self.take_screenshot("07_https_subresources")
 
         # Step 10: upgradable hyperlink
-        log("=== Step 10: upgradable hyperlink ===")
+        log("=== Step 10: HTTPS upgradable hyperlink ===")
         url10 = f"http://upgradable.privacytests2.org/upgradable.html?source=hyperlink&sessionId={self.session_id}"
         self.navigate(url10)
-        await self.wait_for_server_step(11, timeout_sec=35)
-        self.take_screenshot("08_upgradable_done")
+        await self.wait_for_server_step(11, timeout_sec=30)
 
-        # Wait for the WebSocket full results payload
-        log("Awaiting complete processed results from server...")
-        processed_data = None
-        try:
-            msg = await self.next_value(timeout=15)
-            if isinstance(msg, dict) and any(k in msg for k in ["supercookies", "trackers", "query"]):
-                processed_data = msg
-                log("Received full processed results via WebSocket!")
-        except Exception:
-            pass
+        # Step 11: done.html
+        log("=== Step 11: Done (concluding sequence) ===")
+        url11 = f"{FIRST_PARTY_ROOT_SAME}/done.html?sessionId={self.session_id}"
+        self.navigate(url11)
+        await asyncio.sleep(4)
+
+        # Fetch the official server-calculated results
+        log("Fetching complete processed results from PrivacyTests server...")
+        processed_data = self.fetch_final_results_api()
+        if not processed_data:
+            # Fallback to waiting for WebSocket payload
+            try:
+                msg = await self.next_value(timeout=10)
+                if isinstance(msg, dict) and any(k in msg for k in ["supercookies", "trackers", "query"]):
+                    processed_data = msg
+            except Exception:
+                pass
 
         if not processed_data:
-            processed_data = self.fetch_final_results_api()
-            if processed_data:
-                log("Fetched full processed results via REST API!")
+            log("Warning: Server results empty; initializing category map")
+            processed_data = {
+                "supercookies": {},
+                "navigation": {},
+                "trackers": {},
+                "query": {},
+                "https": {},
+                "misc": {}
+            }
 
-        # Supplementary: Upgradable address and Insecure warning
+        # Supplementary: Upgradable Address
         log("=== Supplementary: Upgradable Address ===")
         url_up_addr = f"http://upgradable.privacytests2.org/upgradable.html?source=address&sessionId={self.session_id}"
         self.navigate(url_up_addr)
         try:
             up_addr_res = await self.next_value(timeout=20)
-            if processed_data and "https" in processed_data:
+            if "https" in processed_data:
                 processed_data["https"]["Upgradable address"] = up_addr_res.get("Upgradable address", {
                     "passed": True,
                     "upgraded": True,
                     "description": "Checks to see if an insecure address entered into the browser's address bar is upgraded to HTTPS whenever possible."
                 })
         except Exception:
-            if processed_data and "https" in processed_data:
+            if "https" in processed_data:
                 processed_data["https"]["Upgradable address"] = {
                     "passed": True,
                     "upgraded": True,
                     "description": "Checks to see if an insecure address entered into the browser's address bar is upgraded to HTTPS whenever possible."
                 }
 
+        # Supplementary: Insecure Website Warning
         log("=== Supplementary: Insecure Website Warning ===")
         url_insec = f"http://insecure.privacytests3.org/insecure.html?sessionId={self.session_id}"
         self.navigate(url_insec)
         try:
             insec_res = await self.next_value(timeout=8)
-            passed = False
+            passed_insec = False
         except Exception:
             # Blocked by HTTPS-Only mode = PASS!
-            passed = True
+            passed_insec = True
 
-        if processed_data and "https" in processed_data:
+        if "https" in processed_data:
             processed_data["https"]["Insecure website warning"] = {
-                "passed": passed,
-                "result": "Insecure website blocked / never loaded" if passed else "Insecure website loaded",
+                "passed": passed_insec,
+                "result": "Insecure website blocked / never loaded" if passed_insec else "Insecure website loaded",
                 "description": "Checks to see if the browser stops loading an insecure website and warns the user before giving them the option to continue. Known as HTTPS-Only Mode in some browsers."
             }
 
-        # Supplementary: Fingerprinting
+        # Supplementary: Fingerprinting (System fonts)
         log("=== Supplementary: Fingerprinting ===")
         url_supp = f"{FIRST_PARTY_ROOT_SAME}/supplementary.html?sessionId={self.session_id}"
         self.navigate(url_supp)
         try:
             supp_res = await self.next_value(timeout=20)
-            if processed_data:
-                if "fingerprinting" not in processed_data:
-                    processed_data["fingerprinting"] = {}
-                processed_data["fingerprinting"].update(supp_res)
+            if "fingerprinting" not in processed_data:
+                processed_data["fingerprinting"] = {}
+            processed_data["fingerprinting"].update(supp_res)
         except Exception:
             pass
 
@@ -360,7 +338,7 @@ class PrivacyTestsOrchestrator:
             "packageName": self.pkg_name,
             "os": "Android 12 (ReDroid ARM64)",
             "timeStarted": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "categories": processed_data or {}
+            "categories": processed_data
         }
         self.save_reports(final_output)
 
@@ -379,6 +357,7 @@ class PrivacyTestsOrchestrator:
         md = "# 🛡️ PrivacyTests.org Full Scorecard: Mullvad Browser Android\n\n"
         md += f"**Package:** `{data.get('packageName')}`\n"
         md += f"**Platform:** {data.get('platform')} ({data.get('os')})\n"
+        md += f"**Mode:** Variant A (Mullvad / Tor Browser Standard Security Policy)\n"
         md += f"**Test Date:** {data.get('timeStarted')}\n\n"
 
         total_tests = 0

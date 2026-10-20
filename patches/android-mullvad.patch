@@ -43,6 +43,36 @@ index 51cbeb4..3667733 100644
    xz -9e omni.ja
    mv omni.ja.xz assets/
 +  [% END -%]
++  [% IF c("var/mullvad-browser") -%]
++  mkdir -p assets
++  unzip -p "$apk" assets/omni.ja > assets/omni.ja
++  mkdir omni
++  pushd omni
++  unzip ../assets/omni.ja
++  for pref_file in defaults/pref/*/geckoview-prefs.js */greprefs.js; do
++    if [ -f "$pref_file" ]; then
++      cat << 'EOF' >> "$pref_file"
++pref("dom.security.https_only_mode", true);
++pref("dom.security.https_only_mode_pbm", true);
++pref("privacy.query_stripping.enabled", true);
++pref("privacy.query_stripping.enabled.pbmode", true);
++pref("privacy.query_stripping.strip_on_share.enabled", true);
++pref("privacy.query_stripping.strip_list", "fbclid gclid msclkid mc_eid dclid oly_anon_id oly_enc_id _openstat vero_conv vero_id wickedid yclid __s rb_clickid s_cid ml_subscriber ml_subscriber_hash _hsenc __hssc __hstc __hsfp hsCtaTracking mkt_tok");
++pref("privacy.trackingprotection.enabled", true);
++pref("privacy.trackingprotection.pbmode.enabled", true);
++pref("privacy.trackingprotection.cryptomining.enabled", true);
++pref("privacy.trackingprotection.fingerprinting.enabled", true);
++pref("privacy.trackingprotection.socialtracking.enabled", true);
++pref("privacy.resistFingerprinting", true);
++pref("privacy.globalprivacycontrol.enabled", true);
++EOF
++    fi
++  done
++  rm ../assets/omni.ja
++  zip -0 -r ../assets/omni.ja *
++  popd
++  rm -rf omni
++  [% END -%]
  
    mkdir apk
    pushd apk
@@ -334,6 +364,56 @@ index 04b0b34..0afbd27 100644
 +    if old_h in t and "var torSecurityLevel" not in t:
 +        new_h = ") : PreferencesHolder {\n    var torSecurityLevel: Int = 4"
 +        p_set.write_text(t.replace(old_h, new_h, 1), encoding="utf-8")
++
++# 11. TorBrowserFeatures.kt (auto-install bundled uBlock Origin on startup)
++p_tbf = Path("app/src/main/java/org/mozilla/fenix/components/TorBrowserFeatures.kt")
++if p_tbf.is_file():
++    t_tbf = p_tbf.read_text(encoding="utf-8")
++    old_tbf_needle = 'const val NOSCRIPT_ID = "{73a6fe31-595d-460b-a920-fcc0f8843232}"'
++    new_tbf_decl = '''const val NOSCRIPT_ID = "{73a6fe31-595d-460b-a920-fcc0f8843232}"
++    const val UBLOCK_ID = "uBlock0@raymondhill.net"
++
++    private fun installUBlock(
++        context: Context,
++        runtime: WebExtensionRuntime,
++    ) {
++        val xpiName = "$UBLOCK_ID.xpi"
++        val addonPath = context.cacheDir.resolve(xpiName)
++        val policy = StrictMode.getThreadPolicy()
++        try {
++            context.assets.open("extensions/$xpiName")
++                .use { inStream ->
++                    StrictMode.setThreadPolicy(StrictMode.ThreadPolicy.LAX)
++                    addonPath.outputStream().use { outStream ->
++                        inStream.copyTo(outStream)
++                    }
++                }
++        } catch (throwable: IOException) {
++            logger.error("Could not extract uBlock Origin", throwable)
++            return
++        } finally {
++            StrictMode.setThreadPolicy(policy)
++        }
++
++        runtime.installWebExtension(
++            url = addonPath.toURI().toString(),
++            onSuccess = { extension ->
++                runtime.setAllowedInPrivateBrowsing(
++                    extension,
++                    true,
++                    { logger.debug("uBlock Origin installed successfully") },
++                    { throwable -> logger.error("Could not enable uBlock in private browsing", throwable) }
++                )
++            },
++            onError = { throwable ->
++                logger.error("Could not install uBlock Origin", throwable)
++            }
++        )
++    }'''
++    if old_tbf_needle in t_tbf and "UBLOCK_ID" not in t_tbf:
++        t_tbf = t_tbf.replace(old_tbf_needle, new_tbf_decl, 1)
++        t_tbf = t_tbf.replace("installNoScript(", "installUBlock(context, runtime)\n            installNoScript(", 1)
++        p_tbf.write_text(t_tbf, encoding="utf-8")
 +PY_FENIX_TELEMETRY
 +[% END -%]
 +
