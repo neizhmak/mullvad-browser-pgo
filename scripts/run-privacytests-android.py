@@ -209,20 +209,13 @@ class PrivacyTester:
         md_path = self.out_dir / "privacytests-report.md"
         md_path.write_text(report_md, encoding="utf-8")
         log(f"Saved scorecard report to {md_path}")
-        print("
-" + report_md, flush=True)
+        print("\n" + report_md, flush=True)
 
     def generate_markdown(self, data):
-        md = "# PrivacyTests.org Results: Mullvad Browser for Android
-
-"
-        md += f"**Target:** `{data.get('packageName')}`
-"
-        md += f"**Platform:** {data.get('platform')} ({data.get('os')})
-"
-        md += f"**Test Date:** {data.get('timeStarted')}
-
-"
+        md = "# PrivacyTests.org Results: Mullvad Browser for Android\n\n"
+        md += f"**Target:** `{data.get('packageName')}`\n"
+        md += f"**Platform:** {data.get('platform')} ({data.get('os')})\n"
+        md += f"**Test Date:** {data.get('timeStarted')}\n\n"
 
         total_tests = 0
         total_passed = 0
@@ -264,35 +257,19 @@ class PrivacyTester:
             cat_title = cat_name.capitalize()
             denom = cat_passed + cat_failed
             pct = round((cat_passed / denom) * 100) if denom > 0 else 100
-            t = f"### Category: {cat_title}
-"
-            t += f"**Score:** {cat_passed} / {denom} passed ({pct}%)
-
-"
-            t += "| Test | Status | Description |
-| :--- | :---: | :--- |
-"
-            t += "
-".join(rows) + "
-
-"
+            t = f"### Category: {cat_title}\n"
+            t += f"**Score:** {cat_passed} / {denom} passed ({pct}%)\n\n"
+            t += "| Test | Status | Description |\n| :--- | :---: | :--- |\n"
+            t += "\n".join(rows) + "\n\n"
             category_tables.append(t)
 
         overall_denom = total_passed + total_failed
         overall_pct = round((total_passed / overall_denom) * 100) if overall_denom > 0 else 100
-        md += f"## 🏆 Overall Privacy Score: {total_passed} / {overall_denom} Passed ({overall_pct}%)
-
-"
-        md += f"- **Passed (Protected):** {total_passed} ✅
-"
-        md += f"- **Failed (Leaked):** {total_failed} ❌
-"
-        md += f"- **Unsupported / N/A:** {total_unsupported} ⚪
-
-"
-        md += "---
-
-"
+        md += f"## 🏆 Overall Privacy Score: {total_passed} / {overall_denom} Passed ({overall_pct}%)\n\n"
+        md += f"- **Passed (Protected):** {total_passed} ✅\n"
+        md += f"- **Failed (Leaked):** {total_failed} ❌\n"
+        md += f"- **Unsupported / N/A:** {total_unsupported} ⚪\n\n"
+        md += "---\n\n"
         md += "".join(category_tables)
         return md
 
