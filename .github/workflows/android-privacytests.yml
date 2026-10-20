@@ -28,7 +28,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y git dkms "linux-headers-$(uname -r)" build-essential adb curl python3-pip
-          pip3 install --break-system-packages marionette-driver websockets || true
+          pip3 install --break-system-packages websockets || true
 
           if [[ ! -c /dev/binder ]]; then
             cd /tmp
@@ -99,10 +99,10 @@ jobs:
           ls -lh "$apk_file"
           sha256sum "$apk_file"
 
-      - name: Install Mullvad Browser on ReDroid and configure Marionette
+      - name: Install pristine Mullvad Browser APK (Sterile Out-of-the-Box)
         run: |
           set -euo pipefail
-          echo "Installing $APK_PATH..."
+          echo "Installing pristine production APK: $APK_PATH..."
           adb -s "$TARGET_DEV" install -r "$APK_PATH"
           pkg_name=$(adb -s "$TARGET_DEV" shell pm list packages | grep -E "mullvad|firefox|fenix" | head -n 1 | cut -d: -f2 | tr -d '\r')
           echo "PKG_NAME=$pkg_name" >> "$GITHUB_ENV"
@@ -111,47 +111,10 @@ jobs:
           adb -s "$TARGET_DEV" shell pm grant "$pkg_name" android.permission.WRITE_EXTERNAL_STORAGE 2>/dev/null || true
           adb -s "$TARGET_DEV" shell pm grant "$pkg_name" android.permission.READ_EXTERNAL_STORAGE 2>/dev/null || true
 
-          # Push GeckoView automation config enabling Marionette WebDriver on port 2828
-          python3 - << 'PY_YAML'
-          from pathlib import Path
-
-          config = """args:
-            - "--marionette"
-          prefs:
-            marionette.defaultPrefs.enabled: true
-            marionette.port: 2828
-            dom.security.https_only_mode: true
-            dom.security.https_only_mode_pbm: true
-            privacy.query_stripping.enabled: true
-            privacy.query_stripping.enabled.pbmode: true
-            privacy.query_stripping.strip_list: "fbclid gclid msclkid mc_eid dclid oly_anon_id oly_enc_id _openstat vero_conv vero_id wickedid yclid __s rb_clickid s_cid ml_subscriber ml_subscriber_hash _hsenc __hssc __hstc __hsfp hsCtaTracking mkt_tok"
-            privacy.trackingprotection.enabled: true
-            privacy.trackingprotection.pbmode.enabled: true
-            privacy.trackingprotection.cryptomining.enabled: true
-            privacy.trackingprotection.fingerprinting.enabled: true
-            privacy.trackingprotection.socialtracking.enabled: true
-            privacy.globalprivacycontrol.enabled: true
-            privacy.globalprivacycontrol.functionality.enabled: true
-            privacy.resistFingerprinting: true
-            network.http.referer.trimmingPolicy: 2
-          """
-          Path("/tmp/geckoview-config.yaml").write_text(config, encoding="utf-8")
-          PY_YAML
-          adb -s "$TARGET_DEV" push /tmp/geckoview-config.yaml "/data/local/tmp/${pkg_name}-geckoview-config.yaml"
-          adb -s "$TARGET_DEV" shell "chmod 666 /data/local/tmp/${pkg_name}-geckoview-config.yaml"
-          adb -s "$TARGET_DEV" shell am set-debug-app --persistent "$pkg_name"
-
-          # Forward Marionette port
-          adb -s "$TARGET_DEV" forward tcp:2828 tcp:2828 || true
-
-          # Start browser
-          echo "Starting browser with Marionette enabled..."
-          adb -s "$TARGET_DEV" shell am start -n "$pkg_name/org.mozilla.fenix.HomeActivity"
-          sleep 5
-
-      - name: Run PrivacyTests.org Evaluation Suite via Marionette
+      - name: Run 100% Sterile PrivacyTests.org Evaluation Suite
         run: |
           set -euo pipefail
+          export ADB_DEVICE="$TARGET_DEV"
           export PKG_NAME="$PKG_NAME"
           export OUTPUT_DIR="$RUNNER_TEMP/privacytests"
           python3 ./scripts/run-privacytests-android.py
@@ -167,6 +130,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: privacytests-results
+          name: privacytests-sterile-results
           path: ${{ runner.temp }}/privacytests/
           retention-days: 14
