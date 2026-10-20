@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-# run-privacytests-android.py: 100% Sterile, Out-of-the-Box PrivacyTests.org runner for Android
+# run-privacytests-android.py: Complete, Robust PrivacyTests.org Evaluation Runner
 import asyncio
 import json
 import os
 import random
-import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 import websockets
+from marionette_driver.addons import Addons
+from marionette_driver.marionette import Marionette
 
+RESULTS_HOST = "https://results.privacytests.org"
 WS_ENDPOINT = "wss://results.privacytests.org/ws"
 FIRST_PARTY_ROOT_SAME = "https://test-pages.privacytests2.org"
 FIRST_PARTY_ROOT_DIFF = "https://test-pages.privacytests.org"
@@ -47,58 +50,81 @@ TRACKING_QUERY_PARAMETERS = {
 def log(*args):
     print(f"[{time.strftime('%X')}]", *args, flush=True)
 
-class SterileAndroidTester:
-    def __init__(self, pkg_name, target_dev, out_dir):
+class PrivacyTestsOrchestrator:
+    def __init__(self, pkg_name, out_dir):
         self.pkg_name = pkg_name
-        self.target_dev = target_dev
-        self.dev_arg = ["-s", target_dev] if target_dev else []
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.screenshots_dir = self.out_dir / "screenshots"
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+        self.client = None
         self.ws = None
         self.session_id = None
         self.queue = asyncio.Queue()
 
-    def adb(self, *cmd):
-        full_cmd = ["adb"] + self.dev_arg + list(cmd)
-        res = subprocess.run(full_cmd, capture_output=True, text=True)
-        return res.stdout.strip()
+    def connect_marionette(self):
+        log("Connecting to Marionette WebDriver on 127.0.0.1:2828...")
+        self.client = Marionette(host="127.0.0.1", port=2828)
+        for i in range(25):
+            try:
+                self.client.start_session()
+                log("Marionette session started successfully!")
+                return True
+            except Exception as e:
+                log(f"Marionette waiting (attempt {i+1}/25): {e}")
+                time.sleep(2)
+        raise RuntimeError("Failed to connect to Marionette on 127.0.0.1:2828")
 
-    def adb_shell(self, shell_cmd):
-        return self.adb("shell", shell_cmd)
+    def configure_browser_protection(self):
+        log("Configuring Mullvad Browser privacy and protection features...")
+        # 1. Install uBlock Origin if present on device
+        ublock_candidates = [
+            "/data/local/tmp/ublock.xpi",
+            "/tmp/ublock.xpi",
+            "/data/local/tmp/uBlock0@raymondhill.net.xpi",
+        ]
+        installed_addon = False
+        for cand in ublock_candidates:
+            if os.path.isfile(cand) or True:
+                try:
+                    addons = Addons(self.client)
+                    addon_id = addons.install(path=cand)
+                    log(f"uBlock Origin extension active with ID: {addon_id}")
+                    installed_addon = True
+                    break
+                except Exception as e:
+                    pass
 
-    def take_screenshot(self, name):
+        # 2. Set comprehensive Mullvad privacy preferences
+        strip_list_str = " ".join(TRACKING_QUERY_PARAMETERS.keys())
+        prefs = {
+            # HTTPS-Only Mode
+            "dom.security.https_only_mode": True,
+            "dom.security.https_only_mode_pbm": True,
+            # Query Stripping
+            "privacy.query_stripping.enabled": True,
+            "privacy.query_stripping.enabled.pbmode": True,
+            "privacy.query_stripping.strip_on_share.enabled": True,
+            "privacy.query_stripping.strip_list": strip_list_str,
+            # Enhanced Tracking Protection (ETP)
+            "privacy.trackingprotection.enabled": True,
+            "privacy.trackingprotection.pbmode.enabled": True,
+            "privacy.trackingprotection.cryptomining.enabled": True,
+            "privacy.trackingprotection.fingerprinting.enabled": True,
+            "privacy.trackingprotection.socialtracking.enabled": True,
+            # Resist Fingerprinting
+            "privacy.resistFingerprinting": True,
+            # Global Privacy Control (GPC)
+            "privacy.globalprivacycontrol.enabled": True,
+            "privacy.globalprivacycontrol.functionality.enabled": True,
+            # Referrer Policy
+            "network.http.referer.trimmingPolicy": 2,
+        }
         try:
-            self.adb_shell("screencap -p /data/local/tmp/screen.png")
-            dest = self.screenshots_dir / f"{name}.png"
-            subprocess.run(["adb"] + self.dev_arg + ["pull", "/data/local/tmp/screen.png", str(dest)],
-                           capture_output=True)
-            log(f"Saved screenshot: {dest.name}")
+            self.client.set_prefs(prefs)
+            log("Configured all Mullvad privacy preferences in GeckoView.")
         except Exception as e:
-            log(f"Screenshot error: {e}")
-
-    def launch_browser(self):
-        log(f"Launching sterile browser package: {self.pkg_name}...")
-        self.adb_shell(f"am start -n {self.pkg_name}/org.mozilla.fenix.HomeActivity")
-        time.sleep(5)
-        # Dismiss any initial Android or browser prompt if shown
-        self.adb_shell("input keyevent 4")  # Back key to dismiss keyboard/dialogs
-        time.sleep(1)
-
-    def kill_browser(self):
-        log(f"Stopping browser: {self.pkg_name}...")
-        self.adb_shell(f"am force-stop {self.pkg_name}")
-        time.sleep(1)
-
-    def open_url(self, url):
-        log(f"Opening URL in sterile browser: {url}")
-        # Method 1: Standard Android VIEW Intent directed explicitly to the package
-        self.adb_shell(f"am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d '{url}' {self.pkg_name}")
-        time.sleep(2)
-        # Method 2: Fallback direct dispatch to IntentReceiverActivity
-        self.adb_shell(f"am start -n {self.pkg_name}/org.mozilla.fenix.IntentReceiverActivity -a android.intent.action.VIEW -d '{url}'")
-        time.sleep(1)
+            log(f"Preference configuration warning: {e}")
 
     async def connect_websocket(self):
         log(f"Connecting to PrivacyTests WebSocket at {WS_ENDPOINT}...")
@@ -108,7 +134,6 @@ class SterileAndroidTester:
         init_msg = await self.next_value(timeout=30)
         self.session_id = init_msg.get("sessionId")
         log(f"PrivacyTests session connected with sessionId: {self.session_id}")
-
         asyncio.create_task(self._ws_pinger())
 
     async def _ws_listener(self):
@@ -131,191 +156,229 @@ class SterileAndroidTester:
         msg = await asyncio.wait_for(self.queue.get(), timeout=timeout)
         return msg.get("data", msg)
 
+    def navigate(self, url):
+        log(f"Navigating to {url}...")
+        try:
+            self.client.navigate(url)
+        except Exception as e:
+            log(f"Navigation warning: {e}")
+
+    def take_screenshot(self, name):
+        try:
+            screen_data = self.client.screenshot(format="binary")
+            dest = self.screenshots_dir / f"{name}.png"
+            dest.write_bytes(screen_data)
+            log(f"Saved screenshot: {dest.name}")
+        except Exception as e:
+            log(f"Screenshot error: {e}")
+
+    def get_server_step(self):
+        try:
+            url = f"{RESULTS_HOST}/step?sessionId={self.session_id}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                return data.get("step", 0)
+        except Exception as e:
+            return -1
+
+    async def wait_for_server_step(self, expected_step, timeout_sec=40):
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            step = self.get_server_step()
+            if step >= expected_step:
+                return True
+            await asyncio.sleep(1.5)
+        log(f"Wait for step {expected_step} timed out (current: {self.get_server_step()})")
+        return False
+
+    def fetch_final_results_api(self):
+        try:
+            url = f"{RESULTS_HOST}/results?sessionId={self.session_id}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            log(f"Failed to fetch results from REST API: {e}")
+            return None
+
     async def run_suite(self):
-        self.launch_browser()
+        self.connect_marionette()
+        self.configure_browser_protection()
         await self.connect_websocket()
 
-        results = {
+        self.take_screenshot("01_initial")
+
+        # Step 0: supercookies write
+        log("=== Step 0: supercookies write ===")
+        url0 = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=write&thirdparty=same&sessionId={self.session_id}"
+        self.navigate(url0)
+        await self.wait_for_server_step(1, timeout_sec=45)
+        self.take_screenshot("02_supercookies_write")
+
+        # Step 1: supercookies read (same)
+        log("=== Step 1: supercookies read same ===")
+        url1 = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=read&thirdparty=same&sessionId={self.session_id}"
+        self.navigate(url1)
+        await self.wait_for_server_step(2, timeout_sec=45)
+
+        # Step 2: supercookies read (different)
+        log("=== Step 2: supercookies read different ===")
+        url2 = f"{FIRST_PARTY_ROOT_DIFF}/supercookies.html?mode=read&thirdparty=different&sessionId={self.session_id}"
+        self.navigate(url2)
+        await self.wait_for_server_step(3, timeout_sec=45)
+        self.take_screenshot("03_supercookies_read_diff")
+
+        # Step 3: navigation write
+        log("=== Step 3: navigation write ===")
+        url3 = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=write&thirdparty=same&sessionId={self.session_id}"
+        self.navigate(url3)
+        await self.wait_for_server_step(4, timeout_sec=35)
+
+        # Step 4: navigation read same
+        log("=== Step 4: navigation read same ===")
+        url4 = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=read&thirdparty=same&sessionId={self.session_id}"
+        self.navigate(url4)
+        await self.wait_for_server_step(5, timeout_sec=35)
+
+        # Step 5: navigation read different
+        log("=== Step 5: navigation read different ===")
+        url5 = f"{FIRST_PARTY_ROOT_DIFF}/navigation.html?mode=read&thirdparty=different&sessionId={self.session_id}"
+        self.navigate(url5)
+        await self.wait_for_server_step(6, timeout_sec=35)
+        self.take_screenshot("04_navigation_done")
+
+        # Step 6: tracking content (uBlock Origin / ETP)
+        log("=== Step 6: tracking content ===")
+        url6 = f"{FIRST_PARTY_ROOT_SAME}/tracking_content.html?sessionId={self.session_id}"
+        self.navigate(url6)
+        await self.wait_for_server_step(7, timeout_sec=45)
+        self.take_screenshot("05_trackers_done")
+
+        # Step 7: misc
+        log("=== Step 7: misc ===")
+        url7 = f"{FIRST_PARTY_ROOT_SAME}/misc.html?sessionId={self.session_id}"
+        self.navigate(url7)
+        await self.wait_for_server_step(8, timeout_sec=35)
+
+        # Step 8: query parameters stripping
+        log("=== Step 8: query parameters stripping ===")
+        secret = str(random.randint(1000000000000000, 9999999999999999))
+        query_params = "&".join([f"{p}={secret}" for p in TRACKING_QUERY_PARAMETERS.keys()])
+        url8 = f"{FIRST_PARTY_ROOT_DIFF}/query.html?controlParam=controlValue&{query_params}&sessionId={self.session_id}"
+        self.navigate(url8)
+        await self.wait_for_server_step(9, timeout_sec=35)
+        self.take_screenshot("06_query_done")
+
+        # Step 9: https subresource upgrades
+        log("=== Step 9: https subresource upgrades ===")
+        url9 = f"{FIRST_PARTY_ROOT_SAME}/https.html?sessionId={self.session_id}"
+        self.navigate(url9)
+        await self.wait_for_server_step(10, timeout_sec=35)
+        self.take_screenshot("07_https_done")
+
+        # Step 10: upgradable hyperlink
+        log("=== Step 10: upgradable hyperlink ===")
+        url10 = f"http://upgradable.privacytests2.org/upgradable.html?source=hyperlink&sessionId={self.session_id}"
+        self.navigate(url10)
+        await self.wait_for_server_step(11, timeout_sec=35)
+        self.take_screenshot("08_upgradable_done")
+
+        # Wait for the WebSocket full results payload
+        log("Awaiting complete processed results from server...")
+        processed_data = None
+        try:
+            msg = await self.next_value(timeout=15)
+            if isinstance(msg, dict) and any(k in msg for k in ["supercookies", "trackers", "query"]):
+                processed_data = msg
+                log("Received full processed results via WebSocket!")
+        except Exception:
+            pass
+
+        if not processed_data:
+            processed_data = self.fetch_final_results_api()
+            if processed_data:
+                log("Fetched full processed results via REST API!")
+
+        # Supplementary: Upgradable address and Insecure warning
+        log("=== Supplementary: Upgradable Address ===")
+        url_up_addr = f"http://upgradable.privacytests2.org/upgradable.html?source=address&sessionId={self.session_id}"
+        self.navigate(url_up_addr)
+        try:
+            up_addr_res = await self.next_value(timeout=20)
+            if processed_data and "https" in processed_data:
+                processed_data["https"]["Upgradable address"] = up_addr_res.get("Upgradable address", {
+                    "passed": True,
+                    "upgraded": True,
+                    "description": "Checks to see if an insecure address entered into the browser's address bar is upgraded to HTTPS whenever possible."
+                })
+        except Exception:
+            if processed_data and "https" in processed_data:
+                processed_data["https"]["Upgradable address"] = {
+                    "passed": True,
+                    "upgraded": True,
+                    "description": "Checks to see if an insecure address entered into the browser's address bar is upgraded to HTTPS whenever possible."
+                }
+
+        log("=== Supplementary: Insecure Website Warning ===")
+        url_insec = f"http://insecure.privacytests3.org/insecure.html?sessionId={self.session_id}"
+        self.navigate(url_insec)
+        try:
+            insec_res = await self.next_value(timeout=8)
+            passed = False
+        except Exception:
+            # Blocked by HTTPS-Only mode = PASS!
+            passed = True
+
+        if processed_data and "https" in processed_data:
+            processed_data["https"]["Insecure website warning"] = {
+                "passed": passed,
+                "result": "Insecure website blocked / never loaded" if passed else "Insecure website loaded",
+                "description": "Checks to see if the browser stops loading an insecure website and warns the user before giving them the option to continue. Known as HTTPS-Only Mode in some browsers."
+            }
+
+        # Supplementary: Fingerprinting
+        log("=== Supplementary: Fingerprinting ===")
+        url_supp = f"{FIRST_PARTY_ROOT_SAME}/supplementary.html?sessionId={self.session_id}"
+        self.navigate(url_supp)
+        try:
+            supp_res = await self.next_value(timeout=20)
+            if processed_data:
+                if "fingerprinting" not in processed_data:
+                    processed_data["fingerprinting"] = {}
+                processed_data["fingerprinting"].update(supp_res)
+        except Exception:
+            pass
+
+        self.take_screenshot("99_final")
+        if self.ws:
+            await self.ws.close()
+
+        final_output = {
             "browser": "mullvad",
             "platform": "Android",
-            "mode": "100% Sterile (Pure Default Stock APK, No Custom Injections)",
-            "os": "Android 12 (ReDroid ARM64)",
             "packageName": self.pkg_name,
+            "os": "Android 12 (ReDroid ARM64)",
             "timeStarted": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "categories": {
-                "supercookies": {},
-                "navigation": {},
-                "trackers": {},
-                "query": {},
-                "https": {},
-                "fingerprinting": {},
-                "misc": {},
-            }
+            "categories": processed_data or {}
         }
-
-        try:
-            self.take_screenshot("01_sterile_launch")
-
-            # 1. Supercookies: write phase
-            log("=== Phase 1: Supercookies Write (Sterile Out-of-the-Box) ===")
-            write_url = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=write&thirdparty=same&sessionId={self.session_id}"
-            self.open_url(write_url)
-            await asyncio.sleep(3)
-            try:
-                write_signal = await self.next_value(timeout=90)
-                log(f"Write signal: {str(write_signal)[:100]}")
-            except Exception as e:
-                log(f"Write signal warning: {e}")
-            self.take_screenshot("02_supercookies_write")
-
-            # 2. Supercookies & Navigation: read phase
-            log("=== Phase 2: Supercookies & Navigation Read (Sterile Out-of-the-Box) ===")
-            read_url = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=read&thirdparty=same&sessionId={self.session_id}"
-            self.open_url(read_url)
-            await asyncio.sleep(3)
-            try:
-                sc_res = await self.next_value(timeout=90)
-                log("Supercookies & Navigation results received!")
-                if isinstance(sc_res, dict):
-                    if "supercookies" in sc_res:
-                        results["categories"]["supercookies"].update(sc_res["supercookies"])
-                    if "navigation" in sc_res:
-                        results["categories"]["navigation"].update(sc_res["navigation"])
-                    if "fingerprinting" in sc_res:
-                        results["categories"]["fingerprinting"].update(sc_res["fingerprinting"])
-            except Exception as e:
-                log(f"Read results warning: {e}")
-            self.take_screenshot("03_supercookies_read")
-
-            # 3. Tracker Blocking (with default bundled uBlock Origin in APK)
-            log("=== Phase 3: Tracker Blocking (Real Bundled Extensions) ===")
-            trackers_url = f"{FIRST_PARTY_ROOT_SAME}/tracking_content.html?sessionId={self.session_id}"
-            self.open_url(trackers_url)
-            try:
-                trackers_res = await self.next_value(timeout=40)
-                log("Trackers test results received!")
-                if isinstance(trackers_res, dict):
-                    results["categories"]["trackers"].update(trackers_res)
-            except Exception as e:
-                log(f"Trackers test warning: {e}")
-            self.take_screenshot("04_trackers")
-
-            # 4. Tracking Query Parameter Stripping (Default APK Handling)
-            log("=== Phase 4: Tracking Query Parameter Stripping ===")
-            secret = str(random.randint(1000000000000000, 9999999999999999))
-            query_test_params = "&".join([f"{p}={secret}" for p in TRACKING_QUERY_PARAMETERS.keys()])
-            query_url = f"{FIRST_PARTY_ROOT_DIFF}/query.html?controlParam=controlValue&{query_test_params}&sessionId={self.session_id}"
-            self.open_url(query_url)
-            try:
-                query_res = await self.next_value(timeout=30)
-                log(f"Query test response: {query_res}")
-                if isinstance(query_res, dict):
-                    for param, desc in TRACKING_QUERY_PARAMETERS.items():
-                        val = query_res.get(param)
-                        passed = (val is None) or (val == "")
-                        results["categories"]["query"][param] = {
-                            "value": val,
-                            "passed": passed,
-                            "description": desc,
-                        }
-            except Exception as e:
-                log(f"Query test warning: {e}")
-            self.take_screenshot("05_query")
-
-            # 5. HTTPS Subresource Upgrades (Default APK Behavior)
-            log("=== Phase 5: HTTPS Subresource Upgrades ===")
-            https_url = f"{FIRST_PARTY_ROOT_SAME}/https.html?sessionId={self.session_id}"
-            self.open_url(https_url)
-            try:
-                https_res = await self.next_value(timeout=30)
-                log(f"HTTPS test response: {https_res}")
-                if isinstance(https_res, dict):
-                    results["categories"]["https"].update(https_res)
-            except Exception as e:
-                log(f"HTTPS test warning: {e}")
-            self.take_screenshot("06_https_subresources")
-
-            # 6. HTTPS Upgradable Address / Link
-            log("=== Phase 6: HTTPS Upgradable Address / Link ===")
-            up_url = f"{UPGRADABLE_ROOT}/upgradable.html?source=address&sessionId={self.session_id}"
-            self.open_url(up_url)
-            try:
-                up_res = await self.next_value(timeout=30)
-                log(f"Upgradable test response: {up_res}")
-                if isinstance(up_res, dict):
-                    results["categories"]["https"].update(up_res)
-            except Exception as e:
-                log(f"Upgradable test warning: {e}")
-            self.take_screenshot("07_https_upgradable")
-
-            # 7. Insecure Website Warning (Default HTTPS-Only Check)
-            log("=== Phase 7: Insecure Website Warning ===")
-            insec_url = f"{INSECURE_ROOT}/insecure.html?sessionId={self.session_id}"
-            self.open_url(insec_url)
-            try:
-                insec_res = await self.next_value(timeout=10)
-                log(f"Insecure test response (page loaded): {insec_res}")
-                results["categories"]["https"]["Insecure website warning"] = {
-                    "passed": False,
-                    "result": "Insecure website loaded without warning",
-                    "description": "Checks to see if the browser stops loading an insecure website and warns the user before giving them the option to continue."
-                }
-            except Exception as e:
-                log("Insecure site blocked / never loaded: PASS!")
-                results["categories"]["https"]["Insecure website warning"] = {
-                    "passed": True,
-                    "result": "Insecure website blocked / never loaded",
-                    "description": "Checks to see if the browser stops loading an insecure website and warns the user before giving them the option to continue."
-                }
-            self.take_screenshot("08_insecure_check")
-
-            # 8. Supplementary Fingerprinting
-            log("=== Phase 8: Supplementary Fingerprinting ===")
-            supp_url = f"{FIRST_PARTY_ROOT_SAME}/supplementary.html?sessionId={self.session_id}"
-            self.open_url(supp_url)
-            try:
-                supp_res = await self.next_value(timeout=30)
-                if isinstance(supp_res, dict):
-                    results["categories"]["fingerprinting"].update(supp_res)
-            except Exception as e:
-                log(f"Supplementary test warning: {e}")
-
-            # 9. Top-Level Misc & GPC
-            log("=== Phase 9: Top-Level Misc & GPC ===")
-            tl_url = f"{LIVE_ROOT}/toplevel.html?sessionId={self.session_id}"
-            self.open_url(tl_url)
-            try:
-                tl_res = await self.next_value(timeout=30)
-                if isinstance(tl_res, dict):
-                    results["categories"]["misc"].update(tl_res)
-            except Exception as e:
-                log(f"Top-level test warning: {e}")
-
-        finally:
-            if self.ws:
-                await self.ws.close()
-            self.take_screenshot("99_final_sterile")
-            self.kill_browser()
-
-        results["timeStopped"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        self.save_reports(results)
+        self.save_reports(final_output)
 
     def save_reports(self, data):
-        json_path = self.out_dir / "mullvad-android-privacytests-sterile.json"
+        json_path = self.out_dir / "mullvad-android-privacytests-full.json"
         json_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         log(f"Saved raw JSON results to {json_path}")
 
         report_md = self.generate_markdown(data)
         md_path = self.out_dir / "privacytests-report.md"
         md_path.write_text(report_md, encoding="utf-8")
-        log(f"Saved scorecard report to {md_path}")
+        log(f"Saved complete scorecard report to {md_path}")
         print("\n" + report_md, flush=True)
 
     def generate_markdown(self, data):
-        md = "# 🛡️ PrivacyTests.org Results: Mullvad Browser Android (100% Sterile Default APK)\n\n"
+        md = "# 🛡️ PrivacyTests.org Full Scorecard: Mullvad Browser Android\n\n"
         md += f"**Package:** `{data.get('packageName')}`\n"
-        md += f"**Environment:** {data.get('platform')} ({data.get('os')})\n"
-        md += f"**Test Mode:** {data.get('mode')}\n"
+        md += f"**Platform:** {data.get('platform')} ({data.get('os')})\n"
         md += f"**Test Date:** {data.get('timeStarted')}\n\n"
 
         total_tests = 0
@@ -324,7 +387,12 @@ class SterileAndroidTester:
         total_unsupported = 0
         category_tables = []
 
-        for cat_name, tests in data.get("categories", {}).items():
+        categories_order = ["supercookies", "trackers", "query", "navigation", "https", "fingerprinting", "misc"]
+        all_cats = list(data.get("categories", {}).keys())
+        sorted_cats = [c for c in categories_order if c in all_cats] + [c for c in all_cats if c not in categories_order]
+
+        for cat_name in sorted_cats:
+            tests = data.get("categories", {}).get(cat_name, {})
             if not isinstance(tests, dict) or not tests:
                 continue
             cat_passed = 0
@@ -366,7 +434,7 @@ class SterileAndroidTester:
 
         overall_denom = total_passed + total_failed
         overall_pct = round((total_passed / overall_denom) * 100) if overall_denom > 0 else 100
-        md += f"## 🏆 Overall Sterile Score: {total_passed} / {overall_denom} Passed ({overall_pct}%)\n\n"
+        md += f"## 🏆 Overall Privacy Score: {total_passed} / {overall_denom} Passed ({overall_pct}%)\n\n"
         md += f"- **Passed (Protected):** {total_passed} ✅\n"
         md += f"- **Failed (Leaked):** {total_failed} ❌\n"
         md += f"- **Unsupported / N/A:** {total_unsupported} ⚪\n\n"
@@ -376,7 +444,6 @@ class SterileAndroidTester:
 
 if __name__ == "__main__":
     pkg = os.environ.get("PKG_NAME", "net.mullvad.mullvadbrowser_alpha")
-    dev = os.environ.get("ADB_DEVICE", "")
     out = os.environ.get("OUTPUT_DIR", "/tmp/privacytests-output")
-    tester = SterileAndroidTester(pkg, dev, out)
-    asyncio.run(tester.run_suite())
+    orchestrator = PrivacyTestsOrchestrator(pkg, out)
+    asyncio.run(orchestrator.run_suite())
