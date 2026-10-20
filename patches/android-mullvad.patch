@@ -54,6 +54,18 @@ index 51cbeb4..3667733 100644
 +      cat << 'EOF' >> "$pref_file"
 +pref("dom.security.https_only_mode", true);
 +pref("dom.security.https_only_mode_pbm", true);
++pref("dom.security.https_only_fire_http_request_background_timer_ms", 0);
++pref("dom.security.https_only_mode_send_http_background_request", false);
++pref("dom.security.https_first", false);
++pref("network.trr.mode", 2);
++pref("network.trr.uri", "https://mozilla.cloudflare-dns.com/dns-query");
++pref("network.trr.default_provider_uri", "https://mozilla.cloudflare-dns.com/dns-query");
++pref("network.dns.echconfig.enabled", true);
++pref("network.dns.use_https_rr_as_altsvc", true);
++pref("network.dns.http3_echconfig.enabled", true);
++pref("privacy.globalprivacycontrol.enabled", true);
++pref("privacy.globalprivacycontrol.functionality.enabled", true);
++pref("privacy.globalprivacycontrol.pbmode.enabled", true);
 +pref("privacy.query_stripping.enabled", true);
 +pref("privacy.query_stripping.enabled.pbmode", true);
 +pref("privacy.query_stripping.strip_on_share.enabled", true);
@@ -64,7 +76,7 @@ index 51cbeb4..3667733 100644
 +pref("privacy.trackingprotection.fingerprinting.enabled", true);
 +pref("privacy.trackingprotection.socialtracking.enabled", true);
 +pref("privacy.resistFingerprinting", true);
-+pref("privacy.globalprivacycontrol.enabled", true);
++pref("network.http.referer.trimmingPolicy", 2);
 +EOF
 +    fi
 +  done
