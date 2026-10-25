@@ -74,6 +74,7 @@ jobs:
           adb connect 127.0.0.1:5555 || true
           target_dev=$(adb devices | grep -E "5555|device$" | head -n 1 | awk '{print $1}')
           echo "TARGET_DEV=$target_dev" >> "$GITHUB_ENV"
+          echo "ANDROID_SERIAL=$target_dev" >> "$GITHUB_ENV"
 
           adb -s "$target_dev" root || true
           sleep 3
@@ -158,6 +159,8 @@ jobs:
           export ADB_PATH="/usr/bin/adb"
           export ANDROID_HOME="/opt/android-sdk"
           export ANDROID_SDK_ROOT="/opt/android-sdk"
+          export ANDROID_SERIAL="$TARGET_DEV"
+          export TARGET_DEV="$TARGET_DEV"
           cd "$RUNNER_TEMP/privacytests-repo/scripts"
           node test.js --android --browser=mullvad --out="$RUNNER_TEMP/privacytests/mullvad-official.json"
 

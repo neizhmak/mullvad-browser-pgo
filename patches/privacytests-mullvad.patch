@@ -1,5 +1,5 @@
 diff --git a/scripts/android.js b/scripts/android.js
-index f6a6e4b..6365802 100644
+index f6a6e4b..b8a8708 100644
 --- a/scripts/android.js
 +++ b/scripts/android.js
 @@ -84,6 +84,13 @@ const browserInfo = {
@@ -16,14 +16,16 @@ index f6a6e4b..6365802 100644
    opera: {
      releasePackageName: 'com.opera.browser',
      nightlyPackageName: 'com.opera.browser.beta',
-@@ -169,8 +176,15 @@ const versionNameFromDumpsys = (raw) =>
+@@ -169,8 +176,17 @@ const versionNameFromDumpsys = (raw) =>
    String(raw).match(/versionName=(\S+)/)[1];
  
  const getAppVersion = _.memoize((packageName) => {
 -  const cmd = `/opt/homebrew/bin/adb shell dumpsys package ${packageName} | /usr/bin/grep versionName`;
 -  return versionNameFromDumpsys(execSync(cmd).toString());
 +  const adbCmd = process.env.ADB_PATH || 'adb';
-+  const cmd = `${adbCmd} shell dumpsys package ${packageName}`;
++  const targetDev = process.env.ANDROID_SERIAL || process.env.TARGET_DEV;
++  const sFlag = targetDev ? `-s ${targetDev}` : '';
++  const cmd = `${adbCmd} ${sFlag} shell dumpsys package ${packageName}`;
 +  try {
 +    const out = execSync(cmd).toString();
 +    const match = out.match(/versionName=(\S+)/);
@@ -34,21 +36,58 @@ index f6a6e4b..6365802 100644
  });
  
  const browserstackCredentials = () => {
-@@ -407,6 +421,13 @@ class AndroidBrowser {
+@@ -183,18 +199,24 @@ const browserstackCredentials = () => {
+   return { user, key };
+ };
+ 
+-const localAppiumSession = () =>
+-  WebDriver.newSession({
++const localAppiumSession = () => {
++  const targetDev = process.env.ANDROID_SERIAL || process.env.TARGET_DEV;
++  const capabilities = {
++    platformName: 'Android',
++    'appium:newCommandTimeout': 600,
++    'appium:automationName': 'UiAutomator2',
++    'appium:uiautomator2ServerInstallTimeout': 90000
++  };
++  if (targetDev) {
++    capabilities['appium:udid'] = targetDev;
++  }
++  return WebDriver.newSession({
+     port: 4723,
+     hostname: '0.0.0.0',
+     path: '/wd/hub',
+-    capabilities: {
+-      platformName: 'Android',
+-      'appium:newCommandTimeout': 600,
+-      'appium:automationName': 'UiAutomator2',
+-      'appium:uiautomator2ServerInstallTimeout': 90000
+-    }
++    capabilities
+   });
++};
+ 
+ const browserstackAppFromEnv = () => {
+   const app = process.env.BROWSERSTACK_APP;
+@@ -407,6 +429,17 @@ class AndroidBrowser {
    }
  
    async openUrlOnce (url) {
 +    const adbCmd = process.env.ADB_PATH || 'adb';
++    const targetDev = process.env.ANDROID_SERIAL || process.env.TARGET_DEV;
++    const sFlag = targetDev ? `-s ${targetDev}` : '';
++    const safeUrl = `'${url.replace(/'/g, "'\\''")}'`;
 +    try {
-+      execSync(`${adbCmd} shell am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "${url}" ${this.packageName}`);
-+      await sleepMs(1000);
++      execSync(`${adbCmd} ${sFlag} shell am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d ${safeUrl} ${this.packageName}`);
++      await sleepMs(2000);
++      return;
 +    } catch (e) {
 +      console.log('am start navigation notice:', e.message);
 +    }
      let urlBarToClick = await findElement(this.client, this.packageName, this.urlBarClick);
      if (urlBarToClick === undefined) {
        if (this.urlBarClick2) {
-@@ -414,26 +435,27 @@ class AndroidBrowser {
+@@ -414,26 +447,27 @@ class AndroidBrowser {
        }
        if (urlBarToClick === undefined) {
          urlBarToClick = await findElement(this.client, this.packageName, this.urlBarKeys);
