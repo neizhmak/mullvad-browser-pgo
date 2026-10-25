@@ -155,6 +155,9 @@ jobs:
       - name: Run official PrivacyTests.org test suite
         run: |
           set -euo pipefail
+          export ADB_PATH="/usr/bin/adb"
+          export ANDROID_HOME="/opt/android-sdk"
+          export ANDROID_SDK_ROOT="/opt/android-sdk"
           cd "$RUNNER_TEMP/privacytests-repo/scripts"
           node test.js --android --browser=mullvad --out="$RUNNER_TEMP/privacytests/mullvad-official.json"
 

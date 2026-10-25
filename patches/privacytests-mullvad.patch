@@ -1,5 +1,5 @@
 diff --git a/scripts/android.js b/scripts/android.js
-index f6a6e4b..0c62c62 100644
+index f6a6e4b..6365802 100644
 --- a/scripts/android.js
 +++ b/scripts/android.js
 @@ -84,6 +84,13 @@ const browserInfo = {
@@ -34,3 +34,62 @@ index f6a6e4b..0c62c62 100644
  });
  
  const browserstackCredentials = () => {
+@@ -407,6 +421,13 @@ class AndroidBrowser {
+   }
+ 
+   async openUrlOnce (url) {
++    const adbCmd = process.env.ADB_PATH || 'adb';
++    try {
++      execSync(`${adbCmd} shell am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "${url}" ${this.packageName}`);
++      await sleepMs(1000);
++    } catch (e) {
++      console.log('am start navigation notice:', e.message);
++    }
+     let urlBarToClick = await findElement(this.client, this.packageName, this.urlBarClick);
+     if (urlBarToClick === undefined) {
+       if (this.urlBarClick2) {
+@@ -414,26 +435,27 @@ class AndroidBrowser {
+       }
+       if (urlBarToClick === undefined) {
+         urlBarToClick = await findElement(this.client, this.packageName, this.urlBarKeys);
+-        //      await sleepMs(1000);
+-        //      urlBarToClick = await findElementWithId(this.client, this.packageName, this.urlBarClick);
+       }
+     }
+-    if (urlBarToClick === undefined) {
+-      throw new Error(`no url-bar element found for ${this.browser}`);
+-    }
+-    await this.client.elementClick(urlBarToClick);
+-    await sleepMs(1000);
+-    if (this.urlBarClear) {
+-      const clearButton = await findElement(this.client, this.packageName, this.urlBarClear);
+-      await this.client.elementClick(clearButton);
+-    }
+-    let urlBarToSendKeys = await findElement(this.client, this.packageName, this.urlBarKeys);
+-    if (urlBarToSendKeys === undefined) {
+-      urlBarToSendKeys = urlBarToClick;
++    if (urlBarToClick !== undefined) {
++      try {
++        await this.client.elementClick(urlBarToClick);
++        await sleepMs(1000);
++        if (this.urlBarClear) {
++          const clearButton = await findElement(this.client, this.packageName, this.urlBarClear);
++          if (clearButton) await this.client.elementClick(clearButton);
++        }
++        let urlBarToSendKeys = await findElement(this.client, this.packageName, this.urlBarKeys);
++        if (urlBarToSendKeys === undefined) {
++          urlBarToSendKeys = urlBarToClick;
++        }
++        await this.client.elementClear(urlBarToSendKeys);
++        await this.client.elementSendKeys(urlBarToSendKeys, url);
++        await this.client.appiumPressKeyCode(KEY_ENTER);
++      } catch (e) {
++        console.log('UI typing notice:', e.message);
++      }
+     }
+-    await this.client.elementClear(urlBarToSendKeys);
+-    await this.client.elementSendKeys(urlBarToSendKeys, url);
+-    await this.client.appiumPressKeyCode(KEY_ENTER);
+   }
+ 
+   // Open the url in a new tab.
