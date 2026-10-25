@@ -27,8 +27,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y git dkms "linux-headers-$(uname -r)" build-essential adb curl unzip python3-pip
-          pip3 install --break-system-packages marionette-driver websockets || true
+          sudo apt-get install -y git dkms "linux-headers-$(uname -r)" build-essential adb curl python3-pip nodejs npm
 
           if [[ ! -c /dev/binder ]]; then
             cd /tmp
@@ -58,7 +57,15 @@ jobs:
       - name: Launch ReDroid Android 12 ARM64 container
         run: |
           set -euo pipefail
-          docker run -d --rm --privileged             --name redroid             -p 5555:5555             -v /tmp/redroid-data:/data             redroid/redroid:12.0.0-latest             androidboot.redroid_width=1080             androidboot.redroid_height=1920             androidboot.redroid_dpi=480             androidboot.redroid_gpu_mode=guest
+          docker run -d --rm --privileged \
+            --name redroid \
+            -p 5555:5555 \
+            -v /tmp/redroid-data:/data \
+            redroid/redroid:12.0.0-latest \
+            androidboot.redroid_width=1080 \
+            androidboot.redroid_height=1920 \
+            androidboot.redroid_dpi=480 \
+            androidboot.redroid_gpu_mode=guest
           sleep 10
 
       - name: Connect ADB and wait for Android boot
@@ -99,10 +106,10 @@ jobs:
           ls -lh "$apk_file"
           sha256sum "$apk_file"
 
-      - name: Install Mullvad Browser on ReDroid and configure Marionette
+      - name: Install pristine Mullvad Browser APK
         run: |
           set -euo pipefail
-          echo "Installing $APK_PATH..."
+          echo "Installing production APK: $APK_PATH..."
           adb -s "$TARGET_DEV" install -r "$APK_PATH"
           pkg_name=$(adb -s "$TARGET_DEV" shell pm list packages | grep -E "mullvad|firefox|fenix" | head -n 1 | cut -d: -f2 | tr -d '\r')
           echo "PKG_NAME=$pkg_name" >> "$GITHUB_ENV"
@@ -111,46 +118,51 @@ jobs:
           adb -s "$TARGET_DEV" shell pm grant "$pkg_name" android.permission.WRITE_EXTERNAL_STORAGE 2>/dev/null || true
           adb -s "$TARGET_DEV" shell pm grant "$pkg_name" android.permission.READ_EXTERNAL_STORAGE 2>/dev/null || true
 
-          # Extract bundled uBlock Origin from the APK and push to device for profile activation
-          unzip -p "$APK_PATH" "assets/extensions/uBlock0@raymondhill.net.xpi" > /tmp/ublock.xpi || true
-          if [[ -s /tmp/ublock.xpi ]]; then
-            echo "Extracted bundled uBlock Origin ($(stat -c%s /tmp/ublock.xpi) bytes)"
-            adb -s "$TARGET_DEV" push /tmp/ublock.xpi /data/local/tmp/ublock.xpi
-            adb -s "$TARGET_DEV" shell "chmod 666 /data/local/tmp/ublock.xpi"
-          fi
-
-          # Enable Marionette automation on port 2828
-          printf 'args:\n  - "--marionette"\nprefs:\n  marionette.defaultPrefs.enabled: true\n  marionette.port: 2828\n' > /tmp/geckoview-config.yaml
-          adb -s "$TARGET_DEV" push /tmp/geckoview-config.yaml "/data/local/tmp/${pkg_name}-geckoview-config.yaml"
-          adb -s "$TARGET_DEV" shell "chmod 666 /data/local/tmp/${pkg_name}-geckoview-config.yaml"
-          adb -s "$TARGET_DEV" shell am set-debug-app --persistent "$pkg_name"
-
-          # Forward Marionette port
-          adb -s "$TARGET_DEV" forward tcp:2828 tcp:2828 || true
-
-          # Start browser
-          echo "Starting browser with Marionette enabled..."
-          adb -s "$TARGET_DEV" shell am start -n "$pkg_name/org.mozilla.fenix.HomeActivity"
-          sleep 5
-
-      - name: Run Complete PrivacyTests.org Evaluation Suite
+      - name: Setup Appium server and UiAutomator2 driver
         run: |
           set -euo pipefail
-          export PKG_NAME="$PKG_NAME"
-          export OUTPUT_DIR="$RUNNER_TEMP/privacytests"
-          python3 ./scripts/run-privacytests-android.py
+          echo "Installing Appium globally..."
+          sudo npm install -g appium
+          appium driver install uiautomator2
+          nohup appium server --address 127.0.0.1 --port 4723 --base-path /wd/hub > /tmp/appium.log 2>&1 &
 
-      - name: Publish Complete Test Report to Summary
+          echo "Waiting for Appium server on 127.0.0.1:4723/wd/hub..."
+          for i in $(seq 1 30); do
+            if curl -s http://127.0.0.1:4723/wd/hub/status | grep -q '"ready":true'; then
+              echo "Appium server is ready in check $i!"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Prepare official PrivacyTests.org test suite
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/privacytests/privacytests.org "$RUNNER_TEMP/privacytests-repo"
+          cd "$RUNNER_TEMP/privacytests-repo"
+          git apply "$GITHUB_WORKSPACE/patches/privacytests-mullvad.patch"
+          cd scripts
+          npm install --no-audit --no-fund
+
+      - name: Run official PrivacyTests.org test suite
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/privacytests-repo/scripts"
+          node test.js --android --browser=mullvad --out="$RUNNER_TEMP/privacytests/mullvad-official.json"
+
+      - name: Publish Test Report to Summary
         if: always()
         run: |
-          if [[ -f "$RUNNER_TEMP/privacytests/privacytests-report.md" ]]; then
-            cat "$RUNNER_TEMP/privacytests/privacytests-report.md" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          out_file="$RUNNER_TEMP/privacytests/mullvad-official.json"
+          if [[ -f "$out_file" ]]; then
+            python3 ./scripts/render-privacytests-scorecard.py "$out_file" "${GITHUB_STEP_SUMMARY:-}"
           fi
 
-      - name: Upload Complete PrivacyTests Artifacts
+      - name: Upload Official PrivacyTests Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: privacytests-complete-results
+          name: privacytests-official-results
           path: ${{ runner.temp }}/privacytests/
           retention-days: 14

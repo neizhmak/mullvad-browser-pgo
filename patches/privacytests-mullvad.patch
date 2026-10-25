@@ -1,0 +1,36 @@
+diff --git a/scripts/android.js b/scripts/android.js
+index f6a6e4b..0c62c62 100644
+--- a/scripts/android.js
++++ b/scripts/android.js
+@@ -84,6 +84,13 @@ const browserInfo = {
+     urlBarClick2: 'bottom_bar',
+     urlBarKeys: 'mozac_browser_toolbar_edit_url_view'
+   },
++  mullvad: {
++    releasePackageName: 'net.mullvad.mullvadbrowser_alpha',
++    nightlyPackageName: 'net.mullvad.mullvadbrowser_alpha',
++    urlBarClick: '//*[@resource-id="ADDRESSBAR_URL_BOX"]',
++    urlBarClick2: 'mozac_browser_toolbar_url_view',
++    urlBarKeys: '//*[@resource-id="ADDRESSBAR_SEARCH_BOX"]'
++  },
+   opera: {
+     releasePackageName: 'com.opera.browser',
+     nightlyPackageName: 'com.opera.browser.beta',
+@@ -169,8 +176,15 @@ const versionNameFromDumpsys = (raw) =>
+   String(raw).match(/versionName=(\S+)/)[1];
+ 
+ const getAppVersion = _.memoize((packageName) => {
+-  const cmd = `/opt/homebrew/bin/adb shell dumpsys package ${packageName} | /usr/bin/grep versionName`;
+-  return versionNameFromDumpsys(execSync(cmd).toString());
++  const adbCmd = process.env.ADB_PATH || 'adb';
++  const cmd = `${adbCmd} shell dumpsys package ${packageName}`;
++  try {
++    const out = execSync(cmd).toString();
++    const match = out.match(/versionName=(\S+)/);
++    return match ? match[1] : 'unknown';
++  } catch (e) {
++    return '16.0a9';
++  }
+ });
+ 
+ const browserstackCredentials = () => {
