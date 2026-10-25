@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# run-privacytests-android.py: Complete PrivacyTests.org Evaluation Runner
+# run-privacytests-android.py: Complete PrivacyTests.org Evaluation Runner with Manual Navigation Control
 import asyncio
 import json
 import os
@@ -159,72 +159,72 @@ class PrivacyTestsOrchestrator:
 
         self.take_screenshot("01_initial")
 
-        # Step 0: supercookies write
+        # Step 0: supercookies write (manual=true prevents automatic client redirect)
         log("=== Step 0: Supercookies write ===")
-        url0 = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=write&thirdparty=same&sessionId={self.session_id}"
+        url0 = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=write&thirdparty=same&manual=true&sessionId={self.session_id}"
         await self.navigate_and_wait(url0, wait_seconds=10)
         self.take_screenshot("02_supercookies_write")
 
         # Step 1: supercookies read (same origin)
         log("=== Step 1: Supercookies read (same origin) ===")
-        url1 = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=read&thirdparty=same&sessionId={self.session_id}"
+        url1 = f"{FIRST_PARTY_ROOT_SAME}/supercookies.html?mode=read&thirdparty=same&manual=true&sessionId={self.session_id}"
         await self.navigate_and_wait(url1, wait_seconds=10)
 
         # Step 2: supercookies read (different origin)
         log("=== Step 2: Supercookies read (different origin) ===")
-        url2 = f"{FIRST_PARTY_ROOT_DIFF}/supercookies.html?mode=read&thirdparty=different&sessionId={self.session_id}"
+        url2 = f"{FIRST_PARTY_ROOT_DIFF}/supercookies.html?mode=read&thirdparty=different&manual=true&sessionId={self.session_id}"
         await self.navigate_and_wait(url2, wait_seconds=10)
         self.take_screenshot("03_supercookies_diff")
 
-        # Step 3: navigation write
+        # Step 3: navigation write (writes window.name and cache resources)
         log("=== Step 3: Navigation write ===")
-        url3 = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=write&thirdparty=same&sessionId={self.session_id}"
-        await self.navigate_and_wait(url3, wait_seconds=6)
+        url3 = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=write&thirdparty=same&manual=true&sessionId={self.session_id}"
+        await self.navigate_and_wait(url3, wait_seconds=8)
 
-        # Step 4: navigation read same
+        # Step 4: navigation read same (validates same-origin cache and window.name)
         log("=== Step 4: Navigation read (same origin) ===")
-        url4 = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=read&thirdparty=same&sessionId={self.session_id}"
-        await self.navigate_and_wait(url4, wait_seconds=6)
+        url4 = f"{FIRST_PARTY_ROOT_SAME}/navigation.html?mode=read&thirdparty=same&manual=true&sessionId={self.session_id}"
+        await self.navigate_and_wait(url4, wait_seconds=8)
 
-        # Step 5: navigation read different
+        # Step 5: navigation read different (validates cross-origin isolation)
         log("=== Step 5: Navigation read (different origin) ===")
-        url5 = f"{FIRST_PARTY_ROOT_DIFF}/navigation.html?mode=read&thirdparty=different&sessionId={self.session_id}"
-        await self.navigate_and_wait(url5, wait_seconds=6)
+        url5 = f"{FIRST_PARTY_ROOT_DIFF}/navigation.html?mode=read&thirdparty=different&manual=true&sessionId={self.session_id}"
+        await self.navigate_and_wait(url5, wait_seconds=8)
         self.take_screenshot("04_navigation_diff")
 
         # Step 6: tracker blocking (tracking_content.html - all 19 trackers)
         log("=== Step 6: Tracker blocking (uBlock Origin / ETP) ===")
-        url6 = f"{FIRST_PARTY_ROOT_SAME}/tracking_content.html?sessionId={self.session_id}"
+        url6 = f"{FIRST_PARTY_ROOT_SAME}/tracking_content.html?manual=true&sessionId={self.session_id}"
         await self.navigate_and_wait(url6, wait_seconds=35)
         self.take_screenshot("05_trackers")
 
         # Step 7: misc (Tor, ECH, GPC)
         log("=== Step 7: Misc (ECH & GPC) ===")
-        url7 = f"{FIRST_PARTY_ROOT_SAME}/misc.html?sessionId={self.session_id}"
+        url7 = f"{FIRST_PARTY_ROOT_SAME}/misc.html?manual=true&sessionId={self.session_id}"
         await self.navigate_and_wait(url7, wait_seconds=8)
 
         # Step 8: query parameters stripping (all 23 tracking parameters)
         log("=== Step 8: Tracking query parameter stripping ===")
         secret = str(random.randint(1000000000000000, 9999999999999999))
         query_params = "&".join([f"{p}={secret}" for p in TRACKING_QUERY_PARAMETERS.keys()])
-        url8 = f"{FIRST_PARTY_ROOT_DIFF}/query.html?controlParam=controlValue&{query_params}&sessionId={self.session_id}"
+        url8 = f"{FIRST_PARTY_ROOT_DIFF}/query.html?controlParam=controlValue&{query_params}&manual=true&sessionId={self.session_id}"
         await self.navigate_and_wait(url8, wait_seconds=8)
         self.take_screenshot("06_query")
 
         # Step 9: https subresource upgrades
         log("=== Step 9: HTTPS subresource upgrades ===")
-        url9 = f"{FIRST_PARTY_ROOT_SAME}/https.html?sessionId={self.session_id}"
+        url9 = f"{FIRST_PARTY_ROOT_SAME}/https.html?manual=true&sessionId={self.session_id}"
         await self.navigate_and_wait(url9, wait_seconds=8)
         self.take_screenshot("07_https_subresources")
 
         # Step 10: upgradable hyperlink
         log("=== Step 10: HTTPS upgradable hyperlink ===")
-        url10 = f"http://upgradable.privacytests2.org/upgradable.html?source=hyperlink&sessionId={self.session_id}"
+        url10 = f"http://upgradable.privacytests2.org/upgradable.html?source=hyperlink&manual=true&sessionId={self.session_id}"
         await self.navigate_and_wait(url10, wait_seconds=8)
 
         # Step 11: done.html
         log("=== Step 11: Done (concluding sequence) ===")
-        url11 = f"{FIRST_PARTY_ROOT_SAME}/done.html?sessionId={self.session_id}"
+        url11 = f"{FIRST_PARTY_ROOT_SAME}/done.html?manual=true&sessionId={self.session_id}"
         await self.navigate_and_wait(url11, wait_seconds=5)
 
         # Fetch the official server-calculated results
@@ -251,7 +251,7 @@ class PrivacyTestsOrchestrator:
 
         # Supplementary: Upgradable Address
         log("=== Supplementary: Upgradable Address ===")
-        url_up_addr = f"http://upgradable.privacytests2.org/upgradable.html?source=address&sessionId={self.session_id}"
+        url_up_addr = f"http://upgradable.privacytests2.org/upgradable.html?source=address&manual=true&sessionId={self.session_id}"
         self.navigate(url_up_addr)
         try:
             up_addr_res = await self.next_value(timeout=15)
@@ -271,7 +271,7 @@ class PrivacyTestsOrchestrator:
 
         # Supplementary: Insecure Website Warning
         log("=== Supplementary: Insecure Website Warning ===")
-        url_insec = f"http://insecure.privacytests3.org/insecure.html?sessionId={self.session_id}"
+        url_insec = f"http://insecure.privacytests3.org/insecure.html?manual=true&sessionId={self.session_id}"
         self.navigate(url_insec)
         try:
             insec_res = await self.next_value(timeout=8)
@@ -289,7 +289,7 @@ class PrivacyTestsOrchestrator:
 
         # Supplementary: Fingerprinting (System fonts)
         log("=== Supplementary: Fingerprinting ===")
-        url_supp = f"{FIRST_PARTY_ROOT_SAME}/supplementary.html?sessionId={self.session_id}"
+        url_supp = f"{FIRST_PARTY_ROOT_SAME}/supplementary.html?manual=true&sessionId={self.session_id}"
         self.navigate(url_supp)
         try:
             supp_res = await self.next_value(timeout=15)
