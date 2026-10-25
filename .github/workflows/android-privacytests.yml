@@ -121,9 +121,17 @@ jobs:
       - name: Setup Appium server and UiAutomator2 driver
         run: |
           set -euo pipefail
+          echo "Configuring Android SDK structure for Appium..."
+          sudo mkdir -p /opt/android-sdk/platform-tools
+          sudo ln -sf /usr/bin/adb /opt/android-sdk/platform-tools/adb
+          echo "ANDROID_HOME=/opt/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=/opt/android-sdk" >> "$GITHUB_ENV"
+
           echo "Installing Appium globally..."
           sudo npm install -g appium
           appium driver install uiautomator2
+          export ANDROID_HOME=/opt/android-sdk
+          export ANDROID_SDK_ROOT=/opt/android-sdk
           nohup appium server --address 127.0.0.1 --port 4723 --base-path /wd/hub > /tmp/appium.log 2>&1 &
 
           echo "Waiting for Appium server on 127.0.0.1:4723/wd/hub..."
