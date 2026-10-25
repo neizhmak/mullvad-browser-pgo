@@ -368,14 +368,19 @@ index 04b0b34..0afbd27 100644
 +}
 +''', encoding="utf-8")
 +
-+# 9. Settings.kt (torSecurityLevel property)
++# 9. Settings.kt (torSecurityLevel property and default httpsOnlyMode)
 +p_set = Path("app/src/main/java/org/mozilla/fenix/utils/Settings.kt")
 +if p_set.is_file():
 +    t = p_set.read_text(encoding="utf-8")
 +    old_h = ") : PreferencesHolder {"
 +    if old_h in t and "var torSecurityLevel" not in t:
 +        new_h = ") : PreferencesHolder {\n    var torSecurityLevel: Int = 4"
-+        p_set.write_text(t.replace(old_h, new_h, 1), encoding="utf-8")
++        t = t.replace(old_h, new_h, 1)
++    old_https = "pref_key_https_only),\n            default = false,"
++    new_https = "pref_key_https_only),\n            default = true,"
++    if old_https in t:
++        t = t.replace(old_https, new_https, 1)
++    p_set.write_text(t, encoding="utf-8")
 +
 +# 11. TorBrowserFeatures.kt (auto-install bundled uBlock Origin on startup)
 +p_tbf = Path("app/src/main/java/org/mozilla/fenix/components/TorBrowserFeatures.kt")

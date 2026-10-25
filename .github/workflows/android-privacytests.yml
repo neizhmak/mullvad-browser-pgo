@@ -119,6 +119,24 @@ jobs:
           adb -s "$TARGET_DEV" shell pm grant "$pkg_name" android.permission.WRITE_EXTERNAL_STORAGE 2>/dev/null || true
           adb -s "$TARGET_DEV" shell pm grant "$pkg_name" android.permission.READ_EXTERNAL_STORAGE 2>/dev/null || true
 
+          # Configure default HTTPS-Only mode in SharedPreferences
+          echo "Configuring HTTPS-Only Mode by default in SharedPreferences..."
+          mkdir -p "$RUNNER_TEMP/shared_prefs"
+          cat > "$RUNNER_TEMP/shared_prefs/${pkg_name}_preferences.xml" << 'EOF'
+          <?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+          <map>
+              <boolean name="pref_key_https_only" value="true" />
+              <boolean name="pref_key_https_only_in_all_tabs" value="true" />
+              <boolean name="pref_key_https_only_in_private_tabs" value="false" />
+          </map>
+          EOF
+          sed -i 's/^[ ]*//' "$RUNNER_TEMP/shared_prefs/${pkg_name}_preferences.xml"
+          adb -s "$TARGET_DEV" shell mkdir -p "/data/data/$pkg_name/shared_prefs"
+          adb -s "$TARGET_DEV" push "$RUNNER_TEMP/shared_prefs/${pkg_name}_preferences.xml" "/data/data/$pkg_name/shared_prefs/${pkg_name}_preferences.xml"
+          adb -s "$TARGET_DEV" shell chmod 660 "/data/data/$pkg_name/shared_prefs/${pkg_name}_preferences.xml"
+          app_uid=$(adb -s "$TARGET_DEV" shell stat -c '%u:%g' "/data/data/$pkg_name" 2>/dev/null | tr -d '\r' || echo "1000:1000")
+          adb -s "$TARGET_DEV" shell chown -R "$app_uid" "/data/data/$pkg_name/shared_prefs"
+
       - name: Setup Appium server and UiAutomator2 driver
         run: |
           set -euo pipefail
